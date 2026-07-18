@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="h-full">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zencoder Console</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            DEFAULT: '#007AFF',
+                            hover: '#0063CE',
+                        },
+                        background: {
+                            light: '#F5F5F7',
+                            dark: '#000000',
+                        },
+                        surface: {
+                            light: '#FFFFFF',
+                            dark: '#1C1C1E',
+                        },
+                        border: {
+                            light: '#E5E5E5',
+                            dark: '#38383A',
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['-apple-system', 'BlinkMacSystemFont', 'Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+
+        body {
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #D1D5DB;
+            border-radius: 3px;
+        }
+
+        .dark ::-webkit-scrollbar-thumb {
+            background: #4B5563;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #9CA3AF;
+        }
+
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.8);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+
+        .dark .glass-panel {
+            background: rgba(28, 28, 30, 0.8);
+        }
+
+        .justify-between {
+            justify-content: end;
+        }
+    </style>
+</head>
+
+<body
+    class="bg-background-light dark:bg-background-dark text-gray-900 dark:text-gray-100 h-full flex flex-col transition-colors duration-300">
+
+    <!-- Admin Password Modal -->
+    <div id="adminPasswordModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div
+            class="bg-surface-light dark:bg-surface-dark rounded-2xl shadow-2xl border border-border-light dark:border-border-dark p-8 max-w-md w-full mx-4 transition-colors duration-300">
+            <div class="text-center mb-6">
+                <div class="w-16 h-16 bg-primary rounded-full flex items-center justify-center text-white mx-auto mb-4">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd"
+                            d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z"
+                            clip-rule="evenodd" />
+                    </svg>
+                </div>
+                <h2 class="text-xl font-bold text-gray-900 dark:text-white mb-2">管理员验证</h2>
+                <p class="text-sm text-gray-500 dark:text-gray-400">请输入管理密码以访问控制台</p>
+            </div>
+
+            <form id="adminPasswordForm" class="space-y-4" onsubmit="return false;">
+                <div>
+                    <label for="adminPassword"
+                        class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">管理密码</label>
+                    <div class="relative">
+                        <input type="password" id="adminPassword" autocomplete="off"
+                            class="w-full rounded-xl border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-white shadow-sm focus:border-primary focus:ring-primary sm:text-sm py-3 px-4 transition-colors placeholder-gray-400"
+                            placeholder="输入管理密码">
+                        <button type="button" onclick="toggleAdminPasswordVisibility()"
+                            class="absolute inset-y-0 right-0 px-3 flex items-center text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 focus:outline-none">
+                            <svg id="adminEyeIcon" class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none"
+                                viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="flex items-center">
+                    <input id="rememberPassword" type="checkbox"
+                        class="h-4 w-4 text-primary focus:ring-primary border-gray-300 dark:border-gray-600 rounded">
+                    <label for="rememberPassword"
+                        class="ml-2 block text-sm text-gray-700 dark:text-gray-300">记住密码</label>
+                </div>
+
+                <div class="pt-4">
+                    <button type="submit" id="adminLoginBtn"
+                        class="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-sm text-sm font-medium text-white bg-primary hover:bg-primary-hover focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary transition-all active:scale-[0.98]">
+                        <span id="adminBtnText">验证</span>
+                        <svg id="adminBtnLoading" class="animate-spin ml-2 h-4 w-4 text-white hidden"
+                            xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4">
+                            </circle>
+                            <path class="opacity-75" fill="currentColor"
+                                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
+                            </path>
+                        </svg>
+                    </button>
+                </div>
+
+                <div id="passwordError" class="hidden text-sm text-red-600 dark:text-red-400 text-center mt-2">
+                    密码错误，请重试
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Main Application (Hidden initially) -->
+    <div id="mainApp" class="hidden h-full flex flex-col">
+
+        <!-- Navbar -->
+        <nav
+            class="sticky top-0 z-50 border-b border-border-light dark:border-border-dark glass-panel transition-colors duration-300">
+            <div class="max-w-[1800px] mx-auto px-4 sm:px-6 lg:px-8">
+                <div class="flex justify-between h-16 items-center">
+                    <div class="flex items-center gap-3">
+                        <div class="w-8 h-8 bg-primary rounded-lg flex items-center justify-center text-white">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20"
+                                fill="currentColor">
+                                <path fill-rule="evenodd"
+                                    d="M12.395 2.553a1 1 0 00-1.45-.385c-.345.23-.614.558-.822.88-.214.33-.403.713-.57 1.116-.334.804-.614 1.768-.84 2.734a31.365 31.365 0 00-.613 3.58 2.64 2.64 0 01-.945-1.067c-.328-.68-.398-1.534-.398-2.654A1 1 0 005.05 6.05 6.981 6.981 0 003 11a7 7 0 1011.95-4.95c-.592-.591-.98-.985-1.348-1.467-.363-.476-.724-1.063-1.207-2.03zM12.12 15.12A3 3 0 017 13s.879.5 2.5.5c0-1 .5-4 1.25-4.5.5 1 .786 1.293 1.371 1.879A2.99 2.99 0 0113 13a2.99 2.99 0 01-.879 2.121z"
+                                    clip-rule="evenodd" />
+                            </svg>
+                        </div>
+                        <span class="text-lg font-semibold tracking-tight">Zencoder Console</span>
+                    </div>
+
+                    <div class="flex items-center gap-3">
+                        <!-- Logout Button -->
+                        <button onclick="logout()" title="退出登录"
+                            class="p-2 rounded-full hover:bg-red-100 dark:hover:bg-red-900/20 transition-colors focus:outline-none focus:ring-2 focus:ring-red-500 text-red-600 dark:text-red-400">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24"
+                                stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                            </svg>
+                        </button>
+
+                        <!-- Theme Toggle -->
+                        <button id="themeToggle"
+                            class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-primary">
+                            <!-- Sun Icon -->
+                            <svg id="sunIcon" class="w-5 h-5 hidden" fill="none" stroke="currentColor"
+                                viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z">
+                                </path>
+                            </svg>
+                            <!-- Moon Icon -->
+                            <svg id="moonIcon" class="w-5 h-5 hidden" fill="none" stroke="currentColor"
+                                viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z">
+                                </path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="flex-1 max-w-[1800px] w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+            <!-- Pool View (默认显示) -->
+            <div id="poolView" class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+
+                <!-- Left Column: Add Account & Stats -->
+                <div class="lg:col-span-3 space-y-6">
+                    <!-- OAuth Account Connection -->
+                    <div
+                        class="relative overflow-hidden bg-surface-light dark:bg-surface-dark rounded-2xl shadow-sm border border-border-light dark:border-border-dark p-6 transition-colors duration-300">
+                        <div class="absolute inset-x-6 top-0 h-0.5 bg-primary" aria-hidden="true"></div>
+                        <div class="flex items-center justify-between mb-1">
+                            <h2 class="text-xl font-semibold flex items-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-primary" fill="none"
+                                    viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                                添加账号
+                            </h2>
+                        </div>
+                        <p class="text-sm text-gray-500 dark:text-gray-400 mb-5">推荐通过 Zencoder 登录快速连接账号。</p>
+
+                        <div class="space-y-3">
+                            <button type="button" id="oauthBtn" aria-describedby="oauthHelper oauthStatus"
+                                class="w-full flex items-center justify-center gap-2 py-3 px-4 border border-transparent rounded-xl shadow-sm text-sm font-semibold text-white bg-primary hover:bg-primary-hover focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary dark:focus:ring-offset-gray-900 transition-all active:scale-[0.98] disabled:opacity-60 disabled:cursor-wait disabled:active:scale-100">
+                                <svg id="oauthBtnIcon" xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none"
+                                    viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M12 11c1.105 0 2-.895 2-2s-.895-2-2-2-2 .895-2 2 .895 2 2 2zm0 0v3m7-3V8a7 7 0 10-14 0v3a2 2 0 00-2 2v5a2 2 0 002 2h14a2 2 0 002-2v-5a2 2 0 00-2-2z" />
+                                </svg>
+                                <span id="oauthBtnText">使用 Zencoder 登录</span>
+                                <svg id="oauthBtnLoading" class="animate-spin h-4 w-4 text-white hidden"
+                                    xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
+                                    aria-hidden="true">
+                                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor"
+                                        stroke-width="4"></circle>
+                                    <path class="opacity-75" fill="currentColor"
+                                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
+                                    </path>
+                                </svg>
+                            </button>
+                            <p id="oauthHelper" class="text-xs leading-5 text-gray-500 dark:text-gray-400">
+                                将打开 Zencoder 官方授权页面，授权完成后账号会自动添加。
+                            </p>
+                            <div
+                                class="flex items-start gap-2.5 border-l-2 border-primary/50 py-1 pl-3 text-xs text-gray-600 dark:text-gray-300">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="mt-0.5 h-4 w-4 shrink-0 text-primary"
+                                    fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                                </svg>
+                                <span><span class="font-medium text-gray-800 dark:text-gray-100">官方授权</span><span
+                                        class="mx-1.5 text-gray-300 dark:text-gray-600">·</span>浏览器不保存令牌</span>
+                            </div>
+                            <p id="oauthStatus" class="hidden text-xs font-medium text-primary dark:text-blue-400"
+                                role="status" aria-live="polite">等待 Zencoder 授权…</p>
+                        </div>
+
+                    </div>
+
+                    <!-- Stats Panel (Moved here) -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <div
+                            class="col-span-2 bg-surface-light dark:bg-surface-dark p-4 rounded-2xl shadow-sm border border-border-light dark:border-border-dark transition-colors duration-300">
+                            <div class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                                总账号数</div>
+                            <div class="text-2xl font-bold text-gray-900 dark:text-white mt-1" id="stat-total-accounts">
+                                -</div>
+                        </div>
+                        <div
+                            class="bg-surface-light dark:bg-surface-dark p-4 rounded-2xl shadow-sm border border-border-light dark:border-border-dark transition-colors duration-300 col-span-2">
+                            <div
+                                class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">
+                                使用量统计 <span class="font-normal normal-case tracking-normal">（本地统计）</span></div>
+                            <div class="flex justify-between items-center">
+                                <div>
+                                    <div class="text-xs text-gray-500 dark:text-gray-400">今日用量</div>
+                                    <div class="text-xl font-bold text-blue-600 dark:text-blue-400"
+                                        id="stat-today-usage">-</div>
+                                </div>
+                                <div class="text-right">
+                                    <div class="text-xs text-gray-500 dark:text-gray-400">总用量</div>
+                                    <div class="text-xl font-bold text-purple-600 dark:text-purple-400"
+                                        id="stat-total-usage">-</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right Column: Account List -->
+                <div class="lg:col-span-9">
+                    <div
+                        class="bg-surface-light dark:bg-surface-dark rounded-2xl shadow-sm border border-border-light dark:border-border-dark flex flex-col h-full overflow-hidden transition-colors duration-300">
+                        <div
+                            class="px-6 py-5 border-b border-border-light dark:border-border-dark flex flex-col gap-4 bg-gray-50/50 dark:bg-gray-800/50">
+                            <div class="flex justify-between items-center w-full">
+                                <h3 class="text-lg font-semibold text-gray-900 dark:text-white flex items-center gap-2">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-gray-500" fill="none"
+                                        viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                                    </svg>
+                                    账号列表
+                                </h3>
+                                <div class="flex items-center gap-3">
+                                    <span class="text-xs text-gray-400 flex items-center gap-1">
+                                        <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                                        自动刷新中
+                                    </span>
+                                </div>
+                            </div>
+
+                            <!-- Batch Actions -->
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                                <div id="batchActions" class="hidden items-center gap-2">
+                                    <span class="text-xs text-gray-500 dark:text-gray-400 hidden" id="selectedCount">0
+                                        选中</span>
+                                    <div id="batchButtonsContainer" class="flex items-center gap-2">
+                                        <!-- 动态按钮将在这里通过 JavaScript 生成 -->
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="tableContainer" class="flex-1 sm:overflow-x-auto">
+                            <table
+                                class="hidden sm:table min-w-full divide-y divide-border-light dark:divide-border-dark">
+                                <thead class="bg-gray-50 dark:bg-gray-800">
+                                    <tr>
+                                        <th scope="col" class="px-6 py-3 text-center w-12">
+                                            <input type="checkbox" id="selectAll" onclick="toggleSelectAll()"
+                                                class="rounded border-gray-300 dark:border-gray-600 text-primary focus:ring-primary h-4 w-4 mx-auto">
+                                        </th>
+                                        <th scope="col"
+                                            class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-20">
+                                            ID</th>
+                                        <th scope="col"
+                                            class="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                                            账号</th>
+                                        <th scope="col"
+                                            class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                                            最后使用</th>
+                                        <th scope="col"
+                                            class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                                            用量</th>
+                                        <th scope="col"
+                                            class="px-6 py-3 text-center text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                                            操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="accountList"
+                                    class="bg-surface-light dark:bg-surface-dark divide-y divide-border-light dark:divide-border-dark">
+                                    <!-- Loaded via JS -->
+                                </tbody>
+                            </table>
+                            <div id="mobileAccountList"
+                                class="sm:hidden divide-y divide-border-light dark:divide-border-dark"
+                                aria-label="OAuth 账号列表">
+                                <!-- Loaded via JS -->
+                            </div>
+                        </div>
+
+                        <!-- Pagination -->
+                        <div id="paginationContainer"
+                            class="px-6 py-4 border-t border-border-light dark:border-border-dark flex items-center justify-between bg-gray-50/50 dark:bg-gray-800/50">
+                            <div class="text-xs text-gray-500 dark:text-gray-400">
+                                显示 <span id="pageStart" class="font-medium">0</span> 到 <span id="pageEnd"
+                                    class="font-medium">0</span> 条，共 <span id="totalItems" class="font-medium">0</span>
+                                条
+                            </div>
+                            <div class="flex gap-2">
+                                <button id="prevPage" onclick="changePage(-1)"
+                                    class="px-3 py-1 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed">上一页</button>
+                                <button id="nextPage" onclick="changePage(1)"
+                                    class="px-3 py-1 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed">下一页</button>
+                            </div>
+                        </div>
+
+                        <!-- Empty State (Hidden by default) -->
+                        <div id="emptyState"
+                            class="hidden flex-1 flex-col items-center justify-center py-12 text-center">
+                            <div class="bg-gray-100 dark:bg-gray-800 rounded-full p-4 mb-3">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-gray-400" fill="none"
+                                    viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
+                                </svg>
+                            </div>
+                            <h3 class="text-sm font-medium text-gray-900 dark:text-white">暂无账号</h3>
+                            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1 px-6">请使用 Zencoder 登录连接您的第一个账号。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </main>
+
+    </div> <!-- End mainApp -->
+
+    <script src="/static/app.js?v=20260718-oauth3"></script>
+</body>
+
+</html>
