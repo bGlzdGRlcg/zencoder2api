@@ -2,7 +2,9 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,6 +35,91 @@ func (h *OAuthHandler) StartZencoder(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+func (h *OAuthHandler) CompleteZencoder(c *gin.Context) {
+	var request struct {
+		CallbackURL string `json:"callback_url"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(c.Request.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式无效，请提交 callback_url"})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求中只能包含一个 JSON 对象"})
+		return
+	}
+
+	state, code, provider, err := parseZencoderCallbackURL(request.CallbackURL)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	_, err = h.svc.CompleteZencoderLogin(c.Request.Context(), state, code, provider)
+	if errors.Is(err, service.ErrOAuthSessionInvalidOrExpired) {
+		c.JSON(http.StatusGone, gin.H{
+			"error":      "该授权链接已过期或已使用，请重新复制授权链接",
+			"reset_flow": true,
+		})
+		return
+	}
+	if err != nil {
+		logging.Warnf("Manual Zencoder OAuth completion failed: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":      "授权回调处理失败，请重新复制授权链接后重试",
+			"reset_flow": true,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Zencoder 账号连接成功",
+	})
+}
+
+func parseZencoderCallbackURL(raw string) (state string, code string, provider string, err error) {
+	callbackURL, parseErr := url.Parse(strings.TrimSpace(raw))
+	if parseErr != nil || callbackURL.Scheme == "" || callbackURL.Host == "" || callbackURL.Opaque != "" {
+		return "", "", "", errors.New("请输入浏览器地址栏中的完整 localhost 回调地址")
+	}
+	if callbackURL.Scheme != "http" && callbackURL.Scheme != "https" {
+		return "", "", "", errors.New("回调地址必须以 http:// 或 https:// 开头")
+	}
+	if callbackURL.User != nil {
+		return "", "", "", errors.New("回调地址不能包含用户名或密码")
+	}
+	if !strings.EqualFold(callbackURL.Hostname(), "localhost") {
+		return "", "", "", errors.New("回调地址的主机名必须是 localhost")
+	}
+	if callbackURL.Fragment != "" {
+		return "", "", "", errors.New("回调地址不能包含片段标识")
+	}
+	if callbackURL.RawPath != "" {
+		return "", "", "", errors.New("回调地址路径格式无效")
+	}
+
+	const callbackPrefix = "/oauth/zencoder/callback/"
+	if !strings.HasPrefix(callbackURL.Path, callbackPrefix) {
+		return "", "", "", errors.New("这不是有效的 Zencoder 回调地址")
+	}
+	state = strings.TrimPrefix(callbackURL.Path, callbackPrefix)
+	if state == "" || strings.Contains(state, "/") {
+		return "", "", "", errors.New("回调地址缺少有效的授权状态")
+	}
+
+	query, queryErr := url.ParseQuery(callbackURL.RawQuery)
+	if queryErr != nil {
+		return "", "", "", errors.New("回调地址的查询参数格式无效")
+	}
+	codes := query["code"]
+	if len(codes) != 1 || strings.TrimSpace(codes[0]) == "" {
+		return "", "", "", errors.New("回调地址中缺少有效的授权码 code")
+	}
+	code = codes[0]
+	provider = query.Get("provider")
+	return state, code, provider, nil
 }
 
 func (h *OAuthHandler) ZencoderCallback(c *gin.Context) {

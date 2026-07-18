@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -24,6 +25,8 @@ import (
 )
 
 const oauthSessionTTL = 10 * time.Minute
+
+var ErrOAuthSessionInvalidOrExpired = errors.New("OAuth session is invalid or expired")
 
 type oauthSession struct {
 	CodeVerifier string
@@ -66,7 +69,10 @@ func (s *OAuthService) StartZencoderLogin(origin string) (OAuthStartResult, erro
 	if err != nil {
 		return OAuthStartResult{}, err
 	}
-	callbackURL := strings.TrimRight(origin, "/") + "/oauth/zencoder/callback/" + state
+	callbackURL, err := loopbackCallbackURL(origin, state)
+	if err != nil {
+		return OAuthStartResult{}, err
+	}
 
 	s.mu.Lock()
 	now := time.Now()
@@ -113,7 +119,7 @@ func (s *OAuthService) CompleteZencoderLogin(
 	}
 	s.mu.Unlock()
 	if !exists || time.Now().After(session.ExpiresAt) {
-		return OAuthCompleteResult{}, errors.New("OAuth session is invalid or expired")
+		return OAuthCompleteResult{}, ErrOAuthSessionInvalidOrExpired
 	}
 	if strings.TrimSpace(code) == "" {
 		return OAuthCompleteResult{Origin: session.Origin}, errors.New("OAuth callback has no authorization code")
@@ -136,6 +142,23 @@ func (s *OAuthService) CompleteZencoderLogin(
 	}
 	RefreshAccountPool()
 	return OAuthCompleteResult{Account: account, Origin: session.Origin}, nil
+}
+
+func loopbackCallbackURL(origin string, state string) (string, error) {
+	parsedOrigin, err := url.Parse(origin)
+	if err != nil || parsedOrigin.Host == "" {
+		return "", errors.New("invalid OAuth deployment origin")
+	}
+	host := "localhost"
+	if port := parsedOrigin.Port(); port != "" {
+		host = net.JoinHostPort(host, port)
+	}
+	callback := url.URL{
+		Scheme: "http",
+		Host:   host,
+		Path:   "/oauth/zencoder/callback/" + state,
+	}
+	return callback.String(), nil
 }
 
 func (s *OAuthService) exchangeCode(

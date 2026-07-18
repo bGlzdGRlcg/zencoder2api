@@ -668,43 +668,106 @@ async function batchDelete(deleteAll = false) {
 }
 
 // --- Zencoder OAuth ---
-function setOAuthButtonState(isWaiting) {
+function setOAuthButtonState(mode = "idle") {
 	const button = document.getElementById("oauthBtn");
 	const text = document.getElementById("oauthBtnText");
 	const icon = document.getElementById("oauthBtnIcon");
 	const loading = document.getElementById("oauthBtnLoading");
-	const status = document.getElementById("oauthStatus");
 
-	if (!button || !text || !icon || !loading || !status) return;
+	if (!button || !text || !icon || !loading) return;
 
-	button.disabled = isWaiting;
-	text.textContent = isWaiting ? "等待授权…" : "使用 Zencoder 登录";
-	icon.classList.toggle("hidden", isWaiting);
-	loading.classList.toggle("hidden", !isWaiting);
-	status.classList.toggle("hidden", !isWaiting);
+	const isLoading = mode === "loading";
+	button.disabled = isLoading;
+	text.textContent = isLoading
+		? "正在生成…"
+		: mode === "copied"
+			? "已复制 · 再次复制"
+			: "复制授权链接";
+	icon.classList.toggle("hidden", isLoading);
+	loading.classList.toggle("hidden", !isLoading);
 }
 
-function resetOAuthFlow() {
+function setOAuthStatus(message = "", type = "info") {
+	const status = document.getElementById("oauthStatus");
+	if (!status) return;
+	status.textContent = message;
+	status.classList.toggle("hidden", !message);
+	status.classList.toggle("text-red-600", type === "error");
+	status.classList.toggle("dark:text-red-400", type === "error");
+	status.classList.toggle("text-primary", type !== "error");
+	status.classList.toggle("dark:text-blue-400", type !== "error");
+}
+
+function setOAuthActiveStep(activeStep) {
+	for (let step = 1; step <= 3; step += 1) {
+		const item = document.getElementById(`oauthStep${step}`);
+		if (!item) continue;
+		const isActive = step === activeStep;
+		item.classList.toggle("bg-blue-50", isActive);
+		item.classList.toggle("text-blue-900", isActive);
+		item.classList.toggle("dark:bg-blue-900/20", isActive);
+		item.classList.toggle("dark:text-blue-100", isActive);
+		item.classList.toggle("text-gray-800", !isActive);
+		item.classList.toggle("dark:text-gray-100", !isActive);
+	}
+}
+
+function setOAuthValidation(message = "") {
+	const input = document.getElementById("oauthCallbackURL");
+	const error = document.getElementById("oauthCallbackError");
+	if (!input || !error) return;
+	error.textContent = message;
+	error.classList.toggle("hidden", !message);
+	input.setAttribute("aria-invalid", message ? "true" : "false");
+	input.classList.toggle("border-red-500", Boolean(message));
+}
+
+function resetOAuthFlow({ clearInput = true } = {}) {
 	if (oauthFlow) {
 		clearTimeout(oauthFlow.timeoutTimer);
-		clearInterval(oauthFlow.closeTimer);
-		if (oauthFlow.popup && !oauthFlow.popup.closed) {
-			oauthFlow.popup.close();
-		}
 	}
 	oauthFlow = null;
-	setOAuthButtonState(false);
+	setOAuthButtonState("idle");
+	setOAuthStatus();
+	setOAuthValidation();
+	const input = document.getElementById("oauthCallbackURL");
+	if (input && clearInput) input.value = "";
+	setOAuthActiveStep(1);
 }
 
-function failOAuthFlow(message) {
+function expireOAuthFlow() {
 	resetOAuthFlow();
-	showToast(message || "Zencoder 授权失败，请重试", "error");
+	showToast("授权链接已超过 5 分钟，请重新复制", "error");
 }
 
-function getPopupFeatures(width = 560, height = 720) {
-	const left = Math.max(0, window.screenX + (window.outerWidth - width) / 2);
-	const top = Math.max(0, window.screenY + (window.outerHeight - height) / 2);
-	return `popup=yes,width=${width},height=${height},left=${Math.round(left)},top=${Math.round(top)},resizable=yes,scrollbars=yes`;
+async function copyTextWithFallback(value) {
+	if (navigator.clipboard && window.isSecureContext) {
+		try {
+			await navigator.clipboard.writeText(value);
+			return;
+		} catch (_) {
+			// Fall through for browsers that expose the API but deny the request.
+		}
+	}
+
+	const helper = document.createElement("textarea");
+	helper.value = value;
+	helper.setAttribute("readonly", "");
+	helper.style.position = "fixed";
+	helper.style.top = "0";
+	helper.style.left = "-9999px";
+	helper.style.opacity = "0";
+	document.body.appendChild(helper);
+	helper.focus();
+	helper.select();
+	helper.setSelectionRange(0, helper.value.length);
+	let copied = false;
+	try {
+		copied = document.execCommand("copy");
+	} finally {
+		helper.remove();
+	}
+	if (!copied) throw new Error("浏览器拒绝访问剪贴板");
 }
 
 async function readResponseError(response, fallback) {
@@ -721,97 +784,157 @@ async function readResponseError(response, fallback) {
 }
 
 async function startZencoderOAuth() {
-	if (oauthFlow) return;
-
-	setOAuthButtonState(true);
+	setOAuthButtonState("loading");
 
 	try {
-		const response = await fetch(`${API_BASE}/oauth/zencoder/start`, {
-			method: "POST",
-			headers: getAuthHeaders(),
-		});
+		if (!oauthFlow) {
+			const response = await fetch(`${API_BASE}/oauth/zencoder/start`, {
+				method: "POST",
+				headers: getAuthHeaders(),
+			});
 
-		if (!response.ok) {
-			throw new Error(
-				await readResponseError(response, "无法启动 Zencoder 授权"),
-			);
-		}
-
-		const data = await response.json();
-		if (
-			!data ||
-			typeof data.authorization_url !== "string" ||
-			!data.authorization_url.trim()
-		) {
-			throw new Error("服务器未返回有效的授权地址");
-		}
-
-		const authorizationURL = new URL(
-			data.authorization_url,
-			window.location.href,
-		);
-		if (!["http:", "https:"].includes(authorizationURL.protocol)) {
-			throw new Error("服务器返回了不受支持的授权地址");
-		}
-
-		const popup = window.open(
-			authorizationURL.href,
-			"zencoder-oauth",
-			getPopupFeatures(),
-		);
-		if (!popup) {
-			window.location.assign(authorizationURL.href);
-			return;
-		}
-
-		popup.focus();
-		oauthFlow = {
-			popup,
-			state: typeof data.state === "string" ? data.state : null,
-			timeoutTimer: null,
-			closeTimer: null,
-		};
-
-		oauthFlow.timeoutTimer = setTimeout(() => {
-			failOAuthFlow("Zencoder 授权已超时，请重新登录");
-		}, OAUTH_TIMEOUT_MS);
-
-		oauthFlow.closeTimer = setInterval(() => {
-			if (oauthFlow && oauthFlow.popup.closed) {
-				failOAuthFlow("授权窗口已关闭，账号尚未连接");
+			if (!response.ok) {
+				throw new Error(
+					await readResponseError(response, "无法启动 Zencoder 授权"),
+				);
 			}
-		}, 600);
+
+			const data = await response.json();
+			if (
+				!data ||
+				typeof data.authorization_url !== "string" ||
+				!data.authorization_url.trim() ||
+				typeof data.state !== "string" ||
+				!data.state.trim()
+			) {
+				throw new Error("服务器未返回有效的授权信息");
+			}
+
+			const authorizationURL = new URL(data.authorization_url);
+			if (!["http:", "https:"].includes(authorizationURL.protocol)) {
+				throw new Error("服务器返回了不受支持的授权地址");
+			}
+			oauthFlow = {
+				authorizationURL: authorizationURL.href,
+				state: data.state,
+				timeoutTimer: setTimeout(expireOAuthFlow, OAUTH_TIMEOUT_MS),
+			};
+		}
+
+		await copyTextWithFallback(oauthFlow.authorizationURL);
+		setOAuthActiveStep(1);
+		setOAuthButtonState("copied");
+		setOAuthStatus("授权链接已复制，请按下方步骤继续");
+		showToast("授权链接已复制", "success");
 	} catch (error) {
-		failOAuthFlow(`无法连接 Zencoder：${error.message || "请稍后重试"}`);
+		resetOAuthFlow();
+		showToast(`无法复制授权链接：${error.message || "请稍后重试"}`, "error");
 	}
 }
 
-async function handleOAuthMessage(event) {
-	if (event.origin !== window.location.origin || !oauthFlow) return;
-	if (oauthFlow.popup && event.source !== oauthFlow.popup) return;
+function validateOAuthCallbackURL(rawValue) {
+	if (!oauthFlow) throw new Error("授权链接已失效，请重新复制");
+	const value = rawValue.trim();
+	if (!value) throw new Error("请粘贴完整的 localhost 回调地址");
 
-	const data = event.data;
-	if (
-		!data ||
-		data.type !== "zencoder-oauth" ||
-		typeof data.success !== "boolean"
-	)
-		return;
+	let callbackURL;
+	try {
+		callbackURL = new URL(value);
+	} catch (_) {
+		throw new Error("回调地址格式无效，请从浏览器地址栏重新复制");
+	}
+	if (!["http:", "https:"].includes(callbackURL.protocol)) {
+		throw new Error("回调地址必须以 http:// 或 https:// 开头");
+	}
+	if (callbackURL.username || callbackURL.password) {
+		throw new Error("回调地址不能包含用户名或密码");
+	}
+	if (callbackURL.hostname.toLowerCase() !== "localhost") {
+		throw new Error("回调地址的主机名必须是 localhost");
+	}
+	const expectedPath = `/oauth/zencoder/callback/${oauthFlow.state}`;
+	if (callbackURL.pathname !== expectedPath) {
+		throw new Error("回调地址与当前授权链接不匹配，请检查后重试");
+	}
+	const codes = callbackURL.searchParams.getAll("code");
+	if (codes.length !== 1 || !codes[0].trim()) {
+		throw new Error("回调地址中缺少有效的授权码 code");
+	}
+	if (callbackURL.hash) throw new Error("回调地址不能包含片段标识");
+	return callbackURL.href;
+}
 
-	const message =
-		typeof data.message === "string" && data.message.trim()
-			? data.message.trim()
-			: "";
-	if (!data.success) {
-		failOAuthFlow(message || "Zencoder 未完成授权，请重试");
+function setOAuthCompleteLoading(isLoading) {
+	const button = document.getElementById("oauthCompleteBtn");
+	const text = document.getElementById("oauthCompleteBtnText");
+	const loading = document.getElementById("oauthCompleteLoading");
+	if (!button || !text || !loading) return;
+	button.disabled = isLoading;
+	text.textContent = isLoading ? "正在连接…" : "提交回调地址";
+	loading.classList.toggle("hidden", !isLoading);
+}
+
+async function completeZencoderOAuth(event) {
+	event.preventDefault();
+	const input = document.getElementById("oauthCallbackURL");
+	setOAuthValidation();
+	setOAuthActiveStep(3);
+
+	let callbackURL;
+	try {
+		callbackURL = validateOAuthCallbackURL(input?.value || "");
+	} catch (error) {
+		setOAuthValidation(error.message);
+		input?.focus();
 		return;
 	}
 
-	resetOAuthFlow();
-	currentState.page = 1;
-	currentState.selectedIds.clear();
-	await loadAccounts();
-	showToast(message || "Zencoder 账号连接成功", "success");
+	setOAuthCompleteLoading(true);
+	try {
+		const response = await fetch(`${API_BASE}/oauth/zencoder/complete`, {
+			method: "POST",
+			headers: {
+				...getAuthHeaders(),
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ callback_url: callbackURL }),
+		});
+		let data = {};
+		try {
+			data = await response.json();
+		} catch (_) {
+			// The fallback below includes the HTTP status without exposing the URL.
+		}
+		if (!response.ok) {
+			const message =
+				typeof data.error === "string" && data.error.trim()
+					? data.error.trim()
+					: `无法完成授权（HTTP ${response.status}）`;
+			if (data.reset_flow === true) {
+				resetOAuthFlow();
+				showToast(message, "error");
+				return;
+			}
+			throw new Error(message);
+		}
+
+		resetOAuthFlow();
+		currentState.page = 1;
+		currentState.selectedIds.clear();
+		await loadAccounts();
+		showToast(
+			typeof data.message === "string" && data.message.trim()
+				? data.message.trim()
+				: "Zencoder 账号连接成功",
+			"success",
+		);
+	} catch (error) {
+		setOAuthValidation(error.message || "无法完成授权，请检查地址后重试");
+		setOAuthStatus("回调提交失败，请修正后重试", "error");
+		input?.focus();
+	} finally {
+		setOAuthCompleteLoading(false);
+	}
 }
 
 function consumeOAuthRedirectResult() {
@@ -835,7 +958,16 @@ function consumeOAuthRedirectResult() {
 document
 	.getElementById("oauthBtn")
 	.addEventListener("click", startZencoderOAuth);
-window.addEventListener("message", handleOAuthMessage);
+document
+	.getElementById("oauthCompleteForm")
+	.addEventListener("submit", completeZencoderOAuth);
+document.getElementById("oauthCallbackURL").addEventListener("focus", () => {
+	setOAuthActiveStep(3);
+});
+document.getElementById("oauthCallbackURL").addEventListener("input", () => {
+	setOAuthValidation();
+	setOAuthActiveStep(3);
+});
 
 async function deleteAccount(id) {
 	if (!confirm("确定要删除此账号吗？")) return;

@@ -97,5 +97,6 @@ func setupRoutes(r *gin.Engine) {
 		api.DELETE("/accounts/:id", accountHandler.Delete)
 		api.POST("/accounts/batch/delete", accountHandler.BatchDelete)
 		api.POST("/oauth/zencoder/start", oauthHandler.StartZencoder)
+		api.POST("/oauth/zencoder/complete", oauthHandler.CompleteZencoder)
 	}
 }
