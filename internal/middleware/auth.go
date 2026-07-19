@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"crypto/subtle"
+	"errors"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -21,9 +23,14 @@ func AuthMiddleware() gin.HandlerFunc {
 	token := os.Getenv("AUTH_TOKEN")
 
 	return func(c *gin.Context) {
-		// 如果没有配置全局 Token，则跳过鉴权
+		// Empty credentials are only allowed for an explicitly enabled loopback
+		// development server. Production misconfiguration fails closed.
 		if token == "" {
-			c.Next()
+			if allowInsecureLocalRequest(c) {
+				c.Next()
+				return
+			}
+			unauthenticatedConfiguration(c)
 			return
 		}
 
@@ -31,7 +38,7 @@ func AuthMiddleware() gin.HandlerFunc {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader != "" {
 			parts := strings.SplitN(authHeader, " ", 2)
-			if len(parts) == 2 && parts[0] == "Bearer" && constantTimeEqual(parts[1], token) {
+			if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") && constantTimeEqual(parts[1], token) {
 				c.Next()
 				return
 			}
@@ -48,12 +55,19 @@ func AuthMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if constantTimeEqual(c.Query("key"), token) {
+		if strings.HasPrefix(c.Request.URL.Path, "/v1beta/models") && constantTimeEqual(c.Request.URL.Query().Get("key"), token) {
+			// Gemini SDKs commonly put their key in the query. Remove it immediately
+			// after authentication so downstream logs and handlers never retain it.
+			query := c.Request.URL.Query()
+			query.Del("key")
+			c.Request.URL.RawQuery = query.Encode()
+			c.Request.RequestURI = c.Request.URL.RequestURI()
 			c.Next()
 			return
 		}
 
 		// 鉴权失败
+		c.Header("WWW-Authenticate", `Bearer realm="zencoder2api"`)
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 			"error": gin.H{
 				"message": "Invalid authentication token",
@@ -69,51 +83,55 @@ func AdminAuthMiddleware() gin.HandlerFunc {
 	adminPassword := os.Getenv("ADMIN_PASSWORD")
 
 	return func(c *gin.Context) {
-		// 如果没有配置管理密码，则跳过鉴权
+		// Empty credentials are only allowed for an explicitly enabled loopback
+		// development server. Production misconfiguration fails closed.
 		if adminPassword == "" {
-			c.Next()
-			return
-		}
-
-		// 检查请求头中的管理密码
-		// 支持多种格式：
-		// 1. Authorization: Bearer <password>
-		// 2. X-Admin-Password: <password>
-		// 3. Admin-Password: <password>
-
-		var providedPassword string
-
-		// 检查 Authorization: Bearer <password>
-		authHeader := c.GetHeader("Authorization")
-		if authHeader != "" {
-			parts := strings.SplitN(authHeader, " ", 2)
-			if len(parts) == 2 && parts[0] == "Bearer" {
-				providedPassword = parts[1]
+			if allowInsecureLocalRequest(c) {
+				c.Next()
+				return
 			}
-		}
-
-		// 检查 X-Admin-Password
-		if providedPassword == "" {
-			providedPassword = c.GetHeader("X-Admin-Password")
-		}
-
-		// 检查 Admin-Password
-		if providedPassword == "" {
-			providedPassword = c.GetHeader("Admin-Password")
-		}
-
-		// 验证密码
-		if constantTimeEqual(providedPassword, adminPassword) {
-			c.Next()
+			unauthenticatedConfiguration(c)
 			return
 		}
 
-		// 鉴权失败
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-			"error": gin.H{
-				"message": "Invalid admin password",
-				"type":    "authentication_error",
-			},
-		})
+		// Bearer remains available for non-browser automation. Browser clients
+		// exchange it once for a short-lived HttpOnly session.
+		if providedPassword, ok := bearerCredential(c.GetHeader("Authorization")); ok && constantTimeEqual(providedPassword, adminPassword) {
+			c.Next()
+			return
+		}
+		if err := authenticateAdminSession(c, adminPassword); err == nil {
+			c.Next()
+			return
+		} else if errors.Is(err, errInvalidCSRFToken) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": gin.H{
+				"message": "Invalid CSRF token",
+				"type":    "permission_error",
+			}})
+			return
+		}
+
+		writeAdminUnauthorized(c)
 	}
+}
+
+func unauthenticatedConfiguration(c *gin.Context) {
+	c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+		"error": gin.H{
+			"message": "server authentication is not configured",
+			"type":    "configuration_error",
+		},
+	})
+}
+
+func allowInsecureLocalRequest(c *gin.Context) bool {
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("ALLOW_INSECURE_LOCALHOST")), "true") {
+		return false
+	}
+	host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+	if err != nil {
+		host = c.Request.RemoteAddr
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }

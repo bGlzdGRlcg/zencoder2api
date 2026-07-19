@@ -1,12 +1,9 @@
 package handler
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -36,16 +33,10 @@ func (h *OpenAIHandler) Models(c *gin.Context) {
 	items := make([]gin.H, 0)
 	for _, zenModel := range model.ListZenModels() {
 		items = append(items, gin.H{
-			"id":           zenModel.ID,
-			"object":       "model",
-			"created":      int64(0),
-			"owned_by":     zenModel.ProviderID,
-			"root":         zenModel.ID,
-			"parent":       nil,
-			"display_name": zenModel.DisplayName,
-			"provider":     zenModel.ProviderID,
-			"actual_model": zenModel.Model,
-			"multiplier":   zenModel.Multiplier,
+			"id":       zenModel.ID,
+			"object":   "model",
+			"created":  int64(0),
+			"owned_by": "zencoder",
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -54,18 +45,31 @@ func (h *OpenAIHandler) Models(c *gin.Context) {
 	})
 }
 
-// generateTraceID 生成一个随机的 trace ID
-func generateTraceID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+// Model returns one model using the same public shape as the list endpoint.
+func (h *OpenAIHandler) Model(c *gin.Context) {
+	modelID := strings.TrimSpace(c.Param("model"))
+	zenModel, ok := model.GetZenModel(modelID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{
+			"message": "model not found",
+			"type":    "invalid_request_error",
+			"code":    "model_not_found",
+		}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"id":       zenModel.ID,
+		"object":   "model",
+		"created":  int64(0),
+		"owned_by": "zencoder",
+	})
 }
 
 // ChatCompletions 处理 POST /v1/chat/completions
 func (h *OpenAIHandler) ChatCompletions(c *gin.Context) {
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := readRequestBody(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(bodyErrorStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 
@@ -86,32 +90,39 @@ func (h *OpenAIHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	// 根据模型的 ProviderID 分流
-	zenModel := model.ResolveOpenAIModel(req.Model)
+	zenModel, known := model.GetZenModel(req.Model)
+	if !known {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+			"message": "unknown model",
+			"type":    "invalid_request_error",
+		}})
+		return
+	}
 	if zenModel.ProviderID == "gemini" || strings.HasPrefix(strings.ToLower(req.Model), "gemini-") {
-		if err := h.geminiSvc.ChatCompletionsProxy(c.Request.Context(), c.Writer, body); err != nil {
+		if err := h.geminiSvc.ChatCompletionsProxy(c.Request.Context(), c.Writer, body); err != nil && !c.Writer.Written() {
 			h.handleError(c, err)
 		}
 		return
 	}
 	if zenModel.ProviderID == "xai" || strings.HasPrefix(strings.ToLower(req.Model), "grok-") {
 		// Grok 模型使用 xAI 服务
-		if err := h.grokSvc.ChatCompletionsProxy(c.Request.Context(), c.Writer, body); err != nil {
+		if err := h.grokSvc.ChatCompletionsProxy(c.Request.Context(), c.Writer, body); err != nil && !c.Writer.Written() {
 			h.handleError(c, err)
 		}
 		return
 	}
 
 	// 其他模型使用 OpenAI 服务
-	if err := h.svc.ChatCompletionsProxy(c.Request.Context(), c.Writer, body); err != nil {
+	if err := h.svc.ChatCompletionsProxy(c.Request.Context(), c.Writer, body); err != nil && !c.Writer.Written() {
 		h.handleError(c, err)
 	}
 }
 
 // Responses 处理 POST /v1/responses
 func (h *OpenAIHandler) Responses(c *gin.Context) {
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := readRequestBody(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(bodyErrorStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 
@@ -132,15 +143,21 @@ func (h *OpenAIHandler) Responses(c *gin.Context) {
 
 	// Gemini models are served through the native generateContent endpoint.
 	// Adapt Responses requests before they reach the OpenAI Responses gateway.
-	zenModel := model.ResolveOpenAIModel(req.Model)
+	zenModel, known := model.GetZenModel(req.Model)
+	if !known {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+			"message": "unknown model",
+			"type":    "invalid_request_error",
+		}})
+		return
+	}
 	if zenModel.ProviderID == "gemini" || strings.HasPrefix(strings.ToLower(req.Model), "gemini-") {
-		if err := h.geminiSvc.ResponsesProxy(c.Request.Context(), c.Writer, body); err != nil {
+		if err := h.geminiSvc.ResponsesProxy(c.Request.Context(), c.Writer, body); err != nil && !c.Writer.Written() {
 			h.handleError(c, err)
 		}
 		return
 	}
-
-	if err := h.svc.ResponsesProxy(c.Request.Context(), c.Writer, body); err != nil {
+	if err := h.svc.ResponsesProxy(c.Request.Context(), c.Writer, body); err != nil && !c.Writer.Written() {
 		h.handleError(c, err)
 	}
 }
@@ -162,10 +179,16 @@ func (h *OpenAIHandler) handleError(c *gin.Context, err error) {
 	}
 
 	if errors.Is(err, service.ErrNoAvailableAccount) {
-		traceID := generateTraceID()
+		traceID := requestTraceID(c)
 		errMsg := fmt.Sprintf("没有可用token（traceid: %s）", traceID)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsg})
 		return
 	}
-	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	traceID := requestTraceID(c)
+	c.Header("X-Request-ID", traceID)
+	c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+		"message":  "upstream request failed",
+		"type":     "upstream_error",
+		"trace_id": traceID,
+	}})
 }

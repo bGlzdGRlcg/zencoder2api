@@ -86,34 +86,34 @@ var ZenModels = map[string]ZenModel{
 	"claude-haiku-4-5-20251001": {ID: "claude-haiku-4-5-20251001", GatewayID: "haiku-4-5-think", DisplayName: "Claude Haiku 4.5", Model: "claude-haiku-4-5-20251001", Multiplier: 1, ProviderID: "anthropic", Parameters: anthropicEnabledParams},
 	"claude-sonnet-4-6":         {ID: "claude-sonnet-4-6", GatewayID: "sonnet-4-6-think", DisplayName: "Claude Sonnet 4.6", Model: "claude-sonnet-4-6", Multiplier: 3, ProviderID: "anthropic", Parameters: anthropicAdaptiveParams},
 	"claude-sonnet-5":           {ID: "claude-sonnet-5", GatewayID: "sonnet-5-think", DisplayName: "Claude Sonnet 5", Model: "claude-sonnet-5", Multiplier: 3, ProviderID: "anthropic", Parameters: anthropicAdaptiveNoBetaParams},
-	"claude-opus-4-6":           {ID: "claude-opus-4-6", GatewayID: "opus-4-6-think", DisplayName: "Claude Opus 4.6", Model: "claude-opus-4-6", Multiplier: 5, ProviderID: "anthropic", Parameters: anthropicAdaptiveParams, IsHidden: true},
+	"claude-opus-4-6":           {ID: "claude-opus-4-6", GatewayID: "opus-4-6-think", DisplayName: "Claude Opus 4.6", Model: "claude-opus-4-6", Multiplier: 5, ProviderID: "anthropic", Parameters: anthropicAdaptiveParams},
 	"claude-opus-4-7":           {ID: "claude-opus-4-7", GatewayID: "opus-4-7-think", DisplayName: "Claude Opus 4.7", Model: "claude-opus-4-7", Multiplier: 5, ProviderID: "anthropic", Parameters: anthropicAdaptiveNoBetaParams},
 	"claude-opus-4-8":           {ID: "claude-opus-4-8", GatewayID: "opus-4-8-think", DisplayName: "Claude Opus 4.8", Model: "claude-opus-4-8", Multiplier: 5, ProviderID: "anthropic", Parameters: anthropicAdaptiveNoBetaParams},
 
 	// Gemini
-	"gemini-3.1-pro-preview":             {ID: "gemini-3.1-pro-preview", GatewayID: "gemini-3-1-pro-preview", DisplayName: "Gemini Pro 3.1", Model: "gemini-3.1-pro-preview", Multiplier: 2, ProviderID: "gemini", IsHidden: true},
+	"gemini-3.1-pro-preview":             {ID: "gemini-3.1-pro-preview", GatewayID: "gemini-3-1-pro-preview", DisplayName: "Gemini Pro 3.1", Model: "gemini-3.1-pro-preview", Multiplier: 2, ProviderID: "gemini"},
 	"gemini-3.1-pro-preview-customtools": {ID: "gemini-3.1-pro-preview-customtools", GatewayID: "gemini-3-1-pro-preview-customtools", DisplayName: "Gemini Pro 3.1", Model: "gemini-3.1-pro-preview-customtools", Multiplier: 2, ProviderID: "gemini"},
 	"gemini-3-flash-preview":             {ID: "gemini-3-flash-preview", DisplayName: "Gemini Flash 3.0", Model: "gemini-3-flash-preview", Multiplier: 1, ProviderID: "gemini"},
 	"gemini-3.5-flash":                   {ID: "gemini-3.5-flash", GatewayID: "gemini-3-5-flash", DisplayName: "Gemini Flash 3.5", Model: "gemini-3.5-flash", Multiplier: 2.5, ProviderID: "gemini"},
-	"gemini-3.1-flash-image-preview":     {ID: "gemini-3.1-flash-image-preview", GatewayID: "gemini-3-1-flash-image-preview", DisplayName: "Gemini 3.1 Flash Image Preview", Model: "gemini-3.1-flash-image-preview", Multiplier: 8, ProviderID: "gemini", IsHidden: true},
+	"gemini-3.1-flash-image-preview":     {ID: "gemini-3.1-flash-image-preview", GatewayID: "gemini-3-1-flash-image-preview", DisplayName: "Gemini 3.1 Flash Image Preview", Model: "gemini-3.1-flash-image-preview", Multiplier: 8, ProviderID: "gemini"},
 
 	// Other gateway providers exposed through the OpenAI-compatible route
 	"minimax-m3": {ID: "minimax-m3", DisplayName: "MiniMax M3", Model: "accounts/fireworks/models/minimax-m3", Multiplier: 1, ProviderID: "minimax", Parameters: minimaxParams},
 	"glm-5.2":    {ID: "glm-5.2", GatewayID: "glm-5-2", DisplayName: "GLM 5.2", Model: "accounts/fireworks/models/glm-5p2", Multiplier: 2, ProviderID: "glm", Parameters: glmParams},
 
 	// OpenAI
-	"gpt-5.1-codex-mini": {ID: "gpt-5.1-codex-mini", GatewayID: "gpt-5-1-codex-mini", DisplayName: "GPT-5.1 Codex mini", Model: "gpt-5.1-codex-mini", Multiplier: 0.5, ProviderID: "openai", Parameters: openaiParams, IsHidden: true},
-	"gpt-5.1-codex-max":  {ID: "gpt-5.1-codex-max", GatewayID: "gpt-5-1-codex-max", DisplayName: "GPT-5.1 Codex Max", Model: "gpt-5.1-codex-max", Multiplier: 1.5, ProviderID: "openai", Parameters: openaiParams, IsHidden: true},
-	"gpt-5.3-codex":      {ID: "gpt-5.3-codex", GatewayID: "gpt-5-3-codex", DisplayName: "GPT-5.3 Codex", Model: "gpt-5.3-codex", Multiplier: 2, ProviderID: "openai", Parameters: openaiParams, IsHidden: true},
+	"gpt-5.1-codex-mini": {ID: "gpt-5.1-codex-mini", GatewayID: "gpt-5-1-codex-mini", DisplayName: "GPT-5.1 Codex mini", Model: "gpt-5.1-codex-mini", Multiplier: 0.5, ProviderID: "openai", Parameters: openaiParams},
+	"gpt-5.1-codex-max":  {ID: "gpt-5.1-codex-max", GatewayID: "gpt-5-1-codex-max", DisplayName: "GPT-5.1 Codex Max", Model: "gpt-5.1-codex-max", Multiplier: 1.5, ProviderID: "openai", Parameters: openaiParams},
+	"gpt-5.3-codex":      {ID: "gpt-5.3-codex", GatewayID: "gpt-5-3-codex", DisplayName: "GPT-5.3 Codex", Model: "gpt-5.3-codex", Multiplier: 2, ProviderID: "openai", Parameters: openaiParams},
 	"gpt-5.4-mini":       {ID: "gpt-5.4-mini", GatewayID: "gpt-5-4-mini", DisplayName: "GPT-5.4 mini", Model: "gpt-5.4-mini", Multiplier: 1.25, ProviderID: "openai", Parameters: openaiParams},
 	"gpt-5.4":            {ID: "gpt-5.4", GatewayID: "gpt-5-4", DisplayName: "GPT-5.4", Model: "gpt-5.4", Multiplier: 2.5, ProviderID: "openai", Parameters: openaiParams},
 	"gpt-5.5":            {ID: "gpt-5.5", GatewayID: "gpt-5-5", DisplayName: "GPT-5.5", Model: "gpt-5.5", Multiplier: 5, ProviderID: "openai", Parameters: openaiParams},
-	"gpt-5.6-luna":       {ID: "gpt-5.6-luna", GatewayID: "gpt-5-6-luna", DisplayName: "GPT-5.6 Luna", Model: "gpt-5.6-luna", Multiplier: 1.25, ProviderID: "openai", Parameters: openaiParams, IsHidden: true},
-	"gpt-5.6-terra":      {ID: "gpt-5.6-terra", GatewayID: "gpt-5-6-terra", DisplayName: "GPT-5.6 Terra", Model: "gpt-5.6-terra", Multiplier: 2.5, ProviderID: "openai", Parameters: openaiParams, IsHidden: true},
+	"gpt-5.6-luna":       {ID: "gpt-5.6-luna", GatewayID: "gpt-5-6-luna", DisplayName: "GPT-5.6 Luna", Model: "gpt-5.6-luna", Multiplier: 1.25, ProviderID: "openai", Parameters: openaiParams},
+	"gpt-5.6-terra":      {ID: "gpt-5.6-terra", GatewayID: "gpt-5-6-terra", DisplayName: "GPT-5.6 Terra", Model: "gpt-5.6-terra", Multiplier: 2.5, ProviderID: "openai", Parameters: openaiParams},
 
 	// xAI
-	"grok-code-fast": {ID: "grok-code-fast", DisplayName: "Grok Code Fast 1", Model: "grok-code-fast-1", Multiplier: 0.25, ProviderID: "xai", Parameters: &ModelParameters{Temperature: &temp0}, IsHidden: true},
-	"grok-4.5":       {ID: "grok-4.5", GatewayID: "grok-4-5", DisplayName: "Grok 4.5", Model: "grok-4.5", Multiplier: 2, ProviderID: "xai", Parameters: &ModelParameters{Reasoning: &ReasoningConfig{Effort: "high"}}, IsHidden: true},
+	"grok-code-fast": {ID: "grok-code-fast", DisplayName: "Grok Code Fast 1", Model: "grok-code-fast-1", Multiplier: 0.25, ProviderID: "xai", Parameters: &ModelParameters{Temperature: &temp0}},
+	"grok-4.5":       {ID: "grok-4.5", GatewayID: "grok-4-5", DisplayName: "Grok 4.5", Model: "grok-4.5", Multiplier: 2, ProviderID: "xai", Parameters: &ModelParameters{Reasoning: &ReasoningConfig{Effort: "high"}}},
 }
 
 // GetZenModel 获取模型配置，如果不存在则返回空模型和false
@@ -139,7 +139,7 @@ func ListZenModels() []ZenModel {
 	seen := make(map[string]struct{}, len(ZenModels))
 	models := make([]ZenModel, 0, len(ZenModels))
 	for _, zenModel := range ZenModels {
-		if zenModel.ID == "" {
+		if zenModel.ID == "" || zenModel.IsHidden {
 			continue
 		}
 		if _, exists := seen[zenModel.ID]; exists {
@@ -180,8 +180,8 @@ type ValidationError struct {
 // or abort.
 func ValidateCatalog() []ValidationError {
 	var errs []ValidationError
-	seenID := map[string]string{}      // ID -> first occurrence provider
-	seenGateway := map[string]string{} // gateway ID -> model ID
+	seenID := map[string]string{}        // ID -> first occurrence provider
+	seenGateway := map[string]ZenModel{} // gateway ID -> first catalog entry
 
 	for id, m := range ZenModels {
 		if id == "" {
@@ -211,9 +211,12 @@ func ValidateCatalog() []ValidationError {
 		// Duplicate GatewayID check (only when GatewayID is set)
 		if m.GatewayID != "" {
 			if prev, exists := seenGateway[m.GatewayID]; exists {
-				errs = append(errs, ValidationError{ModelID: m.ID, Issue: "duplicate GatewayID " + m.GatewayID + " (also used by " + prev + ")"})
+				// Public aliases may intentionally share one gateway catalog ID.
+				if prev.ProviderID != m.ProviderID || prev.Model != m.Model {
+					errs = append(errs, ValidationError{ModelID: m.ID, Issue: "duplicate GatewayID " + m.GatewayID + " (also used by " + prev.ID + ")"})
+				}
 			} else {
-				seenGateway[m.GatewayID] = m.ID
+				seenGateway[m.GatewayID] = m
 			}
 		}
 	}

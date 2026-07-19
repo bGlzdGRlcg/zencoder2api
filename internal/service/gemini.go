@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
 	"time"
 
@@ -22,57 +20,72 @@ func NewGeminiService() *GeminiService {
 
 // GenerateContent 处理generateContent请求
 func (s *GeminiService) GenerateContent(ctx context.Context, modelName string, body []byte) (*http.Response, error) {
+	ctx = ensureOperationID(ctx)
 	// 检查模型是否存在于模型字典中
 	_, exists := model.GetZenModel(modelName)
 	if !exists {
 		DebugLog(ctx, "[Gemini] 模型不存在: %s", modelName)
-		return nil, ErrNoAvailableAccount
+		return nil, unknownModelError(modelName)
 	}
 
 	DebugLogRequest(ctx, "Gemini", "generateContent", modelName)
 
 	var lastErr error
-	for i := 0; i < maxAccountAttempts; i++ {
-		account, err := GetNextAccount()
+	tried := make(map[uint]struct{})
+	refreshedAfter401 := make(map[uint]struct{})
+	attemptLimit := accountAttemptLimit()
+	for i := 0; i < attemptLimit; i++ {
+		account, err := GetNextAccountContext(ctx, tried)
 		if err != nil {
 			DebugLogRequestEnd(ctx, "Gemini", false, err)
 			return nil, err
 		}
+		tried[account.ID] = struct{}{}
 		DebugLogAccountSelected(ctx, "Gemini", account.ID, account.OAuthEmail)
 
 		resp, err := s.doRequest(ctx, account, modelName, body, false)
 		if err != nil {
 			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			MarkAccountFailure(account, 0, 0, err)
 			DebugLogRetry(ctx, "Gemini", i+1, account.ID, err)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
 		DebugLogResponseReceived(ctx, "Gemini", resp.StatusCode)
 		DebugLogResponseHeaders(ctx, "Gemini", resp.Header)
 
-		// 总是输出重要的响应头信息
-		if resp.Header.Get("Zen-Pricing-Period-Limit") != "" ||
-			resp.Header.Get("Zen-Pricing-Period-Cost") != "" ||
-			resp.Header.Get("Zen-Request-Cost") != "" {
-			log.Printf("[Gemini] 积分信息 - 周期限额: %s, 周期消耗: %s, 本次消耗: %s",
-				resp.Header.Get("Zen-Pricing-Period-Limit"),
-				resp.Header.Get("Zen-Pricing-Period-Cost"),
-				resp.Header.Get("Zen-Request-Cost"))
-		}
-
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 300 {
 			// 读取错误响应内容用于日志
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := readUpstreamErrorBody(resp.Body)
 			resp.Body.Close()
 			DebugLogErrorResponse(ctx, "Gemini", resp.StatusCode, string(errBody))
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			_, alreadyRefreshed := refreshedAfter401[account.ID]
+			if resp.StatusCode == http.StatusUnauthorized && account.CredentialType == model.CredentialOAuth && !alreadyRefreshed {
+				if err := ForceOAuthRefresh(ctx, account); err == nil {
+					refreshedAfter401[account.ID] = struct{}{}
+					delete(tried, account.ID)
+					i--
+					continue
+				}
+			}
 
 			// 400和500错误直接返回，不进行账号错误计数
-			if resp.StatusCode == 400 || resp.StatusCode == 500 {
+			if !shouldRetryUpstreamStatus(resp.StatusCode) {
 				DebugLogRequestEnd(ctx, "Gemini", false, fmt.Errorf("API error: %d", resp.StatusCode))
 				return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 			}
 
-			lastErr = fmt.Errorf("API error: %d", resp.StatusCode)
+			lastErr = &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+			MarkAccountFailure(account, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")), lastErr)
 			DebugLogRetry(ctx, "Gemini", i+1, account.ID, lastErr)
 			continue
 		}
@@ -87,6 +100,7 @@ func (s *GeminiService) GenerateContent(ctx context.Context, modelName string, b
 		}
 
 		DebugLogRequestEnd(ctx, "Gemini", true, nil)
+		MarkAccountHealthy(account)
 		return resp, nil
 	}
 
@@ -96,69 +110,82 @@ func (s *GeminiService) GenerateContent(ctx context.Context, modelName string, b
 
 // StreamGenerateContent 处理streamGenerateContent请求
 func (s *GeminiService) StreamGenerateContent(ctx context.Context, modelName string, body []byte) (*http.Response, error) {
+	ctx = ensureOperationID(ctx)
 	// 检查模型是否存在于模型字典中
 	_, exists := model.GetZenModel(modelName)
 	if !exists {
 		DebugLog(ctx, "[Gemini] 模型不存在: %s", modelName)
-		return nil, ErrNoAvailableAccount
+		return nil, unknownModelError(modelName)
 	}
 
 	DebugLogRequest(ctx, "Gemini", "streamGenerateContent", modelName)
 
 	var lastErr error
-	for i := 0; i < maxAccountAttempts; i++ {
-		account, err := GetNextAccount()
+	tried := make(map[uint]struct{})
+	refreshedAfter401 := make(map[uint]struct{})
+	attemptLimit := accountAttemptLimit()
+	for i := 0; i < attemptLimit; i++ {
+		account, err := GetNextAccountContext(ctx, tried)
 		if err != nil {
 			DebugLogRequestEnd(ctx, "Gemini", false, err)
 			return nil, err
 		}
+		tried[account.ID] = struct{}{}
 		DebugLogAccountSelected(ctx, "Gemini", account.ID, account.OAuthEmail)
 
 		resp, err := s.doRequest(ctx, account, modelName, body, true)
 		if err != nil {
 			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			MarkAccountFailure(account, 0, 0, err)
 			DebugLogRetry(ctx, "Gemini", i+1, account.ID, err)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
 		DebugLogResponseReceived(ctx, "Gemini", resp.StatusCode)
 		DebugLogResponseHeaders(ctx, "Gemini", resp.Header)
 
-		// 总是输出重要的响应头信息
-		if resp.Header.Get("Zen-Pricing-Period-Limit") != "" ||
-			resp.Header.Get("Zen-Pricing-Period-Cost") != "" ||
-			resp.Header.Get("Zen-Request-Cost") != "" {
-			log.Printf("[Gemini] 积分信息 - 周期限额: %s, 周期消耗: %s, 本次消耗: %s",
-				resp.Header.Get("Zen-Pricing-Period-Limit"),
-				resp.Header.Get("Zen-Pricing-Period-Cost"),
-				resp.Header.Get("Zen-Request-Cost"))
-		}
-
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 300 {
 			// 读取错误响应内容用于日志
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := readUpstreamErrorBody(resp.Body)
 			resp.Body.Close()
 			DebugLogErrorResponse(ctx, "Gemini", resp.StatusCode, string(errBody))
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			_, alreadyRefreshed := refreshedAfter401[account.ID]
+			if resp.StatusCode == http.StatusUnauthorized && account.CredentialType == model.CredentialOAuth && !alreadyRefreshed {
+				if err := ForceOAuthRefresh(ctx, account); err == nil {
+					refreshedAfter401[account.ID] = struct{}{}
+					delete(tried, account.ID)
+					i--
+					continue
+				}
+			}
 
 			// 400和500错误直接返回，不进行账号错误计数
-			if resp.StatusCode == 400 || resp.StatusCode == 500 {
+			if !shouldRetryUpstreamStatus(resp.StatusCode) {
 				DebugLogRequestEnd(ctx, "Gemini", false, fmt.Errorf("API error: %d", resp.StatusCode))
 				return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 			}
 
-			lastErr = fmt.Errorf("API error: %d", resp.StatusCode)
+			lastErr = &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+			MarkAccountFailure(account, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")), lastErr)
 			DebugLogRetry(ctx, "Gemini", i+1, account.ID, lastErr)
 			continue
 		}
 
 		zenModel, exists := model.GetZenModel(modelName)
-		if !exists {
-			// 模型不存在，使用默认倍率
-			UseCredit(account, 1.0)
-		} else {
-			// 流式响应，暂时使用模型倍率（因为没有完整响应头）
-			UseCredit(account, zenModel.Multiplier)
+		multiplier := 1.0
+		if exists {
+			multiplier = zenModel.Multiplier
 		}
+		finalizeStreamingAccount(ctx, resp, account, multiplier, streamGemini)
 
 		DebugLogRequestEnd(ctx, "Gemini", true, nil)
 		return resp, nil
@@ -171,7 +198,7 @@ func (s *GeminiService) StreamGenerateContent(ctx context.Context, modelName str
 func (s *GeminiService) doRequest(ctx context.Context, account *model.Account, modelName string, body []byte, stream bool) (*http.Response, error) {
 	zenModel, exists := model.GetZenModel(modelName)
 	if !exists {
-		return nil, ErrNoAvailableAccount
+		return nil, unknownModelError(modelName)
 	}
 	httpClient := newDirectHTTPClient(10 * time.Minute)
 
@@ -183,9 +210,9 @@ func (s *GeminiService) doRequest(ctx context.Context, account *model.Account, m
 	}
 	// The local route uses the public model ID, while the gateway path uses the
 	// actual model name from its catalog (the same split as the VSCode CLI).
-	reqURL := fmt.Sprintf("%s/v1beta/models/%s:%s%s", GeminiBaseURL, zenModel.Model, action, queryParam)
+	reqURL := fmt.Sprintf("%s/gemini/v1beta/models/%s:%s%s", zencoderGatewayBaseURL(), zenModel.Model, action, queryParam)
 	DebugLogRequestSent(ctx, "Gemini", reqURL)
-	httpReq, err := http.NewRequest("POST", reqURL, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -201,11 +228,7 @@ func (s *GeminiService) doRequest(ctx context.Context, account *model.Account, m
 	}
 
 	// 添加模型配置的额外请求头
-	if zenModel.Parameters != nil && zenModel.Parameters.ExtraHeaders != nil {
-		for k, v := range zenModel.Parameters.ExtraHeaders {
-			httpReq.Header.Set(k, v)
-		}
-	}
+	ApplyModelExtraHeaders(httpReq, zenModel)
 
 	// 记录请求头用于调试
 	DebugLogRequestHeaders(ctx, "Gemini", httpReq.Header)
@@ -221,7 +244,7 @@ func (s *GeminiService) GenerateContentProxy(ctx context.Context, w http.Respons
 	}
 	defer resp.Body.Close()
 
-	return StreamResponse(w, resp)
+	return CopyResponse(w, resp)
 }
 
 // StreamGenerateContentProxy 代理streamGenerateContent请求

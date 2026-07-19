@@ -1,20 +1,58 @@
 services:
   zencoder2api:
-    image: ghcr.io/bglzdgrlcg/zencoder2api:latest
-    container_name: zencoder2api
+    image: "${ZENCODER2API_IMAGE_REPOSITORY:-ghcr.io/bglzdgrlcg/zencoder2api}@${ZENCODER2API_IMAGE_DIGEST:?ZENCODER2API_IMAGE_DIGEST must be sha256:<release-digest>}"
     restart: unless-stopped
+    init: true
+    stop_grace_period: 35s
     ports:
-      - "${PORT:-8080}:8080"
+      - "127.0.0.1:${PORT:-8080}:8080"
     environment:
       PORT: "8080"
+      BIND_ADDRESS: "0.0.0.0"
       DB_PATH: /data/data.db
-      AUTH_TOKEN: "${AUTH_TOKEN:-}"
-      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
-      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-}"
+      CREDIT_RESET_TIMEZONE: "${CREDIT_RESET_TIMEZONE:-UTC}"
+      CREDIT_RESET_AT: "${CREDIT_RESET_AT:-09:09}"
+      MAX_REQUEST_BODY_BYTES: "${MAX_REQUEST_BODY_BYTES:-4194304}"
+      MAX_CONCURRENT_REQUESTS: "${MAX_CONCURRENT_REQUESTS:-32}"
+      REQUESTS_PER_MINUTE: "${REQUESTS_PER_MINUTE:-600}"
+      ADMIN_LOGIN_REQUESTS_PER_MINUTE: "${ADMIN_LOGIN_REQUESTS_PER_MINUTE:-10}"
+      TRUSTED_PROXIES: "${TRUSTED_PROXIES:-}"
+      ALLOW_INSECURE_LOCALHOST: "false"
+      AUTH_TOKEN: "${AUTH_TOKEN:?AUTH_TOKEN is required}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}"
+      TOKEN_ENCRYPTION_KEY: "${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY is required}"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}"
+      ADMIN_COOKIE_SECURE: "${ADMIN_COOKIE_SECURE:-false}"
       LOG_LEVEL: "${LOG_LEVEL:-silent}"
       DEBUG: "${DEBUG:-false}"
+      TZ: "${TZ:-UTC}"
     volumes:
       - zencoder2api-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: ${PIDS_LIMIT:-128}
+    cpus: "${CPU_LIMIT:-1.0}"
+    mem_limit: "${MEMORY_LIMIT:-512m}"
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/livez"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
 
 volumes:
   zencoder2api-data:

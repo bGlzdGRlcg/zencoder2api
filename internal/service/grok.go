@@ -5,10 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"zencoder-2api/internal/model"
@@ -24,8 +21,10 @@ func NewGrokService() *GrokService {
 
 // ChatCompletions 处理/v1/chat/completions请求
 func (s *GrokService) ChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
+	ctx = ensureOperationID(ctx)
 	var req struct {
-		Model string `json:"model"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid request body: %w", err)
@@ -34,65 +33,81 @@ func (s *GrokService) ChatCompletions(ctx context.Context, body []byte) (*http.R
 	if req.Model == "" {
 		return nil, fmt.Errorf("model is required")
 	}
+	zenModel, known := model.GetZenModel(req.Model)
+	if !known || zenModel.ProviderID != "xai" {
+		return nil, unknownModelError(req.Model)
+	}
 
 	DebugLogRequest(ctx, "Grok", "/v1/chat/completions", req.Model)
 
 	var lastErr error
-	for i := 0; i < maxAccountAttempts; i++ {
-		account, err := GetNextAccount()
+	tried := make(map[uint]struct{})
+	refreshedAfter401 := make(map[uint]struct{})
+	attemptLimit := accountAttemptLimit()
+	for i := 0; i < attemptLimit; i++ {
+		account, err := GetNextAccountContext(ctx, tried)
 		if err != nil {
 			DebugLogRequestEnd(ctx, "Grok", false, err)
 			return nil, err
 		}
+		tried[account.ID] = struct{}{}
 		DebugLogAccountSelected(ctx, "Grok", account.ID, account.OAuthEmail)
 
 		resp, err := s.doRequest(ctx, account, req.Model, body)
 		if err != nil {
 			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			MarkAccountFailure(account, 0, 0, err)
 			DebugLogRetry(ctx, "Grok", i+1, account.ID, err)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
 		DebugLogResponseReceived(ctx, "Grok", resp.StatusCode)
 		DebugLogResponseHeaders(ctx, "Grok", resp.Header)
 
-		// 总是输出重要的响应头信息
-		if resp.Header.Get("Zen-Pricing-Period-Limit") != "" ||
-			resp.Header.Get("Zen-Pricing-Period-Cost") != "" ||
-			resp.Header.Get("Zen-Request-Cost") != "" {
-			log.Printf("[Grok] 积分信息 - 周期限额: %s, 周期消耗: %s, 本次消耗: %s",
-				resp.Header.Get("Zen-Pricing-Period-Limit"),
-				resp.Header.Get("Zen-Pricing-Period-Cost"),
-				resp.Header.Get("Zen-Request-Cost"))
-		}
-
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 300 {
 			// 读取错误响应内容
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := readUpstreamErrorBody(resp.Body)
 			resp.Body.Close()
 
-			// 429 错误特殊处理 - 直接返回，不重试
-			if resp.StatusCode == 429 {
-				DebugLogErrorResponse(ctx, "Grok", resp.StatusCode, string(errBody))
-				DebugLogRequestEnd(ctx, "Grok", false, ErrNoAvailableAccount)
-				return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+			DebugLogErrorResponse(ctx, "Grok", resp.StatusCode, string(errBody))
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			_, alreadyRefreshed := refreshedAfter401[account.ID]
+			if resp.StatusCode == http.StatusUnauthorized && account.CredentialType == model.CredentialOAuth && !alreadyRefreshed {
+				if err := ForceOAuthRefresh(ctx, account); err == nil {
+					refreshedAfter401[account.ID] = struct{}{}
+					delete(tried, account.ID)
+					i--
+					continue
+				}
 			}
 
-			DebugLogErrorResponse(ctx, "Grok", resp.StatusCode, string(errBody))
-
 			// 400和500错误直接返回，不进行账号错误计数
-			if resp.StatusCode == 400 || resp.StatusCode == 500 {
+			if !shouldRetryUpstreamStatus(resp.StatusCode) {
 				DebugLogRequestEnd(ctx, "Grok", false, fmt.Errorf("API error: %d", resp.StatusCode))
 				return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 			}
 
 			lastErr = &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+			MarkAccountFailure(account, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")), lastErr)
 			DebugLogRetry(ctx, "Grok", i+1, account.ID, lastErr)
 			continue
 		}
 
 		zenModel := model.ResolveOpenAIModel(req.Model)
-		UpdateAccountCreditsFromResponse(account, resp, zenModel.Multiplier)
+		if req.Stream {
+			finalizeStreamingAccount(ctx, resp, account, zenModel.Multiplier, streamOpenAIChat)
+		} else {
+			UpdateAccountCreditsFromResponse(account, resp, zenModel.Multiplier)
+			MarkAccountHealthy(account)
+		}
 
 		DebugLogRequestEnd(ctx, "Grok", true, nil)
 		return resp, nil
@@ -103,7 +118,10 @@ func (s *GrokService) ChatCompletions(ctx context.Context, body []byte) (*http.R
 }
 
 func (s *GrokService) doRequest(ctx context.Context, account *model.Account, modelID string, body []byte) (*http.Response, error) {
-	zenModel := model.ResolveOpenAIModel(modelID)
+	zenModel, known := model.GetZenModel(modelID)
+	if !known || zenModel.ProviderID != "xai" {
+		return nil, unknownModelError(modelID)
+	}
 	httpClient := newDirectHTTPClient(10 * time.Minute)
 
 	// The public model ID is carried by zen-model-id. The gateway request body
@@ -114,15 +132,7 @@ func (s *GrokService) doRequest(ctx context.Context, account *model.Account, mod
 		return nil, fmt.Errorf("invalid request body: %w", err)
 	}
 
-	// 处理请求体，Grok Code 模型要求 temperature=0
-	if strings.Contains(modelID, "grok-code") {
-		modifiedBody, err = s.setTemperatureZero(modifiedBody)
-		if err != nil {
-			return nil, fmt.Errorf("invalid request body: %w", err)
-		}
-	}
-
-	reqURL := GrokBaseURL + "/v1/chat/completions"
+	reqURL := zencoderGatewayBaseURL() + "/xai/v1/chat/completions"
 	DebugLogRequestSent(ctx, "Grok", reqURL)
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(modifiedBody))
@@ -136,26 +146,12 @@ func (s *GrokService) doRequest(ctx context.Context, account *model.Account, mod
 	}
 
 	// 添加模型配置的额外请求头
-	if zenModel.Parameters != nil && zenModel.Parameters.ExtraHeaders != nil {
-		for k, v := range zenModel.Parameters.ExtraHeaders {
-			httpReq.Header.Set(k, v)
-		}
-	}
+	ApplyModelExtraHeaders(httpReq, zenModel)
 
 	// 记录请求头用于调试
 	DebugLogRequestHeaders(ctx, "Grok", httpReq.Header)
 
 	return httpClient.Do(httpReq)
-}
-
-// setTemperatureZero 设置 temperature=0
-func (s *GrokService) setTemperatureZero(body []byte) ([]byte, error) {
-	var reqMap map[string]interface{}
-	if err := json.Unmarshal(body, &reqMap); err != nil {
-		return body, err
-	}
-	reqMap["temperature"] = 0
-	return json.Marshal(reqMap)
 }
 
 // ChatCompletionsProxy 代理chat completions请求

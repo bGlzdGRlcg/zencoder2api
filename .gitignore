@@ -26,6 +26,25 @@ go.work.sum
 
 # env file
 .env
+.env.*
+!.env.example
+
+# Local credentials and captured API traffic
+/API Keys.txt
+*.har
+
+# Reverse-engineering inputs and extracted artifacts
+*.vsix
+*.chlz
+/zencoder-*.zip
+/Zenflow-Setup.exe
+/.analysis_zencoder31_zip/
+/.analysis_zenflow_setup/
+/_analysis_zenflow/
+/META-INF/
+/$dest/
+/$out/
+/_archive/
 
 # Editor/IDE
 # .idea/
@@ -34,3 +53,8 @@ vscode/
 
 zencoder-2api
 *.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+dist/

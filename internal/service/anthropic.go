@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -15,121 +14,19 @@ import (
 	"zencoder-2api/internal/model"
 )
 
-// sanitizeRequestBody 清理请求体中的敏感信息，保留结构但替换内容
-func sanitizeRequestBody(body []byte) string {
-	var reqMap map[string]interface{}
-	if err := json.Unmarshal(body, &reqMap); err != nil {
-		return string(body) // 如果解析失败，返回原始内容
-	}
-
-	// 处理messages数组
-	if messages, ok := reqMap["messages"].([]interface{}); ok {
-		for i, msg := range messages {
-			if msgMap, ok := msg.(map[string]interface{}); ok {
-				// 处理content字段
-				if content, exists := msgMap["content"]; exists {
-					// content可能是字符串或数组
-					switch c := content.(type) {
-					case string:
-						// 如果是字符串，直接替换
-						msgMap["content"] = "Content omitted"
-					case []interface{}:
-						// 如果是数组（结构化内容），保留结构但替换文本
-						for j, block := range c {
-							if blockMap, ok := block.(map[string]interface{}); ok {
-								// 保留type字段
-								if blockType, hasType := blockMap["type"]; hasType {
-									// 根据type处理不同的内容块
-									switch blockType {
-									case "text":
-										// 替换text内容
-										blockMap["text"] = "Content omitted"
-									case "thinking", "redacted_thinking":
-										// thinking块：替换thinking内容
-										if _, hasThinking := blockMap["thinking"]; hasThinking {
-											blockMap["thinking"] = "Content omitted"
-										}
-										// 保留signature字段不变
-									case "image":
-										// 图片块：清理source内容
-										if source, hasSource := blockMap["source"]; hasSource {
-											if sourceMap, ok := source.(map[string]interface{}); ok {
-												// 保留类型但清理数据
-												if _, hasData := sourceMap["data"]; hasData {
-													sourceMap["data"] = "Image data omitted"
-												}
-											}
-										}
-									case "tool_use":
-										// 工具使用块：清理input内容
-										if _, hasInput := blockMap["input"]; hasInput {
-											blockMap["input"] = map[string]interface{}{
-												"note": "Tool input omitted",
-											}
-										}
-									case "tool_result":
-										// 工具结果块：清理content内容
-										if _, hasContent := blockMap["content"]; hasContent {
-											blockMap["content"] = "Tool result omitted"
-										}
-									}
-								}
-								c[j] = blockMap
-							}
-						}
-						msgMap["content"] = c
-					}
-				}
-				messages[i] = msgMap
-			}
-		}
-		reqMap["messages"] = messages
-	}
-
-	// 处理tools字段 - 改为空数组
-	if _, hasTools := reqMap["tools"]; hasTools {
-		reqMap["tools"] = []interface{}{}
-	}
-
-	// 处理system字段 - 替换为固定文本
-	if _, hasSystem := reqMap["system"]; hasSystem {
-		reqMap["system"] = "System prompt omitted"
-	}
-
-	// 序列化为JSON字符串
-	sanitized, _ := json.MarshalIndent(reqMap, "", "  ")
-	return string(sanitized)
-}
-
 // logRequestDetails 记录请求详细信息
-func logRequestDetails(prefix string, headers http.Header, body []byte) {
-	log.Printf("%s 请求详情:", prefix)
-
-	// 记录请求头
-	log.Printf("%s 请求头:", prefix)
-	for k, v := range headers {
-		// 过滤敏感请求头
-		if strings.Contains(strings.ToLower(k), "auth") ||
-			strings.Contains(strings.ToLower(k), "key") ||
-			strings.Contains(strings.ToLower(k), "token") {
-			log.Printf("  %s: [REDACTED]", k)
-		} else {
-			log.Printf("  %s: %s", k, strings.Join(v, ", "))
-		}
-	}
-
-	// 记录请求体（已清理敏感信息）
-	log.Printf("%s 请求体 (已清理):", prefix)
-	log.Printf("%s", sanitizeRequestBody(body))
+func logRequestDetails(ctx context.Context, prefix string, headers http.Header, body []byte) {
+	logToContext(ctx, "request_details prefix=%q header_count=%d body_bytes=%d", prefix, len(headers), len(body))
 }
 
 const AnthropicBaseURL = "https://api.zencoder.ai/anthropic"
 
 func anthropicCompatibleBaseURL(providerID string) string {
+	baseURL := zencoderGatewayBaseURL()
 	if providerID == "" || providerID == "anthropic" {
-		return AnthropicBaseURL
+		return baseURL + "/anthropic"
 	}
-	return "https://api.zencoder.ai/" + providerID
+	return baseURL + "/" + strings.Trim(providerID, "/")
 }
 
 type AnthropicService struct{}
@@ -140,10 +37,10 @@ func NewAnthropicService() *AnthropicService {
 
 // Messages 处理/v1/messages请求，直接透传到Anthropic API
 func (s *AnthropicService) Messages(ctx context.Context, body []byte, isStream bool) (*http.Response, error) {
+	ctx = ensureOperationID(ctx)
 	var req struct {
-		Model     string                 `json:"model"`
-		MaxTokens float64                `json:"max_tokens,omitempty"`
-		Thinking  map[string]interface{} `json:"thinking,omitempty"`
+		Model    string                 `json:"model"`
+		Thinking map[string]interface{} `json:"thinking,omitempty"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid request body: %w", err)
@@ -164,56 +61,42 @@ func (s *AnthropicService) Messages(ctx context.Context, body []byte, isStream b
 	}
 	// 只在非限速测试时输出请求信息
 	if IsDebugMode() && !strings.Contains(req.Model, "test") {
-		log.Printf("[Anthropic] 请求 - Model: %s, Thinking: %s", req.Model, thinkingStatus)
+		logToContext(ctx, "anthropic_request model=%s thinking=%s", req.Model, thinkingStatus)
 	}
 
 	// 检查模型是否存在于模型字典中
 	_, exists := model.GetZenModel(req.Model)
 	if !exists {
 		DebugLog(ctx, "[Anthropic] 模型不存在: %s", req.Model)
-		return nil, ErrNoAvailableAccount
+		return nil, unknownModelError(req.Model)
 	}
 
 	DebugLogRequest(ctx, "Anthropic", "/v1/messages", req.Model)
 
-	// 处理max_tokens和thinking.budget_tokens的关系
-	// 如果用户传入了thinking配置，检查并调整max_tokens
-	if req.Thinking != nil {
-		budgetTokens := 0.0
-		if budget, ok := req.Thinking["budget_tokens"].(float64); ok {
-			budgetTokens = budget
-		}
-
-		// 如果max_tokens小于等于budget_tokens，调整max_tokens
-		if budgetTokens > 0 && req.MaxTokens > 0 && req.MaxTokens <= budgetTokens {
-			// 按用户要求：max_tokens = max_tokens + budget_tokens
-			newMaxTokens := req.MaxTokens + budgetTokens
-
-			// 修改原始请求体中的max_tokens
-			var reqMap map[string]interface{}
-			if err := json.Unmarshal(body, &reqMap); err == nil {
-				reqMap["max_tokens"] = newMaxTokens
-				if modifiedBody, err := json.Marshal(reqMap); err == nil {
-					body = modifiedBody
-					DebugLog(ctx, "[Anthropic] 调整max_tokens: %.0f -> %.0f (原值+budget_tokens)", req.MaxTokens, newMaxTokens)
-				}
-			}
-		}
-	}
-
 	var lastErr error
-	for i := 0; i < maxAccountAttempts; i++ {
-		account, err := GetNextAccount()
+	tried := make(map[uint]struct{})
+	refreshedAfter401 := make(map[uint]struct{})
+	attemptLimit := accountAttemptLimit()
+	for i := 0; i < attemptLimit; i++ {
+		account, err := GetNextAccountContext(ctx, tried)
 		if err != nil {
 			DebugLogRequestEnd(ctx, "Anthropic", false, err)
 			return nil, err
 		}
+		tried[account.ID] = struct{}{}
 		DebugLogAccountSelected(ctx, "Anthropic", account.ID, account.OAuthEmail)
 
 		resp, err := s.doRequest(ctx, account, req.Model, body)
 		if err != nil {
 			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			MarkAccountFailure(account, 0, 0, err)
 			DebugLogRetry(ctx, "Anthropic", i+1, account.ID, err)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
@@ -232,10 +115,25 @@ func (s *AnthropicService) Messages(ctx context.Context, body []byte, isStream b
 			}
 		}
 
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 300 {
 			// 读取错误响应内容
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := readUpstreamErrorBody(resp.Body)
 			resp.Body.Close()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			_, alreadyRefreshed := refreshedAfter401[account.ID]
+			if resp.StatusCode == http.StatusUnauthorized && account.CredentialType == model.CredentialOAuth && !alreadyRefreshed {
+				if err := ForceOAuthRefresh(ctx, account); err == nil {
+					refreshedAfter401[account.ID] = struct{}{}
+					delete(tried, account.ID)
+					i--
+					continue
+				}
+			}
+			if shouldRetryUpstreamStatus(resp.StatusCode) {
+				MarkAccountFailure(account, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")), &UpstreamError{StatusCode: resp.StatusCode})
+			}
 
 			// 检查是否是官方API直接抛出的错误（413、400、429）
 			// 这些错误不是token池问题，应直接返回给客户端
@@ -290,37 +188,37 @@ func (s *AnthropicService) Messages(ctx context.Context, body []byte, isStream b
 
 						if isKnownError {
 							// 已知错误，只输出简单日志，包含请求模型ID和thinking状态
-							log.Printf("[Anthropic] 400错误: %s - %s (Model: %s, Thinking: %s)", errResp.Error.Type, errResp.Error.Message, req.Model, thinkingStatus)
+							logToContext(ctx, "anthropic_error status=400 type=%s model=%s thinking=%s", errResp.Error.Type, req.Model, thinkingStatus)
 
 							// 对于非"prompt is too long"错误，在DEBUG模式下输出详细信息
 							if !isPromptTooLongError && IsDebugMode() {
 								if originalHeaders, ok := originalHeadersFromContext(ctx); ok {
-									logRequestDetails("[Anthropic] 原始客户端", originalHeaders, body)
+									logRequestDetails(ctx, "[Anthropic] 原始客户端", originalHeaders, body)
 								}
 							}
 						} else {
 							// 未知错误，输出详细日志用于调试，包含请求模型ID和thinking状态
-							log.Printf("[Anthropic] 400未知错误: %s (Model: %s, Thinking: %s)", string(errBody), req.Model, thinkingStatus)
+							logToContext(ctx, "anthropic_error status=400 type=unknown model=%s thinking=%s body_bytes=%d", req.Model, thinkingStatus, len(errBody))
 							if IsDebugMode() {
 								// DEBUG模式下输出原始请求信息
 								if originalHeaders, ok := originalHeadersFromContext(ctx); ok {
-									logRequestDetails("[Anthropic] 原始客户端", originalHeaders, body)
+									logRequestDetails(ctx, "[Anthropic] 原始客户端", originalHeaders, body)
 								}
 							}
 						}
 					} else {
 						// 解析失败，输出完整错误用于调试，包含请求模型ID和thinking状态
-						log.Printf("[Anthropic] 400错误（无法解析）: %s (Model: %s, Thinking: %s)", string(errBody), req.Model, thinkingStatus)
+						logToContext(ctx, "anthropic_error status=400 type=undecodable model=%s thinking=%s body_bytes=%d", req.Model, thinkingStatus, len(errBody))
 						if IsDebugMode() {
 							// DEBUG模式下输出原始请求信息
 							if originalHeaders, ok := originalHeadersFromContext(ctx); ok {
-								logRequestDetails("[Anthropic] 原始客户端", originalHeaders, body)
+								logRequestDetails(ctx, "[Anthropic] 原始客户端", originalHeaders, body)
 							}
 						}
 					}
 				} else if resp.StatusCode == 429 {
 					// 简化429错误日志输出
-					s.classifyAndLog429Error(string(errBody), account.ID, account.OAuthEmail)
+					s.classifyAndLog429Error(ctx, string(errBody), account.ID, account.OAuthEmail)
 
 					// 检查是否是Claude官方的429错误
 					isClaudeOfficialError := s.isClaudeOfficial429Error(string(errBody))
@@ -335,7 +233,7 @@ func (s *AnthropicService) Messages(ctx context.Context, body []byte, isStream b
 						}, nil
 					} else {
 						// 非Claude官方429错误，不返回原始响应，继续重试其他账号
-						lastErr = fmt.Errorf("non-official 429 error")
+						lastErr = &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 						if IsDebugMode() {
 							DebugLogRetry(ctx, "Anthropic", i+1, account.ID, lastErr)
 						}
@@ -353,36 +251,13 @@ func (s *AnthropicService) Messages(ctx context.Context, body []byte, isStream b
 
 			// 503和529错误：上游API错误，不是token问题
 			if resp.StatusCode == 503 || resp.StatusCode == 529 {
-				// 只记录简单的错误日志
-				log.Printf("错误响应 [%d]: %s", resp.StatusCode, string(errBody))
-				// 不计算账号错误次数，返回通用错误
-				return nil, ErrNoAvailableAccount
+				lastErr = &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+				continue
 			}
 
-			// 500错误处理
-			if resp.StatusCode == 500 {
-				// 检查是否是限速问题
-				if strings.Contains(string(errBody), "Rate limit tracking problem") {
-					// 设置错误并继续重试其他账号
-					lastErr = fmt.Errorf("rate limit tracking problem")
-
-					// 只在调试模式下输出详细重试日志
-					if IsDebugMode() {
-						DebugLogRetry(ctx, "Anthropic", i+1, account.ID, lastErr)
-					}
-					continue
-				}
-
-				// 其他500错误直接返回
-				return &http.Response{
-					StatusCode: resp.StatusCode,
-					Header:     resp.Header,
-					Body:       io.NopCloser(bytes.NewReader(errBody)),
-				}, nil
-			}
-
-			// 其他错误继续重试
-			lastErr = fmt.Errorf("API error: %d", resp.StatusCode)
+			// 其余可重试状态（包括所有 5xx）统一换用下一健康凭据。
+			// 409 等请求语义错误已由 shouldRetryUpstreamStatus 排除，避免重复副作用。
+			lastErr = &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 
 			// 只在调试模式下输出详细错误信息
 			if IsDebugMode() {
@@ -390,18 +265,21 @@ func (s *AnthropicService) Messages(ctx context.Context, body []byte, isStream b
 				DebugLogRetry(ctx, "Anthropic", i+1, account.ID, lastErr)
 			} else {
 				// 非调试模式下只输出简单的重试信息
-				log.Printf("[Anthropic] API错误 %d，重试 #%d", resp.StatusCode, i+1)
+				logToContext(ctx, "anthropic_retry status=%d attempt=%d", resp.StatusCode, i+1)
 			}
 			continue
 		}
 
 		zenModel, exists := model.GetZenModel(req.Model)
-		if !exists {
-			// 模型不存在，使用默认倍率
-			UpdateAccountCreditsFromResponse(account, resp, 1.0)
+		multiplier := 1.0
+		if exists {
+			multiplier = zenModel.Multiplier
+		}
+		if isStream {
+			finalizeStreamingAccount(ctx, resp, account, multiplier, streamAnthropic)
 		} else {
-			// 使用统一的积分更新函数，自动处理响应头中的积分信息
-			UpdateAccountCreditsFromResponse(account, resp, zenModel.Multiplier)
+			UpdateAccountCreditsFromResponse(account, resp, multiplier)
+			MarkAccountHealthy(account)
 		}
 
 		DebugLogRequestEnd(ctx, "Anthropic", true, nil)
@@ -413,7 +291,7 @@ func (s *AnthropicService) Messages(ctx context.Context, body []byte, isStream b
 		DebugLogRequestEnd(ctx, "Anthropic", false, lastErr)
 	} else {
 		// 非调试模式下只输出简单的失败信息
-		log.Printf("[Anthropic] 所有重试失败: %v", lastErr)
+		logToContext(ctx, "anthropic_retries_exhausted error_type=%T", lastErr)
 	}
 
 	// 检查是否是网络连接错误，如果是则返回统一的错误信息，避免暴露内部网络详情
@@ -445,8 +323,7 @@ func prepareAnthropicRequestBody(body []byte, actualModel string) ([]byte, error
 func (s *AnthropicService) doRequest(ctx context.Context, account *model.Account, modelID string, body []byte) (*http.Response, error) {
 	zenModel, exists := model.GetZenModel(modelID)
 	if !exists {
-		// 模型不存在，返回错误
-		return nil, ErrNoAvailableAccount
+		return nil, unknownModelError(modelID)
 	}
 
 	// Send the unchanged gateway catalog IDs in both the request header and the
@@ -481,7 +358,7 @@ func (s *AnthropicService) doRequest(ctx context.Context, account *model.Account
 
 	// 检查是否是400错误，需要特殊处理
 	if resp.StatusCode == 400 {
-		bodyBytes, readErr := io.ReadAll(resp.Body)
+		bodyBytes, readErr := readUpstreamErrorBody(resp.Body)
 		resp.Body.Close()
 
 		if readErr == nil {
@@ -489,7 +366,7 @@ func (s *AnthropicService) doRequest(ctx context.Context, account *model.Account
 
 			// 检查是否是thinking格式错误，但不再进行模型切换
 			if s.isThinkingFormatError(errorBody) {
-				log.Printf("[Anthropic] thinking格式错误: %s", errorBody)
+				logToContext(ctx, "anthropic_thinking_format_error body_bytes=%d", len(errorBody))
 			}
 
 			// 检查是否是thinking signature过期错误
@@ -514,9 +391,9 @@ func (s *AnthropicService) doRequest(ctx context.Context, account *model.Account
 				}
 
 				if IsDebugMode() {
-					log.Printf("[Anthropic] thinking signature过期，尝试转换assistant消息为user消息重试")
+					logToContext(ctx, "anthropic_signature_retry mode=redacted")
 				} else {
-					log.Printf("[Anthropic] thinking signature过期，尝试转换assistant消息为user消息重试 model:%s thinking:%s", reqInfo.Model, thinkingStatus)
+					logToContext(ctx, "anthropic_signature_retry model=%s thinking=%s", reqInfo.Model, thinkingStatus)
 				}
 
 				// 转换请求体：将assistant消息转换为user消息
@@ -524,7 +401,7 @@ func (s *AnthropicService) doRequest(ctx context.Context, account *model.Account
 				if fixErr == nil {
 					return s.makeRequest(ctx, fixedBody, account, zenModel)
 				} else {
-					log.Printf("[Anthropic] 转换assistant消息失败: %v", fixErr)
+					logToContext(ctx, "anthropic_message_conversion_failed error_type=%T", fixErr)
 				}
 			}
 
@@ -565,7 +442,7 @@ func (s *AnthropicService) doRequest(ctx context.Context, account *model.Account
 
 func (s *AnthropicService) makeRequest(ctx context.Context, body []byte, account *model.Account, zenModel model.ZenModel) (*http.Response, error) {
 	baseURL := anthropicCompatibleBaseURL(zenModel.ProviderID)
-	httpReq, err := http.NewRequest("POST", baseURL+"/v1/messages", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -579,11 +456,7 @@ func (s *AnthropicService) makeRequest(ctx context.Context, body []byte, account
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 
 	// 添加模型配置的额外请求头
-	if zenModel.Parameters != nil && zenModel.Parameters.ExtraHeaders != nil {
-		for k, v := range zenModel.Parameters.ExtraHeaders {
-			httpReq.Header.Set(k, v)
-		}
-	}
+	ApplyModelExtraHeaders(httpReq, zenModel)
 
 	// 只在非限速测试且调试模式下记录请求头
 	if IsDebugMode() {
@@ -607,7 +480,7 @@ func (s *AnthropicService) makeRequest(ctx context.Context, body []byte, account
 	// 如果是400错误，记录详细的请求信息
 	if resp.StatusCode == 400 {
 		// 读取错误响应内容
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := readUpstreamErrorBody(resp.Body)
 		resp.Body.Close()
 
 		// 检查是否是"prompt is too long"错误
@@ -628,16 +501,14 @@ func (s *AnthropicService) makeRequest(ctx context.Context, body []byte, account
 			if strings.Contains(errorMessage, "prompt is too long") {
 				isPromptTooLongError = true
 				// 对于prompt过长错误，只输出简单的错误信息
-				log.Printf("[Anthropic] 400错误: %s - %s", errResp.Error.Type, errResp.Error.Message)
+				logToContext(ctx, "anthropic_error status=400 type=%s", errResp.Error.Type)
 			}
 			// 检查是否是thinking格式错误
 			if strings.Contains(errResp.Error.Message, "When `thinking` is enabled") ||
 				strings.Contains(errResp.Error.Message, "Expected `thinking` or `redacted_thinking`") {
 				isThinkingFormatError = true
 				// 输出详细的thinking格式错误信息
-				log.Printf("[Anthropic] thinking格式错误详情: %s", errResp.Error.Message)
-				log.Printf("[Anthropic] 发送给zencoder的请求体:")
-				log.Printf("%s", sanitizeRequestBody(body))
+				logToContext(ctx, "anthropic_thinking_format_error body_bytes=%d", len(errBody))
 			}
 			// 检查是否是thinking signature过期错误
 			if strings.Contains(errResp.Error.Message, "Invalid `signature` in `thinking` block") {
@@ -650,15 +521,15 @@ func (s *AnthropicService) makeRequest(ctx context.Context, body []byte, account
 		// thinking相关错误会在doRequest中处理，如果重试成功就不需要输出debug日志
 		shouldOutputDetails := !isPromptTooLongError && !isThinkingFormatError && !isThinkingSignatureError
 		if shouldOutputDetails {
-			log.Printf("[Anthropic] API返回400错误: %s", string(errBody))
+			logToContext(ctx, "anthropic_error status=400 body_bytes=%d", len(errBody))
 			// 只在调试模式下输出详细的请求信息
 			if IsDebugMode() {
-				logRequestDetails("[Anthropic] 实际API", httpReq.Header, body)
+				logRequestDetails(ctx, "[Anthropic] 实际API", httpReq.Header, body)
 			}
 		} else if isThinkingSignatureError && IsDebugMode() {
 			// thinking signature错误只在调试模式下输出简单信息
-			log.Printf("[Anthropic] API返回400错误: %s", string(errBody))
-			logRequestDetails("[Anthropic] 实际API", httpReq.Header, body)
+			logToContext(ctx, "anthropic_error status=400 body_bytes=%d", len(errBody))
+			logRequestDetails(ctx, "[Anthropic] 实际API", httpReq.Header, body)
 		}
 
 		// 重新构建响应，因为body已经被读取
@@ -741,7 +612,7 @@ func (s *AnthropicService) isClaudeOfficial429Error(errorBody string) bool {
 }
 
 // classifyAndLog429Error 分类并记录429错误的简化日志
-func (s *AnthropicService) classifyAndLog429Error(errorBody string, accountID uint, email string) {
+func (s *AnthropicService) classifyAndLog429Error(ctx context.Context, errorBody string, accountID uint, email string) {
 	// 尝试解析Claude官方错误
 	var claudeErr struct {
 		Type  string `json:"type"`
@@ -754,7 +625,7 @@ func (s *AnthropicService) classifyAndLog429Error(errorBody string, accountID ui
 	if err := json.Unmarshal([]byte(errorBody), &claudeErr); err == nil {
 		if claudeErr.Type == "error" && claudeErr.Error.Type == "rate_limit_error" {
 			// Claude官方限流错误
-			log.Printf("[Anthropic] Claude rate_limit_error 账号ID:%d %s", accountID, email)
+			logToContext(ctx, "anthropic_rate_limit source=claude account_id=%d", accountID)
 			return
 		}
 	}
@@ -771,25 +642,29 @@ func (s *AnthropicService) classifyAndLog429Error(errorBody string, accountID ui
 	if err := json.Unmarshal([]byte(errorBody), &gcpErr); err == nil {
 		if gcpErr.Error.Code == 429 && gcpErr.Error.Status == "RESOURCE_EXHAUSTED" {
 			// GCP限流错误
-			log.Printf("[Anthropic] GCP RESOURCE_EXHAUSTED 账号ID:%d %s", accountID, email)
+			logToContext(ctx, "anthropic_rate_limit source=gcp account_id=%d", accountID)
 			return
 		}
 	}
 
 	// 其他未识别的429错误
-	log.Printf("[Anthropic] 429限流错误 账号ID:%d %s", accountID, email)
+	logToContext(ctx, "anthropic_rate_limit source=unknown account_id=%d", accountID)
 }
 
 // MessagesProxy 直接代理请求和响应
 func (s *AnthropicService) MessagesProxy(ctx context.Context, w http.ResponseWriter, body []byte) error {
 	var req struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
+		Model    string                 `json:"model"`
+		Stream   bool                   `json:"stream"`
+		Thinking map[string]interface{} `json:"thinking"`
 	}
 	// 忽略错误，Messages方法会再次解析
 	_ = json.Unmarshal(body, &req)
+	if zenModel, ok := model.GetZenModel(req.Model); ok && zenModel.ProviderID == "xai" {
+		return NewOpenAIService().MessagesProxy(ctx, w, body)
+	}
 
-	resp, err := s.Messages(ctx, body, false)
+	resp, err := s.Messages(ctx, body, req.Stream)
 	if err != nil {
 		return err
 	}
@@ -802,13 +677,18 @@ func (s *AnthropicService) MessagesProxy(ctx context.Context, w http.ResponseWri
 	// 获取模型配置
 	zenModel, exists := model.GetZenModel(req.Model)
 
-	// 如果模型配置中有thinking参数（平台强制thinking）
+	// Catalog thinking is hidden only when the caller did not explicitly ask
+	// for it. Public model IDs do not use a "-thinking" suffix.
 	if exists && zenModel.Parameters != nil && zenModel.Parameters.Thinking != nil {
-		// 检查用户是否明确请求了thinking版本
-		// 如果模型ID不包含 "thinking" 后缀，说明用户要的是非thinking版本
-		if !strings.HasSuffix(req.Model, "-thinking") {
-			needsFiltering = true
+		thinkingType := stringValue(req.Thinking["type"])
+		explicitThinking := thinkingType == "enabled" || thinkingType == "adaptive"
+		if enabled, ok := req.Thinking["enabled"].(bool); ok && enabled {
+			explicitThinking = true
 		}
+		if _, ok := req.Thinking["enabled"].(map[string]interface{}); ok {
+			explicitThinking = true
+		}
+		needsFiltering = !explicitThinking
 	}
 
 	if needsFiltering {
@@ -823,20 +703,12 @@ func (s *AnthropicService) MessagesProxy(ctx context.Context, w http.ResponseWri
 
 func (s *AnthropicService) handleNonStreamFilteredResponse(w http.ResponseWriter, resp *http.Response) error {
 	// 读取全部响应体
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := readCompatibilityResponseBody(resp.Body)
 	if err != nil {
 		return err
 	}
 
-	// 复制响应头
-	for k, v := range resp.Header {
-		// 过滤掉 Content-Length 和 Content-Encoding
-		if k != "Content-Length" && k != "Content-Encoding" {
-			for _, vv := range v {
-				w.Header().Add(k, vv)
-			}
-		}
-	}
+	copyResponseHeaders(w.Header(), resp.Header, true)
 	w.WriteHeader(resp.StatusCode)
 
 	// 尝试解析响应
@@ -851,7 +723,7 @@ func (s *AnthropicService) handleNonStreamFilteredResponse(w http.ResponseWriter
 		var newContent []interface{}
 		for _, block := range content {
 			if b, ok := block.(map[string]interface{}); ok {
-				if typeStr, ok := b["type"].(string); ok && (typeStr == "thinking" || typeStr == "thought") {
+				if typeStr, ok := b["type"].(string); ok && (typeStr == "thinking" || typeStr == "thought" || typeStr == "redacted_thinking") {
 					continue
 				}
 			}
@@ -870,6 +742,12 @@ func (s *AnthropicService) adjustTemperatureForModel(body []byte, modelID string
 
 	// 检查模型配置中是否有特定的温度要求
 	if exists && zenModel.Parameters != nil && zenModel.Parameters.Temperature != nil {
+		var request map[string]interface{}
+		if json.Unmarshal(body, &request) == nil {
+			if thinking, ok := request["thinking"].(map[string]interface{}); ok && stringValue(thinking["type"]) == "disabled" {
+				return body, nil
+			}
+		}
 		return s.forceTemperature(body, *zenModel.Parameters.Temperature)
 	}
 
@@ -1003,27 +881,13 @@ func (s *AnthropicService) ensureThinkingConfig(body []byte, modelID string) ([]
 		// while provider model IDs do not have that suffix.
 	}
 
-	// 如果用户不想要thinking但模型强制thinking，转换assistant消息为user消息
+	// An explicit disabled setting is already valid Anthropic input. Rewriting
+	// assistant history changes conversation and tool semantics.
 	if userDisablesThinking {
-		if IsDebugMode() {
-			log.Printf("[Anthropic] 用户不想要thinking模式，但模型强制thinking，转换assistant消息为user消息")
-		}
-		if messages, ok := reqMap["messages"].([]interface{}); ok {
-			for i, msg := range messages {
-				if msgMap, ok := msg.(map[string]interface{}); ok {
-					if role, ok := msgMap["role"].(string); ok && role == "assistant" {
-						// 转换thinking内容为text并改变角色为user
-						if err := s.convertAssistantToUserMessage(msgMap); err != nil {
-							log.Printf("[Anthropic] 转换assistant消息为user消息失败: %v", err)
-						}
-					}
-					messages[i] = msgMap
-				}
-			}
-			reqMap["messages"] = messages
-		}
-		// Respect an explicit disabled setting instead of forcing the catalog's
-		// default back onto the request.
+		existingThinking["type"] = "disabled"
+		delete(existingThinking, "enabled")
+		delete(existingThinking, "budget_tokens")
+		reqMap["thinking"] = existingThinking
 		modifiedBody, err := json.Marshal(reqMap)
 		if err != nil {
 			return body, err
@@ -1055,12 +919,10 @@ func (s *AnthropicService) ensureThinkingConfig(body []byte, modelID string) ([]
 			thinkingConfig["budget_tokens"] = modelBudgetTokens
 		}
 		reqMap["thinking"] = thinkingConfig
-		if IsDebugMode() {
-			log.Printf("[Anthropic] 添加thinking配置，budget_tokens: %d", modelBudgetTokens)
-		}
-		if IsDebugMode() {
-			log.Printf("[Anthropic] 原始请求体 (处理前):")
-			log.Printf("%s", sanitizeRequestBody(body))
+	}
+	if thinkingType == "enabled" {
+		if maxTokens := numberAsInt(reqMap["max_tokens"]); maxTokens > 0 && maxTokens <= modelBudgetTokens {
+			reqMap["max_tokens"] = maxTokens + modelBudgetTokens
 		}
 	}
 
@@ -1076,12 +938,6 @@ func (s *AnthropicService) ensureThinkingConfig(body []byte, modelID string) ([]
 	modifiedBody, err := json.Marshal(reqMap)
 	if err != nil {
 		return body, err
-	}
-
-	// 输出处理后的请求体日志
-	if IsDebugMode() {
-		log.Printf("[Anthropic] 处理后的请求体 (发送给实际API):")
-		log.Printf("%s", sanitizeRequestBody(modifiedBody))
 	}
 
 	return modifiedBody, nil
@@ -1103,9 +959,6 @@ func (s *AnthropicService) convertAssistantToUserMessage(msgMap map[string]inter
 	switch c := content.(type) {
 	case string:
 		// 如果是字符串content，保持不变，只改角色
-		if IsDebugMode() {
-			log.Printf("[Anthropic] 将assistant字符串消息转换为user消息")
-		}
 	case []interface{}:
 		// 使用range循环逐个处理每个块，保留结构和缓存信息
 		for i, block := range c {
@@ -1170,9 +1023,6 @@ func (s *AnthropicService) convertAssistantToUserMessage(msgMap map[string]inter
 		}
 
 		msgMap["content"] = c
-		if IsDebugMode() {
-			log.Printf("[Anthropic] 将assistant消息转换为user消息，逐个处理内容块并保留缓存信息")
-		}
 	}
 
 	return nil
@@ -1195,13 +1045,11 @@ func (s *AnthropicService) convertAssistantMessagesToUser(body []byte) ([]byte, 
 					if role == "assistant" {
 						// 转换assistant消息为user消息
 						if err := s.convertAssistantToUserMessage(msgMap); err != nil {
-							log.Printf("[Anthropic] 转换第%d个assistant消息失败: %v", i, err)
 							continue
 						}
 					} else if role == "user" {
 						// 对于user消息，也要确保tool_result被正确处理
 						if err := s.convertToolBlocksToText(msgMap); err != nil {
-							log.Printf("[Anthropic] 转换第%d个user消息中的工具块失败: %v", i, err)
 							continue
 						}
 					}
@@ -1216,11 +1064,6 @@ func (s *AnthropicService) convertAssistantMessagesToUser(body []byte) ([]byte, 
 	modifiedBody, err := json.Marshal(reqMap)
 	if err != nil {
 		return body, err
-	}
-
-	if IsDebugMode() {
-		log.Printf("[Anthropic] 已转换所有工具调用消息，处理后的请求体:")
-		log.Printf("%s", sanitizeRequestBody(modifiedBody))
 	}
 
 	return modifiedBody, nil
@@ -1285,9 +1128,6 @@ func (s *AnthropicService) convertToolBlocksToText(msgMap map[string]interface{}
 		}
 
 		msgMap["content"] = c
-		if IsDebugMode() {
-			log.Printf("[Anthropic] 已将消息中的工具块转换为文本格式")
-		}
 	}
 
 	return nil
@@ -1313,14 +1153,7 @@ func (s *AnthropicService) adjustParametersForModel(body []byte, modelID string)
 }
 
 func (s *AnthropicService) streamFilteredResponse(w http.ResponseWriter, resp *http.Response) error {
-	// 复制响应头
-	for k, v := range resp.Header {
-		if k != "Content-Encoding" && k != "Content-Length" {
-			for _, vv := range v {
-				w.Header().Add(k, vv)
-			}
-		}
-	}
+	copyResponseHeaders(w.Header(), resp.Header, true)
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, ok := w.(http.Flusher)
@@ -1333,7 +1166,7 @@ func (s *AnthropicService) streamFilteredResponse(w http.ResponseWriter, resp *h
 	isThinking := false // 标记当前是否处于 thinking block 中
 
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readSSELine(reader)
 		if err != nil {
 			if err == io.EOF {
 				return nil
@@ -1350,7 +1183,7 @@ func (s *AnthropicService) streamFilteredResponse(w http.ResponseWriter, resp *h
 
 		if strings.HasPrefix(trimmedLine, "event:") {
 			// 读取下一行 data
-			dataLine, err := reader.ReadString('\n')
+			dataLine, err := readSSELine(reader)
 			if err != nil {
 				return err
 			}
@@ -1368,7 +1201,7 @@ func (s *AnthropicService) streamFilteredResponse(w http.ResponseWriter, resp *h
 					} `json:"content_block"`
 				}
 				if json.Unmarshal([]byte(data), &payload) == nil {
-					if payload.ContentBlock.Type == "thinking" || payload.ContentBlock.Type == "thought" {
+					if payload.ContentBlock.Type == "thinking" || payload.ContentBlock.Type == "thought" || payload.ContentBlock.Type == "redacted_thinking" {
 						isThinking = true
 						shouldFilter = true
 					}

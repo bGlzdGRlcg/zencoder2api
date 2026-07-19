@@ -2,11 +2,15 @@ const API_BASE = "/api";
 const REFRESH_INTERVAL = 3000;
 const OAUTH_TIMEOUT_MS = 5 * 60 * 1000;
 let autoRefreshTimer = null;
+let refreshInFlight = false;
 let oauthFlow = null;
+let appSessionActive = false;
+let refreshGeneration = 0;
+let apiKeyEditingAccount = null;
 
-// Admin Password Management
-let adminPassword = null;
-const ADMIN_STORAGE_KEY = "zencoder_admin_pass";
+// The password is used only for the session exchange and is never retained.
+// The CSRF token is intentionally memory-only; the server session is HttpOnly.
+let adminCSRFToken = null;
 
 // State
 let currentState = {
@@ -17,49 +21,25 @@ let currentState = {
 	items: [],
 };
 
-// --- Admin Password Management ---
-function savePassword(password) {
+async function createAdminSession(password) {
 	try {
-		localStorage.setItem(ADMIN_STORAGE_KEY, password);
-		console.log("Password saved to localStorage");
-		return true;
-	} catch (e) {
-		console.error("Failed to save password to localStorage:", e);
-		return false;
-	}
-}
-
-function getSavedPassword() {
-	try {
-		const saved = localStorage.getItem(ADMIN_STORAGE_KEY);
-		if (saved) {
-			console.log("Found saved password in localStorage");
-		}
-		return saved;
-	} catch (e) {
-		console.error("Failed to get password from localStorage:", e);
-		return null;
-	}
-}
-
-function clearSavedPassword() {
-	try {
-		localStorage.removeItem(ADMIN_STORAGE_KEY);
-	} catch (e) {
-		console.error("Failed to clear password from localStorage:", e);
-	}
-}
-
-async function verifyAdminPassword(password) {
-	try {
-		// 尝试调用一个需要管理密码的API来验证
-		const response = await fetch(`${API_BASE}/accounts?page=1&size=1`, {
+		const response = await fetch(`${API_BASE}/admin/session`, {
+			method: "POST",
+			credentials: "same-origin",
+			cache: "no-store",
+			referrerPolicy: "no-referrer",
 			headers: {
-				"X-Admin-Password": password,
+				Accept: "application/json",
+				Authorization: `Bearer ${password}`,
 			},
 		});
-		return response.ok;
+		if (!response.ok) return false;
+		const result = await response.json();
+		adminCSRFToken =
+			typeof result.csrfToken === "string" ? result.csrfToken : "";
+		return true;
 	} catch (e) {
+		adminCSRFToken = null;
 		return false;
 	}
 }
@@ -76,24 +56,11 @@ function hideAdminLogin() {
 	document.getElementById("mainApp").classList.add("flex");
 }
 
-async function handleAdminLogin(password, remember = false) {
-	console.log("Attempting login, remember:", remember);
-
-	const isValid = await verifyAdminPassword(password);
+async function handleAdminLogin(password) {
+	const isValid = await createAdminSession(password);
 
 	if (isValid) {
-		adminPassword = password;
-
-		if (remember) {
-			const saved = savePassword(password);
-			if (!saved) {
-				console.warn("Failed to save password to localStorage");
-			}
-		} else {
-			// 如果没有勾选记住，清除之前保存的密码
-			clearSavedPassword();
-		}
-
+		appSessionActive = true;
 		hideAdminLogin();
 		document.getElementById("passwordError").classList.add("hidden");
 
@@ -106,14 +73,28 @@ async function handleAdminLogin(password, remember = false) {
 	}
 }
 
-function logout() {
+async function logout() {
+	appSessionActive = false;
+	refreshGeneration += 1;
 	resetOAuthFlow();
-	adminPassword = null;
-	clearSavedPassword();
+	clearAPIKeyInput();
+	setAPIKeyEditMode(null);
+	try {
+		await fetch(`${API_BASE}/admin/session`, {
+			method: "DELETE",
+			credentials: "same-origin",
+			cache: "no-store",
+			referrerPolicy: "no-referrer",
+			headers: getAuthHeaders(),
+		});
+	} catch (e) {
+		console.warn("Admin session logout failed", e);
+	}
+	adminCSRFToken = null;
 
 	// 停止自动刷新
 	if (autoRefreshTimer) {
-		clearInterval(autoRefreshTimer);
+			clearTimeout(autoRefreshTimer);
 		autoRefreshTimer = null;
 	}
 
@@ -122,41 +103,8 @@ function logout() {
 }
 
 async function initAdminAuth() {
-	// 检查是否有保存的密码
-	const savedPassword = getSavedPassword();
-
-	if (savedPassword) {
-		console.log("Found saved password, attempting auto-login...");
-		// 直接设置密码，不验证（因为验证可能由于网络问题失败）
-		adminPassword = savedPassword;
-
-		// 尝试验证密码
-		try {
-			const isValid = await verifyAdminPassword(savedPassword);
-			if (isValid) {
-				console.log("Saved password validated successfully");
-				hideAdminLogin();
-				initializeApp();
-				return;
-			} else {
-				console.log("Saved password validation failed");
-				// 密码无效，清除并显示登录界面
-				adminPassword = null;
-				clearSavedPassword();
-			}
-		} catch (e) {
-			console.log(
-				"Password validation error, keeping saved password:",
-				e,
-			);
-			// 网络错误时仍然保留密码并尝试使用
-			hideAdminLogin();
-			initializeApp();
-			return;
-		}
-	}
-
-	// 显示登录界面
+	// A reload deliberately requires a fresh exchange; no credential is stored.
+	adminCSRFToken = null;
 	showAdminLogin();
 }
 
@@ -180,15 +128,6 @@ function bindAdminPasswordForm() {
 	const adminForm = document.getElementById("adminPasswordForm");
 	if (adminForm && adminForm.dataset.bound !== "true") {
 		adminForm.dataset.bound = "true";
-		// 检查并恢复记住密码的勾选状态
-		const hasSavedPassword = getSavedPassword() !== null;
-		if (hasSavedPassword) {
-			const rememberCheckbox =
-				document.getElementById("rememberPassword");
-			if (rememberCheckbox) {
-				rememberCheckbox.checked = true;
-			}
-		}
 
 		adminForm.addEventListener("submit", async (e) => {
 			e.preventDefault();
@@ -196,8 +135,6 @@ function bindAdminPasswordForm() {
 			const password = document
 				.getElementById("adminPassword")
 				.value.trim();
-			const remember =
-				document.getElementById("rememberPassword").checked;
 			const btn = document.getElementById("adminLoginBtn");
 			const btnText = document.getElementById("adminBtnText");
 			const btnLoading = document.getElementById("adminBtnLoading");
@@ -215,7 +152,7 @@ function bindAdminPasswordForm() {
 			btnText.textContent = "验证中...";
 			btnLoading.classList.remove("hidden");
 
-			const success = await handleAdminLogin(password, remember);
+			const success = await handleAdminLogin(password);
 
 			btn.disabled = false;
 			btnText.textContent = "验证";
@@ -229,17 +166,201 @@ function bindAdminPasswordForm() {
 }
 
 if (document.readyState === "loading") {
-	document.addEventListener("DOMContentLoaded", bindAdminPasswordForm);
+	document.addEventListener("DOMContentLoaded", () => {
+		bindAdminPasswordForm();
+		bindUIControls();
+	});
 } else {
 	bindAdminPasswordForm();
+	bindUIControls();
 }
 
 function getAuthHeaders() {
 	const headers = {};
-	if (adminPassword) {
-		headers["X-Admin-Password"] = adminPassword;
+	if (adminCSRFToken) {
+		headers["X-CSRF-Token"] = adminCSRFToken;
 	}
 	return headers;
+}
+
+async function adminFetch(path, options = {}) {
+	const headers = new Headers(options.headers || {});
+	for (const [name, value] of Object.entries(getAuthHeaders())) {
+		headers.set(name, value);
+	}
+	const response = await fetch(path, {
+		...options,
+		headers,
+		credentials: "same-origin",
+		cache: "no-store",
+		referrerPolicy: "no-referrer",
+	});
+	if (response.status === 401 || response.status === 403) {
+		appSessionActive = false;
+		refreshGeneration += 1;
+		adminCSRFToken = null;
+		resetOAuthFlow();
+		if (autoRefreshTimer) {
+			clearTimeout(autoRefreshTimer);
+			autoRefreshTimer = null;
+		}
+		if (document.getElementById("adminPasswordModal").classList.contains("hidden")) {
+			showAdminLogin();
+		}
+	}
+	return response;
+}
+
+function setAPIKeyStatus(message = "", type = "info") {
+	const status = document.getElementById("apiKeyStatus");
+	if (!status) return;
+	status.textContent = message;
+	status.classList.toggle("hidden", !message);
+	status.classList.toggle("text-red-600", type === "error");
+	status.classList.toggle("dark:text-red-400", type === "error");
+	status.classList.toggle("text-green-600", type === "success");
+	status.classList.toggle("dark:text-green-400", type === "success");
+}
+
+async function submitAPIKey(event) {
+	event.preventDefault();
+	const nameInput = document.getElementById("apiKeyName");
+	const keyInput = document.getElementById("apiKeyValue");
+	const button = document.getElementById("apiKeySubmit");
+	const text = document.getElementById("apiKeySubmitText");
+	const loading = document.getElementById("apiKeySubmitLoading");
+	let apiKey = keyInput.value.trim();
+	const name = nameInput.value.trim();
+	// Clear the DOM input before any network await; the key is never rendered back.
+	keyInput.value = "";
+	setAPIKeyStatus();
+	if (!apiKey) {
+		setAPIKeyStatus("请输入 API Key", "error");
+		return;
+	}
+
+	button.disabled = true;
+	text.textContent = "保存中...";
+	loading.classList.remove("hidden");
+	try {
+		const editingID = apiKeyEditingAccount?.id;
+		const endpoint = editingID
+			? `${API_BASE}/accounts/${editingID}/api-key`
+			: `${API_BASE}/accounts/api-key`;
+		const response = await adminFetch(endpoint, {
+			method: editingID ? "PUT" : "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name, api_key: apiKey }),
+		});
+		if (!response.ok) {
+			// Do not render an arbitrary server error: it must never echo the key.
+			throw new Error(`API Key 保存失败（HTTP ${response.status}）`);
+		}
+		setAPIKeyStatus(editingID ? "API Key 已轮换" : "API Key 已保存", "success");
+		setAPIKeyEditMode(null);
+		await loadAccounts();
+	} catch (error) {
+		setAPIKeyStatus(error.message || "API Key 保存失败", "error");
+	} finally {
+		apiKey = "";
+		button.disabled = false;
+		text.textContent = apiKeyEditingAccount ? "轮换 API Key" : "保存 API Key";
+		loading.classList.add("hidden");
+	}
+}
+
+function clearAPIKeyInput() {
+	const input = document.getElementById("apiKeyValue");
+	if (input) input.value = "";
+}
+
+function setAPIKeyEditMode(account) {
+	apiKeyEditingAccount = account || null;
+	const title = document.getElementById("apiKeyFormTitle");
+	const helper = document.getElementById("apiKeyFormHelper");
+	const name = document.getElementById("apiKeyName");
+	const key = document.getElementById("apiKeyValue");
+	const submitText = document.getElementById("apiKeySubmitText");
+	const cancel = document.getElementById("apiKeyCancel");
+	if (apiKeyEditingAccount) {
+		title.textContent = "轮换 API Key";
+		helper.textContent = `账号 ID ${apiKeyEditingAccount.id} 将立即改用新密钥。`;
+		name.value = getOAuthAccountLabel(apiKeyEditingAccount);
+		submitText.textContent = "轮换 API Key";
+		cancel.classList.remove("hidden");
+		key.value = "";
+		key.focus();
+	} else {
+		title.textContent = "添加 API Key 账号";
+		helper.textContent = "API key 只在提交请求中使用，提交后会立即从输入框清除。";
+		name.value = "";
+		submitText.textContent = "保存 API Key";
+		cancel.classList.add("hidden");
+		key.value = "";
+	}
+}
+
+function beginAPIKeyRotation(id) {
+	const account = currentState.items.find(
+		(item) => Number(item.id) === id && item.credential_type === "api_key",
+	);
+	if (!account) {
+		showToast("该 API Key 账号已不在当前页面，请刷新后重试", "error");
+		return;
+	}
+	setAPIKeyStatus();
+	setAPIKeyEditMode(account);
+	document.getElementById("apiKeyForm").scrollIntoView({
+		behavior: "smooth",
+		block: "center",
+	});
+}
+
+function bindUIControls() {
+	const bindOnce = (element, event, handler) => {
+		if (!element || element.dataset.bound === "true") return;
+		element.dataset.bound = "true";
+		element.addEventListener(event, handler);
+	};
+
+	bindOnce(
+		document.getElementById("adminPasswordVisibility"),
+		"click",
+		toggleAdminPasswordVisibility,
+	);
+	bindOnce(document.getElementById("logoutButton"), "click", logout);
+	bindOnce(document.getElementById("apiKeyForm"), "submit", submitAPIKey);
+	bindOnce(document.getElementById("apiKeyCancel"), "click", () => {
+		setAPIKeyStatus();
+		setAPIKeyEditMode(null);
+	});
+	bindOnce(document.getElementById("selectAll"), "change", toggleSelectAll);
+	bindOnce(document.getElementById("prevPage"), "click", () => changePage(-1));
+	bindOnce(document.getElementById("nextPage"), "click", () => changePage(1));
+
+	for (const container of [
+		document.getElementById("accountList"),
+		document.getElementById("mobileAccountList"),
+		document.getElementById("batchButtonsContainer"),
+	]) {
+		if (!container || container.dataset.bound === "true") continue;
+		container.dataset.bound = "true";
+		container.addEventListener("change", (event) => {
+			const input = event.target.closest('[data-action="toggle-select"]');
+			if (input) toggleSelect(Number(input.dataset.accountId));
+		});
+		container.addEventListener("click", (event) => {
+			const action = event.target.closest("[data-action]");
+			if (!action) return;
+			if (action.dataset.action === "delete-account") {
+				deleteAccount(Number(action.dataset.accountId));
+			} else if (action.dataset.action === "rotate-api-key") {
+				beginAPIKeyRotation(Number(action.dataset.accountId));
+			} else if (action.dataset.action === "batch-delete") {
+				batchDelete(action.dataset.deleteAll === "true");
+			}
+		});
+	}
 }
 
 // --- Theme Management ---
@@ -308,6 +429,10 @@ function getOAuthAccountLabel(account) {
 	return oauthEmail || "Zencoder 账号";
 }
 
+function getCredentialTypeLabel(account) {
+	return account?.credential_type === "api_key" ? "API Key" : "OAuth";
+}
+
 function formatLastUsed(dateStr) {
 	if (!dateStr || dateStr.startsWith("0001")) return "从未";
 
@@ -335,15 +460,15 @@ function formatLastUsed(dateStr) {
 }
 
 async function loadAccounts(isAutoRefresh = false) {
+	if (refreshInFlight) return;
+	refreshInFlight = true;
 	try {
 		const params = new URLSearchParams({
 			page: currentState.page,
 			size: currentState.size,
 		});
 
-		const resp = await fetch(`${API_BASE}/accounts?${params}`, {
-			headers: getAuthHeaders(),
-		});
+		const resp = await adminFetch(`${API_BASE}/accounts?${params}`);
 		if (!resp.ok) throw new Error("Failed to fetch");
 
 		const data = await resp.json();
@@ -372,7 +497,9 @@ async function loadAccounts(isAutoRefresh = false) {
 			updateStatsUI(data.stats);
 		}
 	} catch (e) {
-		if (!isAutoRefresh) console.error("Failed to load accounts", e);
+				if (!isAutoRefresh) console.error("Failed to load accounts", e);
+	} finally {
+		refreshInFlight = false;
 	}
 }
 
@@ -424,6 +551,8 @@ function renderAccounts(accounts) {
 		const isSelected = currentState.selectedIds.has(acc.id);
 		const lastUsedText = formatLastUsed(acc.last_used);
 		const accountLabel = getOAuthAccountLabel(acc);
+		const credentialTypeLabel = getCredentialTypeLabel(acc);
+		const canRotateAPIKey = acc.credential_type === "api_key";
 		const escapedAccountLabel = escapeHtml(accountLabel);
 		const escapedLastUsedText = escapeHtml(lastUsedText);
 		const accountId = Number(acc.id);
@@ -444,7 +573,7 @@ function renderAccounts(accounts) {
 		const desktop = `
         <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors ${isSelected ? "bg-blue-50 dark:bg-blue-900/10" : ""}">
             <td class="px-6 py-4 whitespace-nowrap text-center">
-                <input type="checkbox" onchange="toggleSelect(${safeAccountId})" ${isSelected ? "checked" : ""} aria-label="选择账号 ${escapedAccountLabel}" class="rounded border-gray-300 dark:border-gray-600 text-primary focus:ring-primary h-4 w-4 mx-auto">
+                <input type="checkbox" data-action="toggle-select" data-account-id="${safeAccountId}" ${isSelected ? "checked" : ""} aria-label="选择账号 ${escapedAccountLabel}" class="rounded border-gray-300 dark:border-gray-600 text-primary focus:ring-primary h-4 w-4 mx-auto">
             </td>
             <td class="px-6 py-4 whitespace-nowrap text-center">
                 <div class="text-sm font-medium text-gray-900 dark:text-white">${safeAccountId}</div>
@@ -452,7 +581,7 @@ function renderAccounts(accounts) {
             <td class="px-6 py-4 whitespace-nowrap text-left">
                 <div class="flex items-center gap-2 min-w-[160px]">
                     <span class="inline-flex items-center rounded-md bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-900/20 dark:text-blue-300 dark:ring-blue-400/30">
-                        OAuth
+                        ${credentialTypeLabel}
                     </span>
                     <span class="max-w-[220px] truncate text-sm text-gray-700 dark:text-gray-200" title="${escapedAccountLabel}">${escapedAccountLabel}</span>
                 </div>
@@ -468,8 +597,11 @@ function renderAccounts(accounts) {
                 <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">累计 ${totalUsage}</div>
             </td>
             <td class="px-6 py-4 whitespace-nowrap text-center text-sm font-medium">
-                <div class="flex justify-center">
-                    <button onclick="deleteAccount(${safeAccountId})" class="text-red-500 hover:text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 rounded-md transition-colors" title="删除" aria-label="删除账号 ${escapedAccountLabel}">
+				<div class="flex justify-center gap-3">
+					${canRotateAPIKey ? `<button type="button" data-action="rotate-api-key" data-account-id="${safeAccountId}" class="text-blue-600 hover:text-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500 rounded-md transition-colors" title="轮换 API Key" aria-label="轮换 API Key ${escapedAccountLabel}">
+						<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5.1 15a7 7 0 0011.2 2.1L20 14M4 10l3.7-3.1A7 7 0 0118.9 9" /></svg>
+					</button>` : ""}
+					<button type="button" data-action="delete-account" data-account-id="${safeAccountId}" class="text-red-500 hover:text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 rounded-md transition-colors" title="删除" aria-label="删除账号 ${escapedAccountLabel}">
                         <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                         </svg>
@@ -481,19 +613,22 @@ function renderAccounts(accounts) {
 		const mobile = `
         <article class="px-4 py-4 transition-colors ${isSelected ? "bg-blue-50 dark:bg-blue-900/10" : "bg-surface-light dark:bg-surface-dark"}">
             <div class="flex items-start gap-3">
-                <input type="checkbox" onchange="toggleSelect(${safeAccountId})" ${isSelected ? "checked" : ""} aria-label="选择账号 ${escapedAccountLabel}" class="mt-1 rounded border-gray-300 dark:border-gray-600 text-primary focus:ring-primary h-4 w-4 shrink-0">
+                <input type="checkbox" data-action="toggle-select" data-account-id="${safeAccountId}" ${isSelected ? "checked" : ""} aria-label="选择账号 ${escapedAccountLabel}" class="mt-1 rounded border-gray-300 dark:border-gray-600 text-primary focus:ring-primary h-4 w-4 shrink-0">
                 <div class="min-w-0 flex-1">
                     <div class="flex items-center gap-2">
-                        <span class="inline-flex shrink-0 items-center rounded-md bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-900/20 dark:text-blue-300 dark:ring-blue-400/30">OAuth</span>
+                        <span class="inline-flex shrink-0 items-center rounded-md bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-900/20 dark:text-blue-300 dark:ring-blue-400/30">${credentialTypeLabel}</span>
                         <span class="truncate text-sm font-medium text-gray-900 dark:text-white" title="${escapedAccountLabel}">${escapedAccountLabel}</span>
                     </div>
                     <div class="mt-1 text-[11px] text-gray-400">账号 ID ${safeAccountId}</div>
                 </div>
-                <button onclick="deleteAccount(${safeAccountId})" class="-mr-1 rounded-lg p-2 text-red-500 hover:bg-red-50 hover:text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 dark:hover:bg-red-900/20 transition-colors" title="删除" aria-label="删除账号 ${escapedAccountLabel}">
+				<div class="-mr-1 flex items-center">
+				${canRotateAPIKey ? `<button type="button" data-action="rotate-api-key" data-account-id="${safeAccountId}" class="rounded-lg p-2 text-blue-600 hover:bg-blue-50 hover:text-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:hover:bg-blue-900/20 transition-colors" title="轮换 API Key" aria-label="轮换 API Key ${escapedAccountLabel}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5.1 15a7 7 0 0011.2 2.1L20 14M4 10l3.7-3.1A7 7 0 0118.9 9" /></svg></button>` : ""}
+				<button type="button" data-action="delete-account" data-account-id="${safeAccountId}" class="rounded-lg p-2 text-red-500 hover:bg-red-50 hover:text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 dark:hover:bg-red-900/20 transition-colors" title="删除" aria-label="删除账号 ${escapedAccountLabel}">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                     </svg>
-                </button>
+				</button>
+				</div>
             </div>
             <div class="mt-3 grid grid-cols-2 gap-3 border-t border-gray-100 pt-3 dark:border-gray-800">
                 <div>
@@ -604,10 +739,8 @@ function updateBatchUI() {
 }
 
 function getBatchButtonsHtml(selectedCount) {
-	const deleteHandler =
-		selectedCount > 0 ? "batchDelete(false)" : "batchDelete(true)";
 	return `
-        <button onclick="${deleteHandler}" class="px-3 py-1.5 bg-red-700 text-white text-xs font-medium rounded-md hover:bg-red-800 transition-colors flex items-center gap-1">
+        <button type="button" data-action="batch-delete" data-delete-all="${selectedCount === 0}" class="px-3 py-1.5 bg-red-700 text-white text-xs font-medium rounded-md hover:bg-red-800 transition-colors flex items-center gap-1">
             <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
             </svg>
@@ -642,11 +775,10 @@ async function batchDelete(deleteAll = false) {
 	if (!confirm(confirmMsg)) return;
 
 	try {
-		const resp = await fetch(`${API_BASE}/accounts/batch/delete`, {
+		const resp = await adminFetch(`${API_BASE}/accounts/batch/delete`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
-				...getAuthHeaders(),
 			},
 			body: JSON.stringify(requestData),
 		});
@@ -788,9 +920,8 @@ async function startZencoderOAuth() {
 
 	try {
 		if (!oauthFlow) {
-			const response = await fetch(`${API_BASE}/oauth/zencoder/start`, {
+			const response = await adminFetch(`${API_BASE}/oauth/zencoder/start`, {
 				method: "POST",
-				headers: getAuthHeaders(),
 			});
 
 			if (!response.ok) {
@@ -891,10 +1022,9 @@ async function completeZencoderOAuth(event) {
 
 	setOAuthCompleteLoading(true);
 	try {
-		const response = await fetch(`${API_BASE}/oauth/zencoder/complete`, {
+		const response = await adminFetch(`${API_BASE}/oauth/zencoder/complete`, {
 			method: "POST",
 			headers: {
-				...getAuthHeaders(),
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify({ callback_url: callbackURL }),
@@ -972,10 +1102,10 @@ document.getElementById("oauthCallbackURL").addEventListener("input", () => {
 async function deleteAccount(id) {
 	if (!confirm("确定要删除此账号吗？")) return;
 	try {
-		await fetch(`${API_BASE}/accounts/${id}`, {
+		const response = await adminFetch(`${API_BASE}/accounts/${id}`, {
 			method: "DELETE",
-			headers: getAuthHeaders(),
 		});
+		if (!response.ok) throw new Error("delete failed");
 		loadAccounts();
 	} catch (e) {
 		alert("删除失败");
@@ -984,15 +1114,21 @@ async function deleteAccount(id) {
 
 // Initialization function for after admin login
 function initializeApp() {
+	appSessionActive = true;
+	const generation = ++refreshGeneration;
 	loadAccounts();
 
 	// Auto Refresh
 	if (autoRefreshTimer) {
-		clearInterval(autoRefreshTimer);
+		clearTimeout(autoRefreshTimer);
 	}
-	autoRefreshTimer = setInterval(() => {
-		loadAccounts(true);
-	}, REFRESH_INTERVAL);
+	const refresh = async () => {
+		await loadAccounts(true);
+		if (appSessionActive && generation === refreshGeneration) {
+			autoRefreshTimer = setTimeout(refresh, REFRESH_INTERVAL);
+		}
+	};
+	autoRefreshTimer = setTimeout(refresh, REFRESH_INTERVAL);
 }
 
 // Toast提示功能
@@ -1039,6 +1175,7 @@ function showToast(message, type = "info") {
 // Page Initialization
 window.addEventListener("load", async function () {
 	console.log("Page loaded, initializing...");
+	bindUIControls();
 	initTheme();
 	await initAdminAuth();
 	consumeOAuthRedirectResult();
