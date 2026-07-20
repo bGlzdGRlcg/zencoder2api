@@ -4,8 +4,8 @@
 
 - 对照 VSIX 3.4.1、JetBrains 3.31.0 和 Zenflow 2.3.5 完成 Provider Gateway
   端点、认证 header、OAuth 和协议转换审计。
-- 修正 Zencoder OAuth exchange/refresh body，增加 SQLite 持久化 session、原子 claim
-  和 refresh token rotation 保护。
+- 修复 Zencoder OAuth：加密持久化 PKCE verifier，按 provider 分流 WorkOS/Frontegg
+  exchange/refresh 端点，并增加不含凭据的诊断日志。
 - 增加 AES-256-GCM OAuth/API Key 加密、启动密钥校验、旧明文迁移和 API Key
   创建/轮换接口；凭据 revision 防止跨实例旧缓存继续使用已撤销密钥。
 - 增加账号健康状态、Retry-After/指数退避、401 单次强制刷新、refresh lease 和

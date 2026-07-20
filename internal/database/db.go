@@ -21,7 +21,7 @@ import (
 var DB *gorm.DB
 
 const (
-	currentSchemaVersion       = 1
+	currentSchemaVersion       = 2
 	migrationBusyTimeoutMillis = 30000
 	runtimeBusyTimeoutMillis   = 5000
 	migrationLeaseDuration     = 10 * time.Minute
@@ -117,11 +117,17 @@ func runSchemaMigrations(db *gorm.DB) error {
 		if err := tx.Raw("SELECT version FROM zencoder_schema_migrations WHERE id = 1 AND holder = ?", holder).Scan(&version).Error; err != nil {
 			return fmt.Errorf("read schema migration version: %w", err)
 		}
-		if version < currentSchemaVersion {
+		if version < 1 {
 			if err := migrateSchemaVersionOne(tx); err != nil {
 				return err
 			}
-			version = currentSchemaVersion
+			version = 1
+		}
+		if version < 2 {
+			if err := migrateSchemaVersionTwo(tx); err != nil {
+				return err
+			}
+			version = 2
 		}
 		completed := tx.Exec(`UPDATE zencoder_schema_migrations
 			SET version = ?, holder = '', lease_until = ?, updated_at = ?
@@ -165,12 +171,22 @@ func migrateSchemaVersionOne(db *gorm.DB) error {
 			return fmt.Errorf("drop legacy account column client_secret: %w", err)
 		}
 	}
-	// Zencoder's confirmed exchange contract does not accept the PKCE verifier.
-	// Remove the retired plaintext session column after older databases migrate.
+	// Schema v1 did not persist the PKCE verifier. Keep its cleanup here so v2
+	// exclusively owns the encrypted verifier column added below.
 	if db.Migrator().HasColumn(&model.OAuthSession{}, "code_verifier") {
 		if err := db.Migrator().DropColumn(&model.OAuthSession{}, "code_verifier"); err != nil {
 			return fmt.Errorf("drop retired OAuth session verifier: %w", err)
 		}
+	}
+	return nil
+}
+
+func migrateSchemaVersionTwo(db *gorm.DB) error {
+	if db.Migrator().HasColumn(&model.OAuthSession{}, "code_verifier") {
+		return nil
+	}
+	if err := db.Migrator().AddColumn(&model.OAuthSession{}, "CodeVerifier"); err != nil {
+		return fmt.Errorf("add OAuth session verifier: %w", err)
 	}
 	return nil
 }

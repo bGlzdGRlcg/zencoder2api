@@ -53,10 +53,9 @@ func NewOAuthService() *OAuthService {
 	}
 }
 
-// StartZencoderLogin creates the browser login URL used by the VSCode extension.
+// StartZencoderLogin creates the PKCE login URL used by the VSCode extension.
 // The random state is embedded in the callback path, making the unauthenticated
-// callback both one-time and unguessable. The Zencoder exchange contract uses
-// code/provider/redirectUrl and intentionally does not receive the verifier.
+// callback both one-time and unguessable.
 func (s *OAuthService) StartZencoderLogin(origin string) (OAuthStartResult, error) {
 	state, err := randomURLToken(32)
 	if err != nil {
@@ -69,6 +68,10 @@ func (s *OAuthService) StartZencoderLogin(origin string) (OAuthStartResult, erro
 	anonymousID, err := randomURLToken(18)
 	if err != nil {
 		return OAuthStartResult{}, err
+	}
+	encryptedVerifier, err := secret.Encrypt(verifier)
+	if err != nil {
+		return OAuthStartResult{}, fmt.Errorf("encrypt OAuth code verifier: %w", err)
 	}
 	callbackURL, err := loopbackCallbackURL(origin, state)
 	if err != nil {
@@ -93,11 +96,12 @@ func (s *OAuthService) StartZencoderLogin(origin string) (OAuthStartResult, erro
 		return OAuthStartResult{}, fmt.Errorf("delete expired OAuth sessions: %w", err)
 	}
 	if err := db.Create(&model.OAuthSession{
-		State:       state,
-		AnonymousID: anonymousID,
-		Origin:      strings.TrimRight(origin, "/"),
-		RedirectURL: callbackURL,
-		ExpiresAt:   now.Add(oauthSessionTTL),
+		State:        state,
+		CodeVerifier: encryptedVerifier,
+		AnonymousID:  anonymousID,
+		Origin:       strings.TrimRight(origin, "/"),
+		RedirectURL:  callbackURL,
+		ExpiresAt:    now.Add(oauthSessionTTL),
 	}).Error; err != nil {
 		return OAuthStartResult{}, fmt.Errorf("persist OAuth session: %w", err)
 	}
@@ -119,8 +123,10 @@ func (s *OAuthService) CompleteZencoderLogin(
 	if strings.TrimSpace(code) == "" {
 		return OAuthCompleteResult{}, errors.New("OAuth callback has no authorization code")
 	}
-	if provider != "workos" {
+	if !strings.EqualFold(strings.TrimSpace(provider), "workos") {
 		provider = "frontegg"
+	} else {
+		provider = "workos"
 	}
 	session, err := claimOAuthSession(ctx, state)
 	if err != nil {
@@ -145,14 +151,21 @@ func (s *OAuthService) CompleteZencoderLogin(
 		}
 	}()
 
-	tokens, err := s.exchangeCode(claimCtx, provider, code, session.RedirectURL, session.AnonymousID)
+	codeVerifier, err := secret.Decrypt(session.CodeVerifier)
+	if err != nil {
+		return OAuthCompleteResult{Origin: session.Origin}, fmt.Errorf("decrypt OAuth code verifier: %w", err)
+	}
+	tokens, err := s.exchangeCode(claimCtx, provider, code, codeVerifier, session.AnonymousID)
 	if claimErr := heartbeat.Err(); claimErr != nil {
 		return OAuthCompleteResult{Origin: session.Origin}, claimErr
 	}
 	if err != nil {
 		return OAuthCompleteResult{Origin: session.Origin}, err
 	}
-	profile, err := s.fetchProfile(claimCtx, tokens.AccessToken)
+	profile, err := oauthProfileFromAccessToken(tokens.AccessToken)
+	if err != nil {
+		profile, err = s.fetchProfile(claimCtx, tokens.AccessToken)
+	}
 	if claimErr := heartbeat.Err(); claimErr != nil {
 		return OAuthCompleteResult{Origin: session.Origin}, claimErr
 	}
@@ -358,23 +371,31 @@ func (s *OAuthService) exchangeCode(
 	ctx context.Context,
 	provider string,
 	code string,
-	redirectURL string,
+	codeVerifier string,
 	anonymousID string,
 ) (zencoderOAuthTokens, error) {
 	body := map[string]string{
-		"providerType": provider,
 		"code":         code,
-		"redirectUrl":  redirectURL,
+		"codeVerifier": codeVerifier,
+	}
+	endpoint := "/api/oauth/token"
+	if provider == "workos" {
+		body["provider"] = provider
+		endpoint = "/api/auth/token"
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return zencoderOAuthTokens{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, zencoderAuthBaseURL()+"/api/oauth/token", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, zencoderAuthBaseURL()+endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return zencoderOAuthTokens{}, err
 	}
 	setOAuthServiceHeaders(req, anonymousID)
+	logging.Debugf(
+		"Zencoder OAuth exchange request request_id=%s provider=%s endpoint=%s plugin_version=%s code_bytes=%d verifier_bytes=%d",
+		logging.RequestIDFromContext(ctx), provider, oauthLogURL(req.URL), req.Header.Get("x-zencoder-plugin-version"), len(code), len(codeVerifier),
+	)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return zencoderOAuthTokens{}, fmt.Errorf("exchange Zencoder OAuth code: %w", err)
@@ -384,6 +405,7 @@ func (s *OAuthService) exchangeCode(
 	if err != nil {
 		return zencoderOAuthTokens{}, err
 	}
+	logOAuthHTTPResponse(ctx, "exchange", resp, responseBody)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return zencoderOAuthTokens{}, fmt.Errorf("exchange Zencoder OAuth code: HTTP %d", resp.StatusCode)
 	}
@@ -401,7 +423,34 @@ type zencoderOAuthProfile struct {
 	UserID   string
 	TenantID string
 	Email    string
-	Name     string
+}
+
+func oauthProfileFromAccessToken(accessToken string) (zencoderOAuthProfile, error) {
+	payload, err := decodeJWTPayload(accessToken)
+	if err != nil {
+		return zencoderOAuthProfile{}, err
+	}
+	var claims struct {
+		Subject        string `json:"sub"`
+		UserID         string `json:"user_id"`
+		UserIDCamel    string `json:"userId"`
+		TenantID       string `json:"tenant_id"`
+		TenantIDCamel  string `json:"tenantId"`
+		OrganizationID string `json:"org_id"`
+		Email          string `json:"email"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return zencoderOAuthProfile{}, fmt.Errorf("decode zencoder OAuth token claims: %w", err)
+	}
+	profile := zencoderOAuthProfile{
+		UserID:   firstNonEmpty(claims.UserID, claims.UserIDCamel, claims.Subject),
+		TenantID: firstNonEmpty(claims.TenantID, claims.TenantIDCamel, claims.OrganizationID),
+		Email:    strings.TrimSpace(claims.Email),
+	}
+	if profile.UserID == "" || profile.TenantID == "" {
+		return zencoderOAuthProfile{}, errors.New("zencoder OAuth token is missing account identity")
+	}
+	return profile, nil
 }
 
 func (s *OAuthService) fetchProfile(ctx context.Context, accessToken string) (zencoderOAuthProfile, error) {
@@ -419,6 +468,7 @@ func (s *OAuthService) fetchProfile(ctx context.Context, accessToken string) (ze
 	if err != nil {
 		return zencoderOAuthProfile{}, err
 	}
+	logOAuthHTTPResponse(ctx, "profile", resp, body)
 	if resp.StatusCode != http.StatusOK {
 		return zencoderOAuthProfile{}, fmt.Errorf("fetch zencoder OAuth profile: HTTP %d", resp.StatusCode)
 	}
@@ -426,7 +476,6 @@ func (s *OAuthService) fetchProfile(ctx context.Context, accessToken string) (ze
 		UserID   string `json:"user_id"`
 		TenantID string `json:"org_id"`
 		Email    string `json:"email"`
-		Name     string `json:"name"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return zencoderOAuthProfile{}, fmt.Errorf("decode zencoder OAuth profile: %w", err)
@@ -434,7 +483,7 @@ func (s *OAuthService) fetchProfile(ctx context.Context, accessToken string) (ze
 	if raw.UserID == "" || raw.TenantID == "" {
 		return zencoderOAuthProfile{}, errors.New("zencoder OAuth profile is missing account identity")
 	}
-	return zencoderOAuthProfile{UserID: raw.UserID, TenantID: raw.TenantID, Email: raw.Email, Name: raw.Name}, nil
+	return zencoderOAuthProfile{UserID: raw.UserID, TenantID: raw.TenantID, Email: raw.Email}, nil
 }
 
 func upsertOAuthAccount(

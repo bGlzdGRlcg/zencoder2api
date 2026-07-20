@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -16,24 +17,23 @@ import (
 
 	"zencoder-2api/internal/database"
 	"zencoder-2api/internal/model"
+	"zencoder-2api/internal/secret"
 )
 
 func TestOAuthExchangeContract(t *testing.T) {
+	t.Setenv("ZENCODER_PLUGIN_VERSION", "")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/oauth/token" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
-		var body map[string]interface{}
+		var body map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body["providerType"] != "workos" || body["code"] != "code" || body["redirectUrl"] != "http://localhost/callback" {
+		if body["code"] != "code" || body["codeVerifier"] != "verifier" || len(body) != 2 {
 			t.Fatalf("unexpected exchange body: %#v", body)
 		}
-		if _, exists := body["codeVerifier"]; exists {
-			t.Fatalf("unrelated PKCE contract leaked into Zencoder exchange: %#v", body)
-		}
-		if r.Header.Get("x-zencoder-anonymous-id") != "anonymous" || r.Header.Get("x-zencoder-plugin-version") == "" {
+		if r.Header.Get("x-zencoder-anonymous-id") != "anonymous" || r.Header.Get("x-zencoder-plugin-version") != "vsc-3.4.1" {
 			t.Fatalf("missing OAuth metadata: %#v", r.Header)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -42,7 +42,7 @@ func TestOAuthExchangeContract(t *testing.T) {
 	defer server.Close()
 	t.Setenv("ZENCODER_AUTH_BASE_URL", server.URL)
 
-	tokens, err := NewOAuthService().exchangeCode(context.Background(), "workos", "code", "http://localhost/callback", "anonymous")
+	tokens, err := NewOAuthService().exchangeCode(context.Background(), "frontegg", "code", "verifier", "anonymous")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,16 +51,39 @@ func TestOAuthExchangeContract(t *testing.T) {
 	}
 }
 
+func TestOAuthWorkOSExchangeContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/auth/token" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["code"] != "code" || body["codeVerifier"] != "verifier" || body["provider"] != "workos" || len(body) != 3 {
+			t.Fatalf("unexpected WorkOS exchange body: %#v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accessToken":"access","refreshToken":"refresh","expiresIn":3600}`))
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_AUTH_BASE_URL", server.URL)
+
+	if _, err := NewOAuthService().exchangeCode(context.Background(), "workos", "code", "verifier", "anonymous"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOAuthRefreshContract(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/refresh_token" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
-		var body map[string]interface{}
+		var body map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body["providerType"] != "frontegg" || body["refreshToken"] != "old-refresh" {
+		if body["refreshToken"] != "old-refresh" || len(body) != 1 {
 			t.Fatalf("unexpected refresh body: %#v", body)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -82,9 +105,135 @@ func TestOAuthRefreshContract(t *testing.T) {
 	}
 }
 
+func TestOAuthWorkOSRefreshContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/auth/refresh" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["refreshToken"] != "old-refresh" || body["provider"] != "workos" || len(body) != 2 {
+			t.Fatalf("unexpected WorkOS refresh body: %#v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accessToken":"new-access","expiresIn":3600}`))
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_AUTH_BASE_URL", server.URL)
+	accessPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"https://api.workos.com/user_management/client"}`))
+
+	tokens, err := refreshZencoderOAuthToken(context.Background(), &model.Account{
+		AccessToken: "header." + accessPayload + ".signature", RefreshToken: "old-refresh", OAuthAnonymousID: "anonymous",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokens.AccessToken != "new-access" || tokens.RefreshToken != "old-refresh" {
+		t.Fatalf("unexpected rotated tokens: %#v", tokens)
+	}
+}
+
 func TestParseOAuthTokensRequiresAccessToken(t *testing.T) {
 	if _, err := parseOAuthTokens([]byte(`{"refreshToken":"refresh"}`)); err == nil {
 		t.Fatal("expected missing access token error")
+	}
+}
+
+func TestStartOAuthPersistsEncryptedVerifier(t *testing.T) {
+	t.Setenv("TOKEN_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString([]byte(strings.Repeat("v", 32))))
+	setupOAuthSessionTestDatabase(t, "oauth-start.db")
+	result, err := NewOAuthService().StartZencoderLogin("http://localhost:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var session model.OAuthSession
+	if err := database.GetDB().Where("state = ?", result.State).First(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !secret.IsEncrypted(session.CodeVerifier) {
+		t.Fatalf("OAuth verifier was not encrypted: %q", session.CodeVerifier)
+	}
+	verifier, err := secret.Decrypt(session.CodeVerifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizationURL, err := url.Parse(result.AuthorizationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorizationURL.Query().Get("code_challenge") != pkceChallenge(verifier) {
+		t.Fatal("authorization challenge does not match persisted verifier")
+	}
+}
+
+func TestOAuthProfileFromAccessToken(t *testing.T) {
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"user","tenantId":"tenant","email":"user@example.test","name":"User"}`))
+	profile, err := oauthProfileFromAccessToken("header." + payload + ".signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.UserID != "user" || profile.TenantID != "tenant" || profile.Email != "user@example.test" {
+		t.Fatalf("unexpected profile: %#v", profile)
+	}
+}
+
+func TestOAuthLogURLRedactsSecrets(t *testing.T) {
+	value, err := url.Parse("https://user:password@auth.example.test/api/auth/token?code=secret#fragment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := oauthLogURL(value); got != "https://auth.example.test/api/auth/token" {
+		t.Fatalf("OAuth log URL = %q", got)
+	}
+}
+
+func TestCompleteOAuthLoginUsesPKCEAndTokenClaims(t *testing.T) {
+	t.Setenv("TOKEN_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString([]byte(strings.Repeat("e", 32))))
+	setupOAuthSessionTestDatabase(t, "oauth-complete.db")
+	session := createOAuthSessionTestRecord(t, "complete-state")
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"user","tenantId":"tenant","email":"user@example.test"}`))
+	accessToken := "header." + payload + ".signature"
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.URL.Path != "/api/auth/token" {
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["code"] != "code" || body["codeVerifier"] != "test-verifier" || body["provider"] != "workos" || len(body) != 3 {
+			t.Fatalf("unexpected exchange body: %#v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token":  accessToken,
+			"refresh_token": "refresh",
+			"expires_in":    3600,
+		})
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_AUTH_BASE_URL", server.URL)
+
+	result, err := NewOAuthService().CompleteZencoderLogin(context.Background(), session.State, "code", "WORKOS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("OAuth completion made %d upstream requests, want 1", requests.Load())
+	}
+	if result.Account == nil || result.Account.OAuthProvider != "workos" || result.Account.OAuthUserID != "user" || result.Account.OAuthTenantID != "tenant" || result.Account.AccessToken != accessToken {
+		t.Fatalf("unexpected OAuth account: %#v", result.Account)
+	}
+	var sessionCount int64
+	if err := database.GetDB().Model(&model.OAuthSession{}).Where("id = ?", session.ID).Count(&sessionCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if sessionCount != 0 {
+		t.Fatal("completed OAuth session was not deleted")
 	}
 }
 
@@ -217,6 +366,7 @@ func TestOAuthAccountUpsertRollsBackWhenSessionConsumeFails(t *testing.T) {
 }
 
 func TestOAuthSessionHeartbeatPreventsClaimTakeover(t *testing.T) {
+	t.Setenv("TOKEN_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString([]byte(strings.Repeat("h", 32))))
 	setupOAuthSessionTestDatabase(t, "oauth-heartbeat.db")
 	session := createOAuthSessionTestRecord(t, "heartbeat-state")
 	claimed, err := claimOAuthSession(context.Background(), session.State)
@@ -320,12 +470,17 @@ func setupOAuthSessionTestDatabase(t *testing.T, name string) {
 
 func createOAuthSessionTestRecord(t *testing.T, state string) *model.OAuthSession {
 	t.Helper()
+	verifier, err := secret.Encrypt("test-verifier")
+	if err != nil {
+		t.Fatal(err)
+	}
 	session := &model.OAuthSession{
-		State:       state,
-		AnonymousID: "anonymous",
-		Origin:      "http://localhost:8080",
-		RedirectURL: fmt.Sprintf("http://localhost:8080/oauth/zencoder/callback/%s", state),
-		ExpiresAt:   time.Now().Add(time.Minute),
+		State:        state,
+		CodeVerifier: verifier,
+		AnonymousID:  "anonymous",
+		Origin:       "http://localhost:8080",
+		RedirectURL:  fmt.Sprintf("http://localhost:8080/oauth/zencoder/callback/%s", state),
+		ExpiresAt:    time.Now().Add(time.Minute),
 	}
 	if err := database.GetDB().Create(session).Error; err != nil {
 		t.Fatal(err)

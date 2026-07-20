@@ -468,7 +468,7 @@ func setupRoutes(r *gin.Engine, cfg serverConfig) error {
 		c.HTML(200, "index.html", nil)
 	})
 
-	// Zencoder OAuth callback is protected by a one-time PKCE state embedded in
+	// Zencoder OAuth callback is protected by a one-time state embedded in
 	// the path, so it must remain reachable from the external login page.
 	oauthHandler := handler.NewOAuthHandler()
 	oauthCallbackLimiter := middleware.NewRemoteRequestLimiter(8, cfg.adminLoginPerMinute)

@@ -58,3 +58,58 @@ func TestPublicOriginRequiresConfigurationForNonLoopbackHost(t *testing.T) {
 		t.Fatal("expected non-loopback Host to be rejected")
 	}
 }
+
+func TestParseZencoderCallbackURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{
+			name:  "valid",
+			input: "http://localhost:8080/oauth/zencoder/callback/state?code=code&provider=frontegg",
+		},
+		{
+			name:    "reject loopback IP",
+			input:   "http://127.0.0.1:8080/oauth/zencoder/callback/state?code=code",
+			wantErr: true,
+		},
+		{
+			name:    "reject duplicate code",
+			input:   "http://localhost:8080/oauth/zencoder/callback/state?code=one&code=two",
+			wantErr: true,
+		},
+		{
+			name:    "reject fragment",
+			input:   "http://localhost:8080/oauth/zencoder/callback/state?code=code#fragment",
+			wantErr: true,
+		},
+		{
+			name:    "reject credentials",
+			input:   "http://user:pass@localhost:8080/oauth/zencoder/callback/state?code=code",
+			wantErr: true,
+		},
+		{
+			name:    "reject wrong path",
+			input:   "http://localhost:8080/oauth/callback/state?code=code",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state, code, provider, err := parseZencoderCallbackURL(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parse callback succeeded: state=%q code=%q provider=%q", state, code, provider)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state != "state" || code != "code" || provider != "frontegg" {
+				t.Fatalf("parsed callback = %q, %q, %q", state, code, provider)
+			}
+		})
+	}
+}

@@ -53,19 +53,21 @@ type Account struct {
 }
 
 // OAuthSession persists a short-lived PKCE login so callbacks survive process
-// restarts. ClaimID is the ownership token; ClaimedAt is a renewable lease
-// timestamp, and ConsumedAt makes successful callbacks permanently one-time.
+// restarts. CodeVerifier is encrypted before persistence. ClaimID is the
+// ownership token; ClaimedAt is a renewable lease timestamp, and ConsumedAt
+// makes successful callbacks permanently one-time.
 type OAuthSession struct {
-	ID          uint       `json:"-" gorm:"primaryKey"`
-	State       string     `json:"-" gorm:"uniqueIndex;not null"`
-	AnonymousID string     `json:"-" gorm:"not null"`
-	Origin      string     `json:"-" gorm:"not null"`
-	RedirectURL string     `json:"-" gorm:"not null"`
-	ExpiresAt   time.Time  `json:"-" gorm:"index;not null"`
-	ClaimID     string     `json:"-" gorm:"index"`
-	ClaimedAt   *time.Time `json:"-" gorm:"index"`
-	ConsumedAt  *time.Time `json:"-" gorm:"index"`
-	CreatedAt   time.Time  `json:"-"`
+	ID           uint       `json:"-" gorm:"primaryKey"`
+	State        string     `json:"-" gorm:"uniqueIndex;not null"`
+	CodeVerifier string     `json:"-" gorm:"type:text"`
+	AnonymousID  string     `json:"-" gorm:"not null"`
+	Origin       string     `json:"-" gorm:"not null"`
+	RedirectURL  string     `json:"-" gorm:"not null"`
+	ExpiresAt    time.Time  `json:"-" gorm:"index;not null"`
+	ClaimID      string     `json:"-" gorm:"index"`
+	ClaimedAt    *time.Time `json:"-" gorm:"index"`
+	ConsumedAt   *time.Time `json:"-" gorm:"index"`
+	CreatedAt    time.Time  `json:"-"`
 }
 
 // AdminSession stores only a hash of the random session nonce. Keeping this

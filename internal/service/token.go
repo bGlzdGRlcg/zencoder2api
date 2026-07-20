@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -596,18 +597,26 @@ func refreshZencoderOAuthToken(ctx context.Context, account *model.Account) (zen
 	}
 	body := map[string]string{
 		"refreshToken": strings.TrimSpace(account.RefreshToken),
-		"providerType": provider,
+	}
+	endpoint := "/refresh_token"
+	if provider == "workos" {
+		body["provider"] = provider
+		endpoint = "/api/auth/refresh"
 	}
 
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return zencoderOAuthTokens{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, zencoderAuthBaseURL()+"/refresh_token", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, zencoderAuthBaseURL()+endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return zencoderOAuthTokens{}, err
 	}
 	setOAuthServiceHeaders(req, account.OAuthAnonymousID)
+	logging.Debugf(
+		"Zencoder OAuth refresh request request_id=%s provider=%s endpoint=%s plugin_version=%s refresh_token_bytes=%d",
+		logging.RequestIDFromContext(ctx), provider, oauthLogURL(req.URL), req.Header.Get("x-zencoder-plugin-version"), len(strings.TrimSpace(account.RefreshToken)),
+	)
 	resp, err := zencoderOAuthHTTPClient.Do(req)
 	if err != nil {
 		return zencoderOAuthTokens{}, fmt.Errorf("refresh Zencoder OAuth token: %w", err)
@@ -617,6 +626,7 @@ func refreshZencoderOAuthToken(ctx context.Context, account *model.Account) (zen
 	if err != nil {
 		return zencoderOAuthTokens{}, err
 	}
+	logOAuthHTTPResponse(ctx, "refresh", resp, responseBody)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return zencoderOAuthTokens{}, &oauthRefreshHTTPError{
 			statusCode: resp.StatusCode,
@@ -684,7 +694,7 @@ func setOAuthServiceHeaders(req *http.Request, anonymousID string) {
 func zencoderPluginVersion() string {
 	value := strings.TrimSpace(os.Getenv("ZENCODER_PLUGIN_VERSION"))
 	if value == "" {
-		value = zencoderVersion
+		value = "3.4.1"
 	}
 	if strings.HasPrefix(value, "vsc-") {
 		return value
@@ -704,6 +714,40 @@ func detectOAuthProviderFromJWT(token string) string {
 		return "workos"
 	}
 	return "frontegg"
+}
+
+func logOAuthHTTPResponse(ctx context.Context, operation string, resp *http.Response, body []byte) {
+	if !logging.Enabled(logging.LevelDebug) || resp == nil {
+		return
+	}
+	endpoint := ""
+	if resp.Request != nil {
+		endpoint = oauthLogURL(resp.Request.URL)
+	}
+	logging.Debugf(
+		"Zencoder OAuth %s response request_id=%s status=%d endpoint=%s content_type=%q server=%q upstream_request_id=%q location_present=%t body_bytes=%d",
+		operation,
+		logging.RequestIDFromContext(ctx),
+		resp.StatusCode,
+		endpoint,
+		resp.Header.Get("Content-Type"),
+		resp.Header.Get("Server"),
+		firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("x-amzn-requestid"), resp.Header.Get("cf-ray")),
+		resp.Header.Get("Location") != "",
+		len(body),
+	)
+}
+
+func oauthLogURL(value *url.URL) string {
+	if value == nil {
+		return ""
+	}
+	cleanURL := *value
+	cleanURL.User = nil
+	cleanURL.RawQuery = ""
+	cleanURL.ForceQuery = false
+	cleanURL.Fragment = ""
+	return cleanURL.String()
 }
 
 func jwtExpiresAt(token string) time.Time {

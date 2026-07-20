@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"zencoder-2api/internal/model"
 	"zencoder-2api/internal/secret"
@@ -74,6 +75,71 @@ func TestInitEncryptsLegacyAPIKey(t *testing.T) {
 func TestInitRejectsSQLiteFileURI(t *testing.T) {
 	if err := Init("file:" + filepath.Join(t.TempDir(), "database.db")); err == nil {
 		t.Fatal("expected file: SQLite DSN to be rejected")
+	}
+}
+
+func TestInitAddsCodeVerifierToVersionOneDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "version-one.db")
+	legacy, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.AutoMigrate(&model.OAuthSession{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Migrator().DropColumn(&model.OAuthSession{}, "code_verifier"); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Exec(`CREATE TABLE zencoder_schema_migrations (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		version INTEGER NOT NULL,
+		holder TEXT NOT NULL,
+		lease_until DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL
+	)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Exec(`INSERT INTO zencoder_schema_migrations
+		(id, version, holder, lease_until, updated_at) VALUES (1, 1, '', ?, ?)`,
+		time.Unix(1, 0).UTC(), time.Now().UTC()).Error; err != nil {
+		t.Fatal(err)
+	}
+	legacySQL, err := legacy.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacySQL.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Init(path); err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := GetDB().DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	if !GetDB().Migrator().HasColumn(&model.OAuthSession{}, "code_verifier") {
+		t.Fatal("version 2 migration did not add OAuth session code_verifier")
+	}
+	session := model.OAuthSession{
+		State:        "state",
+		CodeVerifier: "verifier",
+		AnonymousID:  "anonymous",
+		Origin:       "http://localhost:8080",
+		RedirectURL:  "http://localhost:8080/oauth/zencoder/callback/state",
+		ExpiresAt:    time.Now().Add(time.Minute),
+	}
+	if err := GetDB().Create(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	var stored model.OAuthSession
+	if err := GetDB().First(&stored, session.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.CodeVerifier != session.CodeVerifier {
+		t.Fatalf("code verifier = %q, want %q", stored.CodeVerifier, session.CodeVerifier)
 	}
 }
 
