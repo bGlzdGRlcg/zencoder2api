@@ -5,40 +5,46 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Zencoder Console</title>
-    <link rel="stylesheet" href="/static/app.css?v=20260719">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/static/app.css?v=20260721">
 </head>
 
 <body
     class="bg-background-light dark:bg-background-dark text-gray-900 dark:text-gray-100 h-full flex flex-col transition-colors duration-300">
 
     <!-- Admin Password Modal -->
-    <div id="adminPasswordModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+    <div id="adminPasswordModal" role="dialog" tabindex="-1" aria-modal="true" aria-hidden="false" aria-labelledby="adminPasswordTitle"
+        aria-describedby="adminPasswordDescription"
+        class="admin-modal-backdrop fixed inset-0 flex items-center justify-center z-50 focus:outline-none">
         <div
-            class="bg-surface-light dark:bg-surface-dark rounded-2xl shadow-2xl border border-border-light dark:border-border-dark p-8 max-w-md w-full mx-4 transition-colors duration-300">
+            class="admin-modal-panel bg-surface-light dark:bg-surface-dark rounded-2xl shadow-2xl border border-border-light dark:border-border-dark p-8 max-w-md w-full mx-4 transition-colors duration-300">
             <div class="text-center mb-6">
                 <div class="w-16 h-16 bg-primary rounded-full flex items-center justify-center text-white mx-auto mb-4">
-                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" viewBox="0 0 20 20" fill="currentColor">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" viewBox="0 0 20 20"
+                        fill="currentColor" aria-hidden="true">
                         <path fill-rule="evenodd"
                             d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z"
                             clip-rule="evenodd" />
                     </svg>
                 </div>
-                <h2 class="text-xl font-bold text-gray-900 dark:text-white mb-2">管理员验证</h2>
-                <p class="text-sm text-gray-500 dark:text-gray-400">请输入管理密码以访问控制台</p>
+                <h2 id="adminPasswordTitle" class="text-xl font-bold text-gray-900 dark:text-white mb-2">管理员验证</h2>
+                <p id="adminPasswordDescription" class="text-sm text-gray-500 dark:text-gray-400">请输入管理密码以访问控制台</p>
             </div>
 
             <form id="adminPasswordForm" class="space-y-4">
+                <input type="text" name="username" value="admin" autocomplete="username" hidden>
                 <div>
                     <label for="adminPassword"
                         class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">管理密码</label>
                     <div class="relative">
                         <input type="password" id="adminPassword" autocomplete="current-password"
-                            class="w-full rounded-xl border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-white shadow-sm focus:border-primary focus:ring-primary sm:text-sm py-3 px-4 transition-colors placeholder-gray-400"
+                            class="admin-password-input w-full rounded-xl border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-white shadow-sm focus:border-primary focus:ring-primary sm:text-sm py-3 px-4 transition-colors placeholder-gray-400"
                             placeholder="输入管理密码">
-                        <button type="button" id="adminPasswordVisibility"
-                            class="absolute inset-y-0 right-0 px-3 flex items-center text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 focus:outline-none">
+                        <button type="button" id="adminPasswordVisibility" aria-label="显示管理密码"
+                            aria-pressed="false"
+                            class="absolute inset-y-0 right-0 px-3 flex items-center text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 focus:outline-none focus:ring-2 focus:ring-primary">
                             <svg id="adminEyeIcon" class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none"
-                                viewBox="0 0 24 24" stroke="currentColor">
+                                viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                     d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -63,7 +69,8 @@
                     </button>
                 </div>
 
-                <div id="passwordError" class="hidden text-sm text-red-600 dark:text-red-400 text-center mt-2">
+                <div id="passwordError" class="hidden text-sm text-red-600 dark:text-red-400 text-center mt-2"
+                    role="alert" aria-live="assertive">
                     密码错误，请重试
                 </div>
             </form>
@@ -71,7 +78,7 @@
     </div>
 
     <!-- Main Application (Hidden initially) -->
-    <div id="mainApp" class="hidden h-full flex flex-col">
+    <div id="mainApp" aria-hidden="true" class="hidden h-full flex flex-col">
 
         <!-- Navbar -->
         <nav
@@ -81,7 +88,7 @@
                     <div class="flex items-center gap-3">
                         <div class="w-8 h-8 bg-primary rounded-lg flex items-center justify-center text-white">
                             <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20"
-                                fill="currentColor">
+                                fill="currentColor" aria-hidden="true">
                                 <path fill-rule="evenodd"
                                     d="M12.395 2.553a1 1 0 00-1.45-.385c-.345.23-.614.558-.822.88-.214.33-.403.713-.57 1.116-.334.804-.614 1.768-.84 2.734a31.365 31.365 0 00-.613 3.58 2.64 2.64 0 01-.945-1.067c-.328-.68-.398-1.534-.398-2.654A1 1 0 005.05 6.05 6.981 6.981 0 003 11a7 7 0 1011.95-4.95c-.592-.591-.98-.985-1.348-1.467-.363-.476-.724-1.063-1.207-2.03zM12.12 15.12A3 3 0 017 13s.879.5 2.5.5c0-1 .5-4 1.25-4.5.5 1 .786 1.293 1.371 1.879A2.99 2.99 0 0113 13a2.99 2.99 0 01-.879 2.121z"
                                     clip-rule="evenodd" />
@@ -92,28 +99,28 @@
 
                     <div class="flex items-center gap-3">
                         <!-- Logout Button -->
-                        <button type="button" id="logoutButton" title="退出登录"
-                            class="p-2 rounded-full hover:bg-red-100 dark:hover:bg-red-900/20 transition-colors focus:outline-none focus:ring-2 focus:ring-red-500 text-red-600 dark:text-red-400">
+                        <button type="button" id="logoutButton" title="退出登录" aria-label="退出登录"
+                            class="admin-icon-button p-2 rounded-full hover:bg-red-100 dark:hover:bg-red-900/20 transition-colors focus:outline-none focus:ring-2 focus:ring-red-500 text-red-600 dark:text-red-400">
                             <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24"
-                                stroke="currentColor">
+                                stroke="currentColor" aria-hidden="true">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                     d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
                             </svg>
                         </button>
 
                         <!-- Theme Toggle -->
-                        <button id="themeToggle"
-                            class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-primary">
+                        <button type="button" id="themeToggle" aria-label="切换明暗主题"
+                            class="admin-icon-button p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-primary">
                             <!-- Sun Icon -->
                             <svg id="sunIcon" class="w-5 h-5 hidden" fill="none" stroke="currentColor"
-                                viewBox="0 0 24 24">
+                                viewBox="0 0 24 24" aria-hidden="true">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                     d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z">
                                 </path>
                             </svg>
                             <!-- Moon Icon -->
                             <svg id="moonIcon" class="w-5 h-5 hidden" fill="none" stroke="currentColor"
-                                viewBox="0 0 24 24">
+                                viewBox="0 0 24 24" aria-hidden="true">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                     d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z">
                                 </path>
@@ -121,10 +128,11 @@
                         </button>
                     </div>
                 </div>
+            </div>
         </nav>
 
         <!-- Main Content -->
-        <main class="flex-1 max-w-[1800px] w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <main id="mainContent" tabindex="-1" class="flex-1 max-w-[1800px] w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
             <!-- Pool View (默认显示) -->
             <div id="poolView" class="grid grid-cols-1 lg:grid-cols-12 gap-8">
 
@@ -137,7 +145,7 @@
                         <div class="flex items-center justify-between mb-1">
                             <h2 class="text-xl font-semibold flex items-center gap-2">
                                 <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-primary" fill="none"
-                                    viewBox="0 0 24 24" stroke="currentColor">
+                                    viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                         d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
                                 </svg>
@@ -166,7 +174,7 @@
                                 </svg>
                             </button>
                             <p id="oauthHelper" class="text-xs leading-5 text-gray-500 dark:text-gray-400">
-                                链接有效期为 5 分钟，可再次点击上方按钮复制。
+                                链接有效期约为 9 分钟，可再次点击上方按钮复制。
                             </p>
                             <p id="oauthStatus" class="hidden text-xs font-medium text-primary dark:text-blue-400"
                                 role="status" aria-live="polite"></p>
@@ -253,6 +261,7 @@
                             <div>
                                 <label for="apiKeyValue" class="block text-xs font-medium text-gray-700 dark:text-gray-300">API Key</label>
                                 <input id="apiKeyValue" name="api_key" type="password" minlength="16" maxlength="4096" autocomplete="off"
+                                    aria-describedby="apiKeyStatus" aria-invalid="false"
                                     autocapitalize="off" spellcheck="false" required
                                     class="mt-1 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 font-mono text-xs text-gray-900 shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100"
                                     placeholder="粘贴 zencoder-api-key">
@@ -314,17 +323,21 @@
                             <div class="flex justify-between items-center w-full">
                                 <h3 class="text-lg font-semibold text-gray-900 dark:text-white flex items-center gap-2">
                                     <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-gray-500" fill="none"
-                                        viewBox="0 0 24 24" stroke="currentColor">
+                                        viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                             d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
                                     </svg>
                                     账号列表
                                 </h3>
                                 <div class="flex items-center gap-3">
-                                    <span class="text-xs text-gray-400 flex items-center gap-1">
-                                        <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-                                        自动刷新中
+                                    <span id="accountsRefreshIndicator"
+                                        class="text-xs text-gray-500 flex items-center gap-1" aria-hidden="true">
+                                        <span data-accounts-status-dot class="w-2 h-2 rounded-full bg-green-500 animate-pulse"
+                                            aria-hidden="true"></span>
+                                        <span id="accountsRefreshStatus">自动刷新中</span>
                                     </span>
+                                    <span id="accountsRefreshAnnouncement" class="sr-only" role="status"
+                                        aria-live="polite" aria-atomic="true"></span>
                                 </div>
                             </div>
 
@@ -346,7 +359,7 @@
                                 <thead class="bg-gray-50 dark:bg-gray-800">
                                     <tr>
                                         <th scope="col" class="px-6 py-3 text-center w-12">
-                                            <input type="checkbox" id="selectAll"
+                                            <input type="checkbox" id="selectAll" aria-label="选择当前页全部账号"
                                                 class="rounded border-gray-300 dark:border-gray-600 text-primary focus:ring-primary h-4 w-4 mx-auto">
                                         </th>
                                         <th scope="col"
@@ -388,18 +401,18 @@
                             </div>
                             <div class="flex gap-2">
                                 <button type="button" id="prevPage"
-                                    class="px-3 py-1 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed">上一页</button>
+                                    class="px-3 py-1 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed">上一页</button>
                                 <button type="button" id="nextPage"
-                                    class="px-3 py-1 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed">下一页</button>
+                                    class="px-3 py-1 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed">下一页</button>
                             </div>
                         </div>
 
                         <!-- Empty State (Hidden by default) -->
-                        <div id="emptyState"
+                        <div id="emptyState" role="status" aria-live="polite" tabindex="-1"
                             class="hidden flex-1 flex-col items-center justify-center py-12 text-center">
                             <div class="bg-gray-100 dark:bg-gray-800 rounded-full p-4 mb-3">
                                 <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-gray-400" fill="none"
-                                    viewBox="0 0 24 24" stroke="currentColor">
+                                    viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                         d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
                                 </svg>
@@ -414,8 +427,9 @@
         </main>
 
     </div> <!-- End mainApp -->
+    <div id="toastContainer" class="admin-toast-container"></div>
 
-    <script src="/static/app.js?v=20260719-2"></script>
+    <script src="/static/app.js?v=20260721"></script>
 </body>
 
 </html>

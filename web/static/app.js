@@ -1,12 +1,23 @@
 const API_BASE = "/api";
 const REFRESH_INTERVAL = 3000;
-const OAUTH_TIMEOUT_MS = 5 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 15 * 1000;
+const OAUTH_COMPLETE_TIMEOUT_MS = 45 * 1000;
+const OAUTH_TIMEOUT_MINUTES = 9;
+const OAUTH_TIMEOUT_MS = OAUTH_TIMEOUT_MINUTES * 60 * 1000;
 let autoRefreshTimer = null;
-let refreshInFlight = false;
+let accountsRequestController = null;
+let accountsRequestSequence = 0;
 let oauthFlow = null;
+let nextOAuthFlowID = 0;
 let appSessionActive = false;
 let refreshGeneration = 0;
 let apiKeyEditingAccount = null;
+let adminLoginErrorMessage = "密码错误，请重试";
+let adminLogoutInProgress = false;
+let lastAccountsErrorAnnouncement = "";
+let activeOAuthOperation = null;
+let activeDeleteOperation = null;
+let deleteOperationInFlight = false;
 
 // The password is used only for the session exchange and is never retained.
 // The CSRF token is intentionally memory-only; the server session is HttpOnly.
@@ -20,10 +31,179 @@ let currentState = {
 	selectedIds: new Set(),
 	items: [],
 };
+const pendingAdminControllers = new Set();
+
+function resetAdminUIState() {
+	currentState.page = 1;
+	currentState.total = 0;
+	currentState.items = [];
+	currentState.selectedIds.clear();
+	if (!document.getElementById("mainApp")) return;
+	renderAccounts([]);
+	updatePaginationUI();
+	updateBatchUI();
+	updateStatsUI({ total_accounts: 0, today_usage: 0, total_usage: 0 });
+	setAPIKeyStatus();
+	lastAccountsErrorAnnouncement = "";
+	const announcement = document.getElementById("accountsRefreshAnnouncement");
+	if (announcement) announcement.textContent = "";
+}
+
+function deactivateAdminSession() {
+	appSessionActive = false;
+	refreshGeneration += 1;
+	adminCSRFToken = null;
+	cancelAccountsRequest();
+	abortPendingAdminOperations();
+	activeOAuthOperation = null;
+	updateOAuthActionDisabled();
+	activeDeleteOperation = null;
+	deleteOperationInFlight = false;
+	setDeleteActionsDisabled(false);
+	resetOAuthFlow();
+	clearAPIKeyInput();
+	setAPIKeyEditMode(null);
+	setAPIKeySubmitLoading(false);
+	if (autoRefreshTimer) {
+		clearTimeout(autoRefreshTimer);
+		autoRefreshTimer = null;
+	}
+	resetAdminUIState();
+}
+
+function beginAdminOperation() {
+	const controller = new AbortController();
+	pendingAdminControllers.add(controller);
+	return { controller, generation: refreshGeneration };
+}
+
+function finishAdminOperation(operation) {
+	pendingAdminControllers.delete(operation.controller);
+}
+
+function updateOAuthActionDisabled() {
+	const isDisabled = Boolean(activeOAuthOperation);
+	const startButton = document.getElementById("oauthBtn");
+	const completeButton = document.getElementById("oauthCompleteBtn");
+	if (startButton) startButton.disabled = isDisabled;
+	if (completeButton) completeButton.disabled = isDisabled;
+}
+
+function beginOAuthOperation() {
+	if (activeOAuthOperation) return null;
+	const operation = beginAdminOperation();
+	activeOAuthOperation = operation;
+	updateOAuthActionDisabled();
+	return operation;
+}
+
+function finishOAuthOperation(operation) {
+	finishAdminOperation(operation);
+	if (activeOAuthOperation !== operation) return;
+	activeOAuthOperation = null;
+	updateOAuthActionDisabled();
+}
+
+function setDeleteActionsDisabled(isDisabled) {
+	const buttons = document.querySelectorAll?.(
+		'[data-action="delete-account"], [data-action="batch-delete"]',
+	);
+	if (!buttons) return;
+	for (const button of buttons) {
+		button.disabled = isDisabled;
+		if (isDisabled) {
+			button.setAttribute("aria-disabled", "true");
+		} else {
+			button.removeAttribute("aria-disabled");
+		}
+	}
+}
+
+function beginDeleteOperation() {
+	if (activeDeleteOperation) return null;
+	const operation = beginAdminOperation();
+	activeDeleteOperation = operation;
+	deleteOperationInFlight = true;
+	setDeleteActionsDisabled(true);
+	return operation;
+}
+
+function finishDeleteOperation(operation) {
+	finishAdminOperation(operation);
+	if (activeDeleteOperation !== operation) return;
+	activeDeleteOperation = null;
+	deleteOperationInFlight = false;
+	setDeleteActionsDisabled(false);
+}
+
+function abortPendingAdminOperations() {
+	for (const controller of pendingAdminControllers) controller.abort();
+	pendingAdminControllers.clear();
+}
+
+function createTimeoutSignal(timeoutMs) {
+	if (typeof AbortSignal.timeout === "function") {
+		return AbortSignal.timeout(timeoutMs);
+	}
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	timer.unref?.();
+	return controller.signal;
+}
+
+function combineAbortSignals(signals) {
+	if (typeof AbortSignal.any === "function") return AbortSignal.any(signals);
+	const controller = new AbortController();
+	const cleanup = () => {
+		for (const signal of signals) {
+			signal.removeEventListener("abort", abort);
+		}
+	};
+	const abort = () => {
+		if (controller.signal.aborted) return;
+		cleanup();
+		controller.abort();
+	};
+	for (const signal of signals) {
+		if (signal.aborted) {
+			abort();
+			break;
+		}
+		signal.addEventListener("abort", abort, { once: true });
+	}
+	return controller.signal;
+}
+
+async function fetchWithTimeout(path, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+	const externalSignal = options.signal;
+	const timeoutSignal = createTimeoutSignal(timeoutMs);
+	const signal = externalSignal
+		? combineAbortSignals([externalSignal, timeoutSignal])
+		: timeoutSignal;
+
+	try {
+		return await fetch(path, { ...options, signal });
+	} catch (error) {
+		if (timeoutSignal.aborted && !externalSignal?.aborted) {
+			const timeoutError = new Error("请求超时，请稍后重试");
+			timeoutError.name = "TimeoutError";
+			throw timeoutError;
+		}
+		throw error;
+	}
+}
+
+function requestErrorMessage(error, fallback) {
+	if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+		return "请求超时，请稍后重试";
+	}
+	return error?.message || fallback;
+}
 
 async function createAdminSession(password) {
+	adminLoginErrorMessage = "密码错误，请重试";
 	try {
-		const response = await fetch(`${API_BASE}/admin/session`, {
+		const response = await fetchWithTimeout(`${API_BASE}/admin/session`, {
 			method: "POST",
 			credentials: "same-origin",
 			cache: "no-store",
@@ -33,30 +213,91 @@ async function createAdminSession(password) {
 				Authorization: `Bearer ${password}`,
 			},
 		});
-		if (!response.ok) return false;
-		const result = await response.json();
+		if (!response.ok) {
+			adminLoginErrorMessage =
+				response.status === 401
+					? "密码错误，请重试"
+					: response.status === 429
+						? "尝试次数过多，请稍后重试"
+						: `登录失败（HTTP ${response.status}）`;
+			return false;
+		}
+		let result;
+		try {
+			result = await response.json();
+		} catch (error) {
+			if (error.name === "TimeoutError" || error.name === "AbortError") {
+				throw error;
+			}
+			adminCSRFToken = null;
+			adminLoginErrorMessage = "服务器返回了无效的登录会话，请稍后重试";
+			return false;
+		}
+		if (!result || typeof result.csrfToken !== "string") {
+			adminCSRFToken = null;
+			adminLoginErrorMessage = "服务器返回了无效的登录会话，请稍后重试";
+			return false;
+		}
 		adminCSRFToken =
 			typeof result.csrfToken === "string" ? result.csrfToken : "";
 		return true;
-	} catch (e) {
+	} catch (error) {
 		adminCSRFToken = null;
+		adminLoginErrorMessage =
+			error.name === "TimeoutError" || error.name === "AbortError"
+				? requestErrorMessage(error, "请求超时，请稍后重试")
+				: "无法连接服务器，请稍后重试";
 		return false;
 	}
 }
 
 function showAdminLogin() {
-	document.getElementById("adminPasswordModal").classList.remove("hidden");
-	document.getElementById("mainApp").classList.add("hidden");
+	const modal = document.getElementById("adminPasswordModal");
+	const mainApp = document.getElementById("mainApp");
+	modal.classList.remove("hidden");
+	modal.setAttribute("aria-hidden", "false");
+	mainApp.classList.add("hidden");
+	mainApp.setAttribute("aria-hidden", "true");
+	mainApp.inert = true;
+	setAdminPasswordVisibility(false);
 	document.getElementById("adminPassword").focus();
 }
 
 function hideAdminLogin() {
-	document.getElementById("adminPasswordModal").classList.add("hidden");
-	document.getElementById("mainApp").classList.remove("hidden");
-	document.getElementById("mainApp").classList.add("flex");
+	const modal = document.getElementById("adminPasswordModal");
+	const mainApp = document.getElementById("mainApp");
+	modal.classList.add("hidden");
+	modal.setAttribute("aria-hidden", "true");
+	mainApp.classList.remove("hidden");
+	mainApp.classList.add("flex");
+	mainApp.setAttribute("aria-hidden", "false");
+	mainApp.inert = false;
+	document.getElementById("mainContent")?.focus({ preventScroll: true });
+}
+
+function setAdminLoginLoading(isLoading, label = "验证中...") {
+	const modal = document.getElementById("adminPasswordModal");
+	const input = document.getElementById("adminPassword");
+	const visibility = document.getElementById("adminPasswordVisibility");
+	const button = document.getElementById("adminLoginBtn");
+	const text = document.getElementById("adminBtnText");
+	const loading = document.getElementById("adminBtnLoading");
+	if (!modal || !input || !visibility || !button || !text || !loading) return;
+	if (isLoading) {
+		modal.setAttribute("aria-busy", "true");
+		modal.focus({ preventScroll: true });
+	} else {
+		modal.removeAttribute("aria-busy");
+	}
+	input.disabled = isLoading;
+	visibility.disabled = isLoading;
+	button.disabled = isLoading;
+	text.textContent = isLoading ? label : "验证";
+	loading.classList.toggle("hidden", !isLoading);
 }
 
 async function handleAdminLogin(password) {
+	if (adminLogoutInProgress) return false;
 	const isValid = await createAdminSession(password);
 
 	if (isValid) {
@@ -68,38 +309,43 @@ async function handleAdminLogin(password) {
 		initializeApp();
 		return true;
 	} else {
-		document.getElementById("passwordError").classList.remove("hidden");
+		const error = document.getElementById("passwordError");
+		error.textContent = adminLoginErrorMessage;
+		error.classList.remove("hidden");
 		return false;
 	}
 }
 
 async function logout() {
-	appSessionActive = false;
-	refreshGeneration += 1;
-	resetOAuthFlow();
-	clearAPIKeyInput();
-	setAPIKeyEditMode(null);
+	if (!appSessionActive || adminLogoutInProgress) return;
+	adminLogoutInProgress = true;
+	deactivateAdminSession();
+	showAdminLogin();
+	setAdminLoginLoading(true, "正在退出...");
+	let logoutError = null;
 	try {
-		await fetch(`${API_BASE}/admin/session`, {
+		const response = await fetchWithTimeout(`${API_BASE}/admin/session`, {
 			method: "DELETE",
 			credentials: "same-origin",
 			cache: "no-store",
 			referrerPolicy: "no-referrer",
-			headers: getAuthHeaders(),
 		});
-	} catch (e) {
-		console.warn("Admin session logout failed", e);
+		if (!response.ok) {
+			throw new Error(`服务器退出失败（HTTP ${response.status}）`);
+		}
+	} catch (error) {
+		logoutError = requestErrorMessage(error, "服务器退出失败");
+		console.warn("Admin session logout failed", error);
 	}
-	adminCSRFToken = null;
-
-	// 停止自动刷新
-	if (autoRefreshTimer) {
-			clearTimeout(autoRefreshTimer);
-		autoRefreshTimer = null;
+	adminLogoutInProgress = false;
+	setAdminLoginLoading(false);
+	if (logoutError) {
+		adminLoginErrorMessage = `未能确认服务端退出：${logoutError}`;
+		const error = document.getElementById("passwordError");
+		error.textContent = adminLoginErrorMessage;
+		error.classList.remove("hidden");
 	}
-
-	// 显示登录界面
-	showAdminLogin();
+	document.getElementById("adminPassword").focus();
 }
 
 async function initAdminAuth() {
@@ -108,24 +354,69 @@ async function initAdminAuth() {
 	showAdminLogin();
 }
 
-function toggleAdminPasswordVisibility() {
+function setAdminPasswordVisibility(isVisible) {
 	const input = document.getElementById("adminPassword");
 	const eyeIcon = document.getElementById("adminEyeIcon");
+	const button = document.getElementById("adminPasswordVisibility");
+	if (!input || !eyeIcon || !button) return;
 
-	if (input.type === "password") {
+	if (isVisible) {
 		input.type = "text";
+		button.setAttribute("aria-label", "隐藏管理密码");
+		button.setAttribute("aria-pressed", "true");
 		eyeIcon.innerHTML =
 			'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />';
 	} else {
 		input.type = "password";
+		button.setAttribute("aria-label", "显示管理密码");
+		button.setAttribute("aria-pressed", "false");
 		eyeIcon.innerHTML =
 			'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />';
+	}
+}
+
+function toggleAdminPasswordVisibility() {
+	const input = document.getElementById("adminPassword");
+	setAdminPasswordVisibility(input?.type !== "text");
+}
+
+function trapAdminDialogFocus(event) {
+	if (event.key !== "Tab") return;
+	const modal = document.getElementById("adminPasswordModal");
+	const focusable = Array.from(
+		modal.querySelectorAll(
+			"button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex='-1'])",
+		),
+	).filter((element) => !element.hidden && element.offsetParent !== null);
+	if (focusable.length === 0) {
+		event.preventDefault();
+		modal.focus();
+		return;
+	}
+	if (focusable.length === 1) {
+		event.preventDefault();
+		focusable[0].focus();
+		return;
+	}
+	const first = focusable[0];
+	const last = focusable[focusable.length - 1];
+	if (event.shiftKey && document.activeElement === first) {
+		event.preventDefault();
+		last.focus();
+	} else if (!event.shiftKey && document.activeElement === last) {
+		event.preventDefault();
+		first.focus();
 	}
 }
 
 // Admin Password Form Handler
 function bindAdminPasswordForm() {
 	const adminForm = document.getElementById("adminPasswordForm");
+	const adminModal = document.getElementById("adminPasswordModal");
+	if (adminModal && adminModal.dataset.focusBound !== "true") {
+		adminModal.dataset.focusBound = "true";
+		adminModal.addEventListener("keydown", trapAdminDialogFocus);
+	}
 	if (adminForm && adminForm.dataset.bound !== "true") {
 		adminForm.dataset.bound = "true";
 
@@ -135,9 +426,6 @@ function bindAdminPasswordForm() {
 			const password = document
 				.getElementById("adminPassword")
 				.value.trim();
-			const btn = document.getElementById("adminLoginBtn");
-			const btnText = document.getElementById("adminBtnText");
-			const btnLoading = document.getElementById("adminBtnLoading");
 
 			if (!password) {
 				document.getElementById("passwordError").textContent =
@@ -145,21 +433,20 @@ function bindAdminPasswordForm() {
 				document
 					.getElementById("passwordError")
 					.classList.remove("hidden");
+				document.getElementById("adminPassword").focus();
 				return;
 			}
 
-			btn.disabled = true;
-			btnText.textContent = "验证中...";
-			btnLoading.classList.remove("hidden");
+			setAdminLoginLoading(true);
 
 			const success = await handleAdminLogin(password);
 
-			btn.disabled = false;
-			btnText.textContent = "验证";
-			btnLoading.classList.add("hidden");
+			setAdminLoginLoading(false);
 
 			if (success) {
 				document.getElementById("adminPassword").value = "";
+			} else {
+				document.getElementById("adminPassword").focus();
 			}
 		});
 	}
@@ -183,27 +470,32 @@ function getAuthHeaders() {
 	return headers;
 }
 
-async function adminFetch(path, options = {}) {
+function isCurrentSession(generation) {
+	return appSessionActive && generation === refreshGeneration;
+}
+
+async function adminFetch(
+	path,
+	options = {},
+	timeoutMs = REQUEST_TIMEOUT_MS,
+) {
+	if (!appSessionActive) {
+		const error = new DOMException("管理员会话已失效", "AbortError");
+		throw error;
+	}
 	const headers = new Headers(options.headers || {});
 	for (const [name, value] of Object.entries(getAuthHeaders())) {
 		headers.set(name, value);
 	}
-	const response = await fetch(path, {
+	const response = await fetchWithTimeout(path, {
 		...options,
 		headers,
 		credentials: "same-origin",
 		cache: "no-store",
 		referrerPolicy: "no-referrer",
-	});
+	}, timeoutMs);
 	if (response.status === 401 || response.status === 403) {
-		appSessionActive = false;
-		refreshGeneration += 1;
-		adminCSRFToken = null;
-		resetOAuthFlow();
-		if (autoRefreshTimer) {
-			clearTimeout(autoRefreshTimer);
-			autoRefreshTimer = null;
-		}
+		deactivateAdminSession();
 		if (document.getElementById("adminPasswordModal").classList.contains("hidden")) {
 			showAdminLogin();
 		}
@@ -214,34 +506,61 @@ async function adminFetch(path, options = {}) {
 function setAPIKeyStatus(message = "", type = "info") {
 	const status = document.getElementById("apiKeyStatus");
 	if (!status) return;
+	const isError = Boolean(message) && type === "error";
 	status.textContent = message;
 	status.classList.toggle("hidden", !message);
-	status.classList.toggle("text-red-600", type === "error");
-	status.classList.toggle("dark:text-red-400", type === "error");
+	status.classList.toggle("text-red-600", isError);
+	status.classList.toggle("dark:text-red-400", isError);
 	status.classList.toggle("text-green-600", type === "success");
 	status.classList.toggle("dark:text-green-400", type === "success");
+	status.setAttribute("role", isError ? "alert" : "status");
+	status.setAttribute("aria-live", isError ? "assertive" : "polite");
+	document
+		.getElementById("apiKeyValue")
+		?.setAttribute("aria-invalid", isError ? "true" : "false");
+}
+
+function setAPIKeySubmitLoading(isLoading) {
+	const button = document.getElementById("apiKeySubmit");
+	const text = document.getElementById("apiKeySubmitText");
+	const loading = document.getElementById("apiKeySubmitLoading");
+	if (!button || !text || !loading) return;
+	button.disabled = isLoading;
+	text.textContent = isLoading
+		? "保存中..."
+		: apiKeyEditingAccount
+			? "轮换 API Key"
+			: "保存 API Key";
+	loading.classList.toggle("hidden", !isLoading);
 }
 
 async function submitAPIKey(event) {
 	event.preventDefault();
+	if (!appSessionActive) return;
 	const nameInput = document.getElementById("apiKeyName");
 	const keyInput = document.getElementById("apiKeyValue");
-	const button = document.getElementById("apiKeySubmit");
-	const text = document.getElementById("apiKeySubmitText");
-	const loading = document.getElementById("apiKeySubmitLoading");
-	let apiKey = keyInput.value.trim();
+	const rawAPIKey = keyInput.value;
+	let apiKey = rawAPIKey.trim();
 	const name = nameInput.value.trim();
-	// Clear the DOM input before any network await; the key is never rendered back.
-	keyInput.value = "";
 	setAPIKeyStatus();
 	if (!apiKey) {
 		setAPIKeyStatus("请输入 API Key", "error");
+		keyInput.focus();
 		return;
 	}
+	const encoder = new TextEncoder();
+	const rawAPIKeyBytes = encoder.encode(rawAPIKey).length;
+	const apiKeyBytes = encoder.encode(apiKey).length;
+	if (apiKeyBytes < 16 || rawAPIKeyBytes > 4096) {
+		setAPIKeyStatus("API Key 必须为 16 至 4096 字节", "error");
+		keyInput.focus();
+		return;
+	}
+	// Clear the DOM input before any network await; the key is never rendered back.
+	keyInput.value = "";
 
-	button.disabled = true;
-	text.textContent = "保存中...";
-	loading.classList.remove("hidden");
+	setAPIKeySubmitLoading(true);
+	const operation = beginAdminOperation();
 	try {
 		const editingID = apiKeyEditingAccount?.id;
 		const endpoint = editingID
@@ -251,7 +570,9 @@ async function submitAPIKey(event) {
 			method: editingID ? "PUT" : "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ name, api_key: apiKey }),
+			signal: operation.controller.signal,
 		});
+		if (!isCurrentSession(operation.generation)) return;
 		if (!response.ok) {
 			// Do not render an arbitrary server error: it must never echo the key.
 			throw new Error(`API Key 保存失败（HTTP ${response.status}）`);
@@ -260,12 +581,19 @@ async function submitAPIKey(event) {
 		setAPIKeyEditMode(null);
 		await loadAccounts();
 	} catch (error) {
-		setAPIKeyStatus(error.message || "API Key 保存失败", "error");
+		if (
+			!isCurrentSession(operation.generation) ||
+			operation.controller.signal.aborted
+		) {
+			return;
+		}
+		setAPIKeyStatus(requestErrorMessage(error, "API Key 保存失败"), "error");
 	} finally {
 		apiKey = "";
-		button.disabled = false;
-		text.textContent = apiKeyEditingAccount ? "轮换 API Key" : "保存 API Key";
-		loading.classList.add("hidden");
+		finishAdminOperation(operation);
+		if (isCurrentSession(operation.generation)) {
+			setAPIKeySubmitLoading(false);
+		}
 	}
 }
 
@@ -301,6 +629,7 @@ function setAPIKeyEditMode(account) {
 }
 
 function beginAPIKeyRotation(id) {
+	if (!appSessionActive) return;
 	const account = currentState.items.find(
 		(item) => Number(item.id) === id && item.credential_type === "api_key",
 	);
@@ -311,7 +640,9 @@ function beginAPIKeyRotation(id) {
 	setAPIKeyStatus();
 	setAPIKeyEditMode(account);
 	document.getElementById("apiKeyForm").scrollIntoView({
-		behavior: "smooth",
+		behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+			? "auto"
+			: "smooth",
 		block: "center",
 	});
 }
@@ -387,6 +718,11 @@ function toggleTheme() {
 function updateThemeIcons(isDark) {
 	const sun = document.getElementById("sunIcon");
 	const moon = document.getElementById("moonIcon");
+	const toggle = document.getElementById("themeToggle");
+	toggle.setAttribute(
+		"aria-label",
+		isDark ? "切换到浅色主题" : "切换到深色主题",
+	);
 	if (isDark) {
 		sun.classList.remove("hidden");
 		moon.classList.add("hidden");
@@ -397,13 +733,6 @@ function updateThemeIcons(isDark) {
 }
 
 document.getElementById("themeToggle").addEventListener("click", toggleTheme);
-
-// --- Data Logic ---
-function formatDate(dateStr) {
-	if (!dateStr || dateStr.startsWith("0001")) return "-";
-	const d = new Date(dateStr);
-	return d.toLocaleDateString("zh-CN");
-}
 
 function escapeHtml(value) {
 	return String(value ?? "").replace(
@@ -459,48 +788,127 @@ function formatLastUsed(dateStr) {
 	}
 }
 
+function cancelAccountsRequest() {
+	accountsRequestSequence += 1;
+	if (accountsRequestController) {
+		accountsRequestController.abort();
+		accountsRequestController = null;
+	}
+}
+
+function setAccountsRefreshStatus(message, type = "success") {
+	const label = document.getElementById("accountsRefreshStatus");
+	const announcement = document.getElementById("accountsRefreshAnnouncement");
+	const dot = document.querySelector("[data-accounts-status-dot]");
+	if (!label || !dot) return;
+	label.textContent = message;
+	if (announcement) {
+		if (type === "error" && lastAccountsErrorAnnouncement !== message) {
+			announcement.textContent = message;
+			lastAccountsErrorAnnouncement = message;
+		} else if (type === "success") {
+			announcement.textContent = "";
+			lastAccountsErrorAnnouncement = "";
+		}
+	}
+	const container = dot.parentElement;
+	container.classList.toggle("text-gray-400", false);
+	container.classList.toggle("text-gray-500", type !== "error");
+	container.classList.toggle("text-red-600", type === "error");
+	container.classList.toggle("dark:text-red-400", type === "error");
+	dot.classList.toggle("bg-green-500", type !== "error");
+	dot.classList.toggle("bg-red-500", type === "error");
+	dot.classList.toggle("animate-pulse", type !== "error");
+	document.getElementById("tableContainer")?.setAttribute(
+		"aria-busy",
+		type === "loading" ? "true" : "false",
+	);
+}
+
 async function loadAccounts(isAutoRefresh = false) {
-	if (refreshInFlight) return;
-	refreshInFlight = true;
+	if (!appSessionActive) return;
+	if (isAutoRefresh && accountsRequestController) return;
+	cancelAccountsRequest();
+	const requestSequence = accountsRequestSequence;
+	const requestPage = currentState.page;
+	const controller = new AbortController();
+	accountsRequestController = controller;
+	setAccountsRefreshStatus(isAutoRefresh ? "正在刷新..." : "正在加载...", "loading");
+	let retryOutOfRange = false;
 	try {
 		const params = new URLSearchParams({
-			page: currentState.page,
+			page: requestPage,
 			size: currentState.size,
 		});
 
-		const resp = await adminFetch(`${API_BASE}/accounts?${params}`);
-		if (!resp.ok) throw new Error("Failed to fetch");
+		const resp = await adminFetch(`${API_BASE}/accounts?${params}`, {
+			signal: controller.signal,
+		});
+		if (
+			requestSequence !== accountsRequestSequence ||
+			requestPage !== currentState.page
+		) {
+			return;
+		}
+		if (!resp.ok) {
+			throw new Error(await readResponseError(resp, "账号加载失败"));
+		}
 
 		const data = await resp.json();
+		if (
+			requestSequence !== accountsRequestSequence ||
+			requestPage !== currentState.page
+		) {
+			return;
+		}
 
-		// Handle both old and new API response formats temporarily if needed, but we know it's new
-		const items = data.items || [];
-		const total = data.total || 0;
+		const items = Array.isArray(data.items) ? data.items : [];
+		const total = Math.max(0, Number(data.total) || 0);
+		const totalPages = Math.max(1, Math.ceil(total / currentState.size));
+		if (requestPage > totalPages) {
+			currentState.page = totalPages;
+			retryOutOfRange = true;
+		} else {
+			currentState.items = items;
+			currentState.total = total;
 
-		currentState.items = items;
-		currentState.total = total;
+			// Retain selection if items still exist
+			const newSet = new Set();
+			items.forEach((item) => {
+				if (currentState.selectedIds.has(item.id)) {
+					newSet.add(item.id);
+				}
+			});
+			currentState.selectedIds = newSet;
 
-		// Retain selection if items still exist
-		const newSet = new Set();
-		items.forEach((item) => {
-			if (currentState.selectedIds.has(item.id)) {
-				newSet.add(item.id);
+			renderAccounts(items);
+			updatePaginationUI();
+			updateBatchUI();
+
+			if (data.stats) {
+				updateStatsUI(data.stats);
 			}
-		});
-		currentState.selectedIds = newSet;
-
-		renderAccounts(items);
-		updatePaginationUI();
-		updateBatchUI();
-
-		if (data.stats) {
-			updateStatsUI(data.stats);
+			setAccountsRefreshStatus("自动刷新中", "success");
 		}
 	} catch (e) {
-				if (!isAutoRefresh) console.error("Failed to load accounts", e);
+		if (e.name === "AbortError" && requestSequence !== accountsRequestSequence) {
+			return;
+		}
+		if (requestSequence !== accountsRequestSequence) return;
+		setAccountsRefreshStatus(
+			isAutoRefresh ? "刷新失败，正在重试" : "加载失败，请重试",
+			"error",
+		);
+		if (!isAutoRefresh) {
+			console.error("Failed to load accounts", e);
+			showToast(requestErrorMessage(e, "账号加载失败"), "error");
+		}
 	} finally {
-		refreshInFlight = false;
+		if (requestSequence === accountsRequestSequence) {
+			accountsRequestController = null;
+		}
 	}
+	if (retryOutOfRange) await loadAccounts(false);
 }
 
 function updateStatsUI(stats) {
@@ -522,6 +930,12 @@ function renderAccounts(accounts) {
 	const tableContainer = document.getElementById("tableContainer");
 	const paginationContainer = document.getElementById("paginationContainer");
 	const selectAll = document.getElementById("selectAll");
+	const activeElement = document.activeElement;
+	const focusedList = activeElement?.closest?.(
+		"#accountList, #mobileAccountList",
+	);
+	const focusedAction = activeElement?.dataset?.action;
+	const focusedAccountID = activeElement?.dataset?.accountId;
 
 	if (accounts.length === 0) {
 		tbody.innerHTML = "";
@@ -533,6 +947,7 @@ function renderAccounts(accounts) {
 		emptyState.classList.add("flex");
 		selectAll.checked = false;
 		selectAll.disabled = true;
+		if (focusedList) emptyState.focus({ preventScroll: true });
 		return;
 	}
 
@@ -588,8 +1003,8 @@ function renderAccounts(accounts) {
             </td>
             <td class="px-6 py-4 whitespace-nowrap text-center">
                 <div class="text-sm">
-                    <span class="${lastUsedText === "从未" ? "text-gray-400" : "text-gray-600 dark:text-gray-300"}">${escapedLastUsedText}</span>
-                    ${lastUsedTime ? `<div class="text-[10px] text-gray-400 mt-0.5">${escapeHtml(lastUsedTime)}</div>` : ""}
+					<span class="${lastUsedText === "从未" ? "text-gray-500 dark:text-gray-400" : "text-gray-600 dark:text-gray-300"}">${escapedLastUsedText}</span>
+					${lastUsedTime ? `<div class="text-[10px] text-gray-500 dark:text-gray-400 mt-0.5">${escapeHtml(lastUsedTime)}</div>` : ""}
                 </div>
             </td>
             <td class="px-6 py-4 whitespace-nowrap text-center text-sm">
@@ -598,11 +1013,11 @@ function renderAccounts(accounts) {
             </td>
             <td class="px-6 py-4 whitespace-nowrap text-center text-sm font-medium">
 				<div class="flex justify-center gap-3">
-					${canRotateAPIKey ? `<button type="button" data-action="rotate-api-key" data-account-id="${safeAccountId}" class="text-blue-600 hover:text-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500 rounded-md transition-colors" title="轮换 API Key" aria-label="轮换 API Key ${escapedAccountLabel}">
+					${canRotateAPIKey ? `<button type="button" data-action="rotate-api-key" data-account-id="${safeAccountId}" class="account-action-button text-blue-600 hover:text-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500 rounded-md transition-colors" title="轮换 API Key" aria-label="轮换 API Key ${escapedAccountLabel}">
 						<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5.1 15a7 7 0 0011.2 2.1L20 14M4 10l3.7-3.1A7 7 0 0118.9 9" /></svg>
 					</button>` : ""}
-					<button type="button" data-action="delete-account" data-account-id="${safeAccountId}" class="text-red-500 hover:text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 rounded-md transition-colors" title="删除" aria-label="删除账号 ${escapedAccountLabel}">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+					<button type="button" data-action="delete-account" data-account-id="${safeAccountId}" ${deleteOperationInFlight ? 'disabled aria-disabled="true"' : ""} class="account-action-button text-red-500 hover:text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 rounded-md transition-colors disabled:cursor-wait disabled:opacity-50" title="删除" aria-label="删除账号 ${escapedAccountLabel}">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                         </svg>
                     </button>
@@ -613,17 +1028,19 @@ function renderAccounts(accounts) {
 		const mobile = `
         <article class="px-4 py-4 transition-colors ${isSelected ? "bg-blue-50 dark:bg-blue-900/10" : "bg-surface-light dark:bg-surface-dark"}">
             <div class="flex items-start gap-3">
-                <input type="checkbox" data-action="toggle-select" data-account-id="${safeAccountId}" ${isSelected ? "checked" : ""} aria-label="选择账号 ${escapedAccountLabel}" class="mt-1 rounded border-gray-300 dark:border-gray-600 text-primary focus:ring-primary h-4 w-4 shrink-0">
+                <label class="account-select-control shrink-0">
+                    <input type="checkbox" data-action="toggle-select" data-account-id="${safeAccountId}" ${isSelected ? "checked" : ""} aria-label="选择账号 ${escapedAccountLabel}" class="rounded border-gray-300 dark:border-gray-600 text-primary focus:ring-primary h-4 w-4">
+                </label>
                 <div class="min-w-0 flex-1">
                     <div class="flex items-center gap-2">
                         <span class="inline-flex shrink-0 items-center rounded-md bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-900/20 dark:text-blue-300 dark:ring-blue-400/30">${credentialTypeLabel}</span>
                         <span class="truncate text-sm font-medium text-gray-900 dark:text-white" title="${escapedAccountLabel}">${escapedAccountLabel}</span>
                     </div>
-                    <div class="mt-1 text-[11px] text-gray-400">账号 ID ${safeAccountId}</div>
+					<div class="mt-1 text-[11px] text-gray-500 dark:text-gray-400">账号 ID ${safeAccountId}</div>
                 </div>
 				<div class="-mr-1 flex items-center">
-				${canRotateAPIKey ? `<button type="button" data-action="rotate-api-key" data-account-id="${safeAccountId}" class="rounded-lg p-2 text-blue-600 hover:bg-blue-50 hover:text-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:hover:bg-blue-900/20 transition-colors" title="轮换 API Key" aria-label="轮换 API Key ${escapedAccountLabel}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5.1 15a7 7 0 0011.2 2.1L20 14M4 10l3.7-3.1A7 7 0 0118.9 9" /></svg></button>` : ""}
-				<button type="button" data-action="delete-account" data-account-id="${safeAccountId}" class="rounded-lg p-2 text-red-500 hover:bg-red-50 hover:text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 dark:hover:bg-red-900/20 transition-colors" title="删除" aria-label="删除账号 ${escapedAccountLabel}">
+				${canRotateAPIKey ? `<button type="button" data-action="rotate-api-key" data-account-id="${safeAccountId}" class="account-action-button rounded-lg p-2 text-blue-600 hover:bg-blue-50 hover:text-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:hover:bg-blue-900/20 transition-colors" title="轮换 API Key" aria-label="轮换 API Key ${escapedAccountLabel}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5.1 15a7 7 0 0011.2 2.1L20 14M4 10l3.7-3.1A7 7 0 0118.9 9" /></svg></button>` : ""}
+				<button type="button" data-action="delete-account" data-account-id="${safeAccountId}" ${deleteOperationInFlight ? 'disabled aria-disabled="true"' : ""} class="account-action-button rounded-lg p-2 text-red-500 hover:bg-red-50 hover:text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 dark:hover:bg-red-900/20 transition-colors disabled:cursor-wait disabled:opacity-50" title="删除" aria-label="删除账号 ${escapedAccountLabel}">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                     </svg>
@@ -632,11 +1049,11 @@ function renderAccounts(accounts) {
             </div>
             <div class="mt-3 grid grid-cols-2 gap-3 border-t border-gray-100 pt-3 dark:border-gray-800">
                 <div>
-                    <div class="text-[10px] font-medium uppercase tracking-wider text-gray-400">最后使用</div>
+					<div class="text-[10px] font-medium uppercase tracking-wider text-gray-500 dark:text-gray-400">最后使用</div>
                     <div class="mt-1 text-xs text-gray-600 dark:text-gray-300">${escapedLastUsedText}${lastUsedTime ? ` · ${escapeHtml(lastUsedTime)}` : ""}</div>
                 </div>
                 <div class="text-right">
-                    <div class="text-[10px] font-medium uppercase tracking-wider text-gray-400">使用量</div>
+					<div class="text-[10px] font-medium uppercase tracking-wider text-gray-500 dark:text-gray-400">使用量</div>
                     <div class="mt-1 text-xs text-blue-600 dark:text-blue-400">今日 ${todayUsage}</div>
                     <div class="mt-0.5 text-[10px] text-gray-500 dark:text-gray-400">累计 ${totalUsage}</div>
                 </div>
@@ -655,6 +1072,13 @@ function renderAccounts(accounts) {
 	}
 	if (mobileList.innerHTML !== mobileHtml) {
 		mobileList.innerHTML = mobileHtml;
+	}
+	if (focusedList && !activeElement.isConnected && focusedAction) {
+		focusedList
+			.querySelector(
+				`[data-action="${focusedAction}"][data-account-id="${focusedAccountID}"]`,
+			)
+			?.focus({ preventScroll: true });
 	}
 }
 
@@ -733,15 +1157,15 @@ function updateBatchUI() {
 
 	// 更新按钮容器
 	const buttonsContainer = document.getElementById("batchButtonsContainer");
-	if (buttonsContainer) {
+	if (buttonsContainer && buttonsContainer.innerHTML !== buttonsHtml) {
 		buttonsContainer.innerHTML = buttonsHtml;
 	}
 }
 
 function getBatchButtonsHtml(selectedCount) {
 	return `
-        <button type="button" data-action="batch-delete" data-delete-all="${selectedCount === 0}" class="px-3 py-1.5 bg-red-700 text-white text-xs font-medium rounded-md hover:bg-red-800 transition-colors flex items-center gap-1">
-            <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <button type="button" data-action="batch-delete" data-delete-all="${selectedCount === 0}" ${deleteOperationInFlight ? 'disabled aria-disabled="true"' : ""} class="px-3 py-1.5 bg-red-700 text-white text-xs font-medium rounded-md hover:bg-red-800 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 transition-colors flex items-center gap-1 disabled:cursor-wait disabled:opacity-50">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
             </svg>
             ${selectedCount > 0 ? "删除选中" : "删除全部"}
@@ -751,6 +1175,7 @@ function getBatchButtonsHtml(selectedCount) {
 
 // 批量删除功能
 async function batchDelete(deleteAll = false) {
+	if (!appSessionActive || activeDeleteOperation) return;
 	let confirmMsg;
 	let requestData;
 
@@ -773,6 +1198,8 @@ async function batchDelete(deleteAll = false) {
 	}
 
 	if (!confirm(confirmMsg)) return;
+	const operation = beginDeleteOperation();
+	if (!operation) return;
 
 	try {
 		const resp = await adminFetch(`${API_BASE}/accounts/batch/delete`, {
@@ -781,21 +1208,31 @@ async function batchDelete(deleteAll = false) {
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(requestData),
+			signal: operation.controller.signal,
 		});
+		if (!isCurrentSession(operation.generation)) return;
 
 		if (!resp.ok) {
-			const err = await resp.json();
-			throw new Error(err.error || "Delete failed");
+			throw new Error(await readResponseError(resp, "批量删除失败"));
 		}
 
 		const result = await resp.json();
+		if (!isCurrentSession(operation.generation)) return;
 		alert(`成功删除 ${result.deleted_count || 0} 个账号`);
 
 		// 清空选择并刷新页面
 		currentState.selectedIds.clear();
-		loadAccounts();
-	} catch (e) {
-		alert("批量删除失败: " + e.message);
+		await loadAccounts();
+	} catch (error) {
+		if (
+			!isCurrentSession(operation.generation) ||
+			operation.controller.signal.aborted
+		) {
+			return;
+		}
+		alert(requestErrorMessage(error, "批量删除失败"));
+	} finally {
+		finishDeleteOperation(operation);
 	}
 }
 
@@ -809,7 +1246,6 @@ function setOAuthButtonState(mode = "idle") {
 	if (!button || !text || !icon || !loading) return;
 
 	const isLoading = mode === "loading";
-	button.disabled = isLoading;
 	text.textContent = isLoading
 		? "正在生成…"
 		: mode === "copied"
@@ -854,22 +1290,48 @@ function setOAuthValidation(message = "") {
 	input.classList.toggle("border-red-500", Boolean(message));
 }
 
-function resetOAuthFlow({ clearInput = true } = {}) {
+function isCurrentOAuthFlow(flow) {
+	return Boolean(flow && oauthFlow && flow.id === oauthFlow.id);
+}
+
+function scheduleOAuthExpiry(flow) {
+	if (!isCurrentOAuthFlow(flow)) return false;
+	clearTimeout(flow.timeoutTimer);
+	const remainingMs = flow.expiresAt - Date.now();
+	if (remainingMs <= 0) {
+		expireOAuthFlow(flow);
+		return false;
+	}
+	flow.timeoutTimer = setTimeout(() => expireOAuthFlow(flow), remainingMs);
+	return true;
+}
+
+function pauseOAuthExpiry(flow) {
+	if (!isCurrentOAuthFlow(flow)) return false;
+	clearTimeout(flow.timeoutTimer);
+	flow.timeoutTimer = null;
+	return true;
+}
+
+function resetOAuthFlow({ clearInput = true, expectedFlow = null } = {}) {
+	if (expectedFlow && !isCurrentOAuthFlow(expectedFlow)) return false;
 	if (oauthFlow) {
 		clearTimeout(oauthFlow.timeoutTimer);
 	}
 	oauthFlow = null;
 	setOAuthButtonState("idle");
+	setOAuthCompleteLoading(false);
 	setOAuthStatus();
 	setOAuthValidation();
 	const input = document.getElementById("oauthCallbackURL");
 	if (input && clearInput) input.value = "";
 	setOAuthActiveStep(1);
+	return true;
 }
 
-function expireOAuthFlow() {
-	resetOAuthFlow();
-	showToast("授权链接已超过 5 分钟，请重新复制", "error");
+function expireOAuthFlow(flow) {
+	if (!resetOAuthFlow({ expectedFlow: flow })) return;
+	showToast(`授权链接已超过 ${OAUTH_TIMEOUT_MINUTES} 分钟，请重新复制`, "error");
 }
 
 async function copyTextWithFallback(value) {
@@ -907,22 +1369,38 @@ async function readResponseError(response, fallback) {
 		const data = await response.json();
 		if (typeof data.error === "string" && data.error.trim())
 			return data.error.trim();
+		if (
+			data.error &&
+			typeof data.error.message === "string" &&
+			data.error.message.trim()
+		)
+			return data.error.message.trim();
 		if (typeof data.message === "string" && data.message.trim())
 			return data.message.trim();
-	} catch (_) {
+	} catch (error) {
+		if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+			throw error;
+		}
 		// The status code below is more useful than a non-JSON response body.
 	}
 	return `${fallback}（HTTP ${response.status}）`;
 }
 
 async function startZencoderOAuth() {
+	if (!appSessionActive || activeOAuthOperation) return;
+	const operation = beginOAuthOperation();
+	if (!operation) return;
 	setOAuthButtonState("loading");
+	const initialFlow = oauthFlow;
+	let flow = initialFlow;
 
 	try {
-		if (!oauthFlow) {
+		if (!flow) {
 			const response = await adminFetch(`${API_BASE}/oauth/zencoder/start`, {
 				method: "POST",
+				signal: operation.controller.signal,
 			});
+			if (!isCurrentSession(operation.generation)) return;
 
 			if (!response.ok) {
 				throw new Error(
@@ -931,6 +1409,7 @@ async function startZencoderOAuth() {
 			}
 
 			const data = await response.json();
+			if (!isCurrentSession(operation.generation)) return;
 			if (
 				!data ||
 				typeof data.authorization_url !== "string" ||
@@ -945,21 +1424,51 @@ async function startZencoderOAuth() {
 			if (!["http:", "https:"].includes(authorizationURL.protocol)) {
 				throw new Error("服务器返回了不受支持的授权地址");
 			}
+			if (oauthFlow !== initialFlow) return;
 			oauthFlow = {
+				id: ++nextOAuthFlowID,
 				authorizationURL: authorizationURL.href,
 				state: data.state,
-				timeoutTimer: setTimeout(expireOAuthFlow, OAUTH_TIMEOUT_MS),
+				expiresAt: Date.now() + OAUTH_TIMEOUT_MS,
+				timeoutTimer: null,
 			};
+			flow = oauthFlow;
+			scheduleOAuthExpiry(flow);
 		}
 
-		await copyTextWithFallback(oauthFlow.authorizationURL);
+		if (!isCurrentSession(operation.generation) || !isCurrentOAuthFlow(flow)) {
+			return;
+		}
+		await copyTextWithFallback(flow.authorizationURL);
+		if (
+			!isCurrentSession(operation.generation) ||
+			!isCurrentOAuthFlow(flow)
+		) {
+			return;
+		}
 		setOAuthActiveStep(1);
 		setOAuthButtonState("copied");
 		setOAuthStatus("授权链接已复制，请按下方步骤继续");
 		showToast("授权链接已复制", "success");
 	} catch (error) {
-		resetOAuthFlow();
-		showToast(`无法复制授权链接：${error.message || "请稍后重试"}`, "error");
+		if (
+			!isCurrentSession(operation.generation) ||
+			operation.controller.signal.aborted
+		) {
+			return;
+		}
+		const flowStillCurrent = flow
+			? isCurrentOAuthFlow(flow)
+			: oauthFlow === initialFlow;
+		if (!flowStillCurrent) return;
+		if (flow) resetOAuthFlow({ expectedFlow: flow });
+		else resetOAuthFlow();
+		showToast(
+			`无法复制授权链接：${requestErrorMessage(error, "请稍后重试")}`,
+			"error",
+		);
+	} finally {
+		finishOAuthOperation(operation);
 	}
 }
 
@@ -1000,13 +1509,13 @@ function setOAuthCompleteLoading(isLoading) {
 	const text = document.getElementById("oauthCompleteBtnText");
 	const loading = document.getElementById("oauthCompleteLoading");
 	if (!button || !text || !loading) return;
-	button.disabled = isLoading;
 	text.textContent = isLoading ? "正在连接…" : "提交回调地址";
 	loading.classList.toggle("hidden", !isLoading);
 }
 
 async function completeZencoderOAuth(event) {
 	event.preventDefault();
+	if (!appSessionActive || activeOAuthOperation) return;
 	const input = document.getElementById("oauthCallbackURL");
 	setOAuthValidation();
 	setOAuthActiveStep(3);
@@ -1019,21 +1528,48 @@ async function completeZencoderOAuth(event) {
 		input?.focus();
 		return;
 	}
+	const flow = oauthFlow;
+	const operation = beginOAuthOperation();
+	if (!operation) return;
+	if (!pauseOAuthExpiry(flow)) {
+		finishOAuthOperation(operation);
+		return;
+	}
 
 	setOAuthCompleteLoading(true);
 	try {
-		const response = await adminFetch(`${API_BASE}/oauth/zencoder/complete`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
+		const response = await adminFetch(
+			`${API_BASE}/oauth/zencoder/complete`,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ callback_url: callbackURL }),
+				signal: operation.controller.signal,
 			},
-			body: JSON.stringify({ callback_url: callbackURL }),
-		});
+			OAUTH_COMPLETE_TIMEOUT_MS,
+		);
+		if (
+			!isCurrentSession(operation.generation) ||
+			!isCurrentOAuthFlow(flow)
+		) {
+			return;
+		}
 		let data = {};
 		try {
 			data = await response.json();
-		} catch (_) {
+		} catch (error) {
+			if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+				throw error;
+			}
 			// The fallback below includes the HTTP status without exposing the URL.
+		}
+		if (
+			!isCurrentSession(operation.generation) ||
+			!isCurrentOAuthFlow(flow)
+		) {
+			return;
 		}
 		if (!response.ok) {
 			const message =
@@ -1041,17 +1577,24 @@ async function completeZencoderOAuth(event) {
 					? data.error.trim()
 					: `无法完成授权（HTTP ${response.status}）`;
 			if (data.reset_flow === true) {
-				resetOAuthFlow();
+				if (!resetOAuthFlow({ expectedFlow: flow })) return;
 				showToast(message, "error");
 				return;
 			}
 			throw new Error(message);
 		}
 
-		resetOAuthFlow();
+		if (!resetOAuthFlow({ expectedFlow: flow })) return;
+		const completedFlowID = flow.id;
 		currentState.page = 1;
 		currentState.selectedIds.clear();
 		await loadAccounts();
+		if (
+			!isCurrentSession(operation.generation) ||
+			nextOAuthFlowID !== completedFlowID
+		) {
+			return;
+		}
 		showToast(
 			typeof data.message === "string" && data.message.trim()
 				? data.message.trim()
@@ -1059,11 +1602,27 @@ async function completeZencoderOAuth(event) {
 			"success",
 		);
 	} catch (error) {
-		setOAuthValidation(error.message || "无法完成授权，请检查地址后重试");
+		if (
+			!isCurrentSession(operation.generation) ||
+			operation.controller.signal.aborted ||
+			!isCurrentOAuthFlow(flow)
+		) {
+			return;
+		}
+		if (!scheduleOAuthExpiry(flow)) return;
+		setOAuthValidation(
+			requestErrorMessage(error, "无法完成授权，请检查地址后重试"),
+		);
 		setOAuthStatus("回调提交失败，请修正后重试", "error");
 		input?.focus();
 	} finally {
-		setOAuthCompleteLoading(false);
+		finishOAuthOperation(operation);
+		if (
+			isCurrentSession(operation.generation) &&
+			isCurrentOAuthFlow(flow)
+		) {
+			setOAuthCompleteLoading(false);
+		}
 	}
 }
 
@@ -1100,15 +1659,30 @@ document.getElementById("oauthCallbackURL").addEventListener("input", () => {
 });
 
 async function deleteAccount(id) {
+	if (!appSessionActive || activeDeleteOperation) return;
 	if (!confirm("确定要删除此账号吗？")) return;
+	const operation = beginDeleteOperation();
+	if (!operation) return;
 	try {
 		const response = await adminFetch(`${API_BASE}/accounts/${id}`, {
 			method: "DELETE",
+			signal: operation.controller.signal,
 		});
-		if (!response.ok) throw new Error("delete failed");
-		loadAccounts();
-	} catch (e) {
-		alert("删除失败");
+		if (!isCurrentSession(operation.generation)) return;
+		if (!response.ok) {
+			throw new Error(await readResponseError(response, "删除失败"));
+		}
+		await loadAccounts();
+	} catch (error) {
+		if (
+			!isCurrentSession(operation.generation) ||
+			operation.controller.signal.aborted
+		) {
+			return;
+		}
+		alert(requestErrorMessage(error, "删除失败"));
+	} finally {
+		finishDeleteOperation(operation);
 	}
 }
 
@@ -1135,7 +1709,11 @@ function initializeApp() {
 function showToast(message, type = "info") {
 	// 创建toast元素
 	const toast = document.createElement("div");
-	toast.className = `fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg transition-all duration-300 transform translate-x-96 z-50`;
+	const isError = type === "error";
+	toast.setAttribute("role", isError ? "alert" : "status");
+	toast.setAttribute("aria-live", isError ? "assertive" : "polite");
+	toast.setAttribute("aria-atomic", "true");
+	toast.className = `admin-toast px-6 py-3 rounded-lg shadow-lg transition-all duration-300 transform translate-x-96`;
 
 	// 根据类型设置样式
 	const styles = {
@@ -1154,7 +1732,7 @@ function showToast(message, type = "info") {
 	content.appendChild(text);
 	toast.appendChild(content);
 
-	document.body.appendChild(toast);
+	document.getElementById("toastContainer").appendChild(toast);
 
 	// 动画显示
 	setTimeout(() => {
@@ -1174,7 +1752,6 @@ function showToast(message, type = "info") {
 
 // Page Initialization
 window.addEventListener("load", async function () {
-	console.log("Page loaded, initializing...");
 	bindUIControls();
 	initTheme();
 	await initAdminAuth();
