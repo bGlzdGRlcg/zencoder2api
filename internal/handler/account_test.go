@@ -101,6 +101,16 @@ func TestAPIKeyCreateAndRotateStayEncrypted(t *testing.T) {
 	if !secret.IsEncrypted(account.APIKey) {
 		t.Fatalf("API key was not encrypted at rest: %q", account.APIKey)
 	}
+	if err := database.GetDB().Model(&account).Updates(map[string]interface{}{
+		"usage_credits_query_revision": 20,
+		"usage_credits_available":      true,
+		"usage_credits_status":         "ready",
+		"usage_credits_remaining":      4992,
+		"usage_credits_operation_id":   "old-operation",
+		"usage_credits_lease_id":       "old-holder",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	rotate := httptest.NewRequest(http.MethodPut, "/api/accounts/1/api-key", bytes.NewBufferString(`{"api_key":"`+rotatedKey+`"}`))
 	rotate.Header.Set("Content-Type", "application/json")
@@ -128,6 +138,13 @@ func TestAPIKeyCreateAndRotateStayEncrypted(t *testing.T) {
 	}
 	if account.ClientID != wantClientID || strings.Contains(account.ClientID, rotatedKey) {
 		t.Fatalf("rotated API-key identity was not updated: %q", account.ClientID)
+	}
+	if account.CredentialRevision != 2 || account.UsageCreditsQueryRevision != 21 {
+		t.Fatalf("rotation revisions = credential:%d credits:%d, want 2 and 21", account.CredentialRevision, account.UsageCreditsQueryRevision)
+	}
+	if account.UsageCreditsAvailable || account.UsageCreditsStatus != "unknown" || account.UsageCreditsRemaining != 0 ||
+		account.UsageCreditsOperationID != "" || account.UsageCreditsLeaseID != "" {
+		t.Fatalf("rotation retained the previous credential's credit snapshot: %+v", account)
 	}
 
 	recreate := httptest.NewRequest(http.MethodPost, "/api/accounts/api-key", bytes.NewBufferString(`{"api_key":"`+rotatedKey+`"}`))

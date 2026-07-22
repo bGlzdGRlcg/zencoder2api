@@ -254,6 +254,13 @@ func TestUpsertOAuthAccountUpdatesExistingIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := database.GetDB().Model(&model.Account{}).Where("id = ?", first.ID).Updates(map[string]interface{}{
+		"usage_credits_query_revision": 20,
+		"usage_credits_available":      true,
+		"usage_credits_status":         UsageCreditsStateReady,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	profile.Email = "new@example.test"
 	second, err := upsertOAuthAccount(context.Background(), "frontegg", "anonymous-new", zencoderOAuthTokens{
 		AccessToken: "access-new", RefreshToken: "refresh-new", ExpiresAt: time.Now().Add(2 * time.Hour),
@@ -263,6 +270,13 @@ func TestUpsertOAuthAccountUpdatesExistingIdentity(t *testing.T) {
 	}
 	if second.ID != first.ID || second.CredentialRevision != first.CredentialRevision+1 {
 		t.Fatalf("OAuth upsert created/revisioned the wrong account: first=%+v second=%+v", first, second)
+	}
+	if second.UsageCreditsQueryRevision != 21 {
+		t.Fatalf("OAuth upsert did not advance the Credit query revision: %d", second.UsageCreditsQueryRevision)
+	}
+	if second.UsageCreditsAvailable || second.UsageCreditsStatus != UsageCreditsStateUnknown ||
+		second.UsageCreditsRemaining != 0 || second.UsageCreditsOperationID != "" {
+		t.Fatalf("OAuth upsert retained the previous credential's Credit snapshot: %+v", second)
 	}
 	if second.OAuthEmail != profile.Email || second.OAuthAnonymousID != "anonymous-new" || second.AccessToken != "access-new" || second.RefreshToken != "refresh-new" {
 		t.Fatalf("OAuth identity was not updated: %+v", second)

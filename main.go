@@ -83,6 +83,9 @@ func run() error {
 	if err := service.ValidateCreditResetConfig(); err != nil {
 		return err
 	}
+	if err := service.ValidateUsageCreditsRefreshConfig(); err != nil {
+		return err
+	}
 	if err := service.ValidateUpstreamEndpointConfig(); err != nil {
 		return err
 	}
@@ -117,6 +120,10 @@ func run() error {
 	// 初始化账号池
 	service.InitAccountPool()
 	defer service.StopAccountPool()
+	stopUsageCreditsWorker := service.StartUsageCreditsWorker()
+	defer stopUsageCreditsWorker()
+	stopUsageCreditsScheduler := service.StartUsageCreditsRefreshScheduler()
+	defer stopUsageCreditsScheduler()
 
 	r := gin.New()
 	r.Use(middleware.Recovery())
@@ -506,6 +513,7 @@ func setupRoutes(r *gin.Engine, cfg serverConfig) error {
 	{
 		// 账号管理
 		api.GET("/accounts", accountHandler.List)
+		api.POST("/accounts/credits/refresh", accountHandler.RefreshCredits)
 		api.POST("/accounts/api-key", accountHandler.CreateAPIKey)
 		api.PUT("/accounts/:id/api-key", accountHandler.RotateAPIKey)
 		api.DELETE("/accounts/:id", accountHandler.Delete)

@@ -25,6 +25,7 @@ func setValidServerEnvironment(t *testing.T) {
 	t.Setenv("MAX_REQUEST_BODY_BYTES", "4194304")
 	t.Setenv("MAX_CONCURRENT_REQUESTS", "32")
 	t.Setenv("TRUSTED_PROXIES", "")
+	t.Setenv("USAGE_CREDITS_REFRESH_INTERVAL", "15m")
 }
 
 func TestLoadServerConfigRequiresCredentials(t *testing.T) {
@@ -103,6 +104,14 @@ func TestCreditResetConfigurationFailsClosed(t *testing.T) {
 		t.Fatal("expected invalid credit reset timezone error")
 	}
 }
+
+func TestUsageCreditsRefreshConfigurationFailsClosed(t *testing.T) {
+	t.Setenv("USAGE_CREDITS_REFRESH_INTERVAL", "30s")
+	if err := service.ValidateUsageCreditsRefreshConfig(); err == nil {
+		t.Fatal("expected invalid usage credits refresh interval error")
+	}
+}
+
 
 func TestLoadServerConfigRejectsCredentialWhitespace(t *testing.T) {
 	setValidServerEnvironment(t)

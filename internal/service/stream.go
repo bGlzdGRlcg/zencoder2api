@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"zencoder-2api/internal/model"
@@ -29,25 +30,44 @@ var errUpstreamStreamTruncated = errors.New("upstream stream ended without a ter
 
 type accountFinalizingBody struct {
 	io.ReadCloser
-	ctx        context.Context
-	resp       *http.Response
-	account    *model.Account
-	multiplier float64
-	protocol   streamProtocol
-	tail       []byte
-	finalized  atomic.Bool
-	closed     atomic.Bool
+	ctx                 context.Context
+	resp                *http.Response
+	account             *model.Account
+	multiplier          float64
+	protocol            streamProtocol
+	tail                []byte
+	finalized           atomic.Bool
+	closed              atomic.Bool
+	refreshOnce         sync.Once
+	operationRemembered bool
 }
 
 func finalizeStreamingAccount(ctx context.Context, resp *http.Response, account *model.Account, multiplier float64, protocol streamProtocol) {
-	resp.Body = &accountFinalizingBody{
-		ReadCloser: resp.Body,
-		ctx:        ctx,
-		resp:       resp,
-		account:    account,
-		multiplier: multiplier,
-		protocol:   protocol,
+	operationRemembered := false
+	if operationID, ok := operationIDIfPresent(ctx); ok {
+		operationRemembered = rememberAccountCreditsOperation(ctx, account, operationID)
 	}
+	resp.Body = &accountFinalizingBody{
+		ReadCloser:          resp.Body,
+		ctx:                 ctx,
+		resp:                resp,
+		account:             account,
+		multiplier:          multiplier,
+		protocol:            protocol,
+		operationRemembered: operationRemembered,
+	}
+}
+
+func (body *accountFinalizingBody) queueRefresh() {
+	body.refreshOnce.Do(func() {
+		operationID, _ := operationIDIfPresent(body.ctx)
+		if !body.operationRemembered {
+			if normalized, ok := validCreditOperationID(operationID); ok {
+				body.operationRemembered = rememberAccountCreditsOperation(body.ctx, body.account, normalized)
+			}
+		}
+		enqueueAccountCreditsRefresh(body.account)
+	})
 }
 
 func (body *accountFinalizingBody) Read(data []byte) (int, error) {
@@ -55,7 +75,8 @@ func (body *accountFinalizingBody) Read(data []byte) (int, error) {
 	if n > 0 && !body.finalized.Load() {
 		combined := append(body.tail, data[:n]...)
 		if streamTerminalSeen(body.protocol, combined) && body.finalized.CompareAndSwap(false, true) {
-			UpdateAccountCreditsFromResponse(body.account, body.resp, body.multiplier)
+			updateAccountCreditsFromResponse(body.ctx, body.account, body.resp, body.multiplier)
+			body.queueRefresh()
 			MarkAccountHealthy(body.account)
 		}
 		const terminalMarkerWindow = 64
@@ -65,6 +86,7 @@ func (body *accountFinalizingBody) Read(data []byte) (int, error) {
 		body.tail = append(body.tail[:0], combined...)
 	}
 	if err != nil && !body.closed.Load() && body.ctx.Err() == nil && body.finalized.CompareAndSwap(false, true) {
+		body.queueRefresh()
 		MarkAccountFailure(body.account, 0, 0, errUpstreamStreamTruncated)
 	}
 	return n, err
@@ -72,6 +94,7 @@ func (body *accountFinalizingBody) Read(data []byte) (int, error) {
 
 func (body *accountFinalizingBody) Close() error {
 	body.closed.Store(true)
+	body.queueRefresh()
 	return body.ReadCloser.Close()
 }
 

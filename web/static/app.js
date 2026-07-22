@@ -1,6 +1,9 @@
 const API_BASE = "/api";
 const REFRESH_INTERVAL = 3000;
 const REQUEST_TIMEOUT_MS = 15 * 1000;
+const USAGE_CREDITS_TIMEOUT_MS = 60 * 1000;
+const USAGE_CREDITS_BATCH_SIZE = 4;
+const USAGE_CREDITS_LIST_PAGE_SIZE = 100;
 const OAUTH_COMPLETE_TIMEOUT_MS = 45 * 1000;
 const OAUTH_TIMEOUT_MINUTES = 9;
 const OAUTH_TIMEOUT_MS = OAUTH_TIMEOUT_MINUTES * 60 * 1000;
@@ -18,6 +21,10 @@ let lastAccountsErrorAnnouncement = "";
 let activeOAuthOperation = null;
 let activeDeleteOperation = null;
 let deleteOperationInFlight = false;
+const usageCreditsRefreshOperations = new Map();
+let activeUsageCreditsRefreshOperation = null;
+const usageCreditsLocalStates = new Map();
+let usageCreditsRefreshSequence = 0;
 
 // The password is used only for the session exchange and is never retained.
 // The CSRF token is intentionally memory-only; the server session is HttpOnly.
@@ -38,6 +45,10 @@ function resetAdminUIState() {
 	currentState.total = 0;
 	currentState.items = [];
 	currentState.selectedIds.clear();
+	usageCreditsRefreshOperations.clear();
+	activeUsageCreditsRefreshOperation = null;
+	usageCreditsLocalStates.clear();
+	usageCreditsRefreshSequence = 0;
 	if (!document.getElementById("mainApp")) return;
 	renderAccounts([]);
 	updatePaginationUI();
@@ -47,6 +58,7 @@ function resetAdminUIState() {
 	lastAccountsErrorAnnouncement = "";
 	const announcement = document.getElementById("accountsRefreshAnnouncement");
 	if (announcement) announcement.textContent = "";
+	setUsageCreditsRefreshAnnouncement("");
 }
 
 function deactivateAdminSession() {
@@ -59,7 +71,12 @@ function deactivateAdminSession() {
 	updateOAuthActionDisabled();
 	activeDeleteOperation = null;
 	deleteOperationInFlight = false;
+	usageCreditsRefreshOperations.clear();
+	activeUsageCreditsRefreshOperation = null;
+	usageCreditsLocalStates.clear();
+	usageCreditsRefreshSequence = 0;
 	setDeleteActionsDisabled(false);
+	syncUsageCreditsRefreshControls();
 	resetOAuthFlow();
 	clearAPIKeyInput();
 	setAPIKeyEditMode(null);
@@ -578,6 +595,13 @@ async function submitAPIKey(event) {
 			throw new Error(`API Key 保存失败（HTTP ${response.status}）`);
 		}
 		setAPIKeyStatus(editingID ? "API Key 已轮换" : "API Key 已保存", "success");
+		if (editingID) {
+			const accountID = Number(editingID);
+			usageCreditsRefreshOperations.get(accountID)?.controller.abort();
+			activeUsageCreditsRefreshOperation?.controller.abort();
+			usageCreditsLocalStates.delete(accountID);
+			invalidateVisibleUsageCredits(accountID);
+		}
 		setAPIKeyEditMode(null);
 		await loadAccounts();
 	} catch (error) {
@@ -661,6 +685,7 @@ function bindUIControls() {
 	);
 	bindOnce(document.getElementById("logoutButton"), "click", logout);
 	bindOnce(document.getElementById("apiKeyForm"), "submit", submitAPIKey);
+	bindOnce(document.getElementById("refreshAllCredits"), "click", refreshAllCredits);
 	bindOnce(document.getElementById("apiKeyCancel"), "click", () => {
 		setAPIKeyStatus();
 		setAPIKeyEditMode(null);
@@ -687,6 +712,8 @@ function bindUIControls() {
 				deleteAccount(Number(action.dataset.accountId));
 			} else if (action.dataset.action === "rotate-api-key") {
 				beginAPIKeyRotation(Number(action.dataset.accountId));
+			} else if (action.dataset.action === "refresh-credits") {
+				refreshCreditsForAccount(Number(action.dataset.accountId));
 			} else if (action.dataset.action === "batch-delete") {
 				batchDelete(action.dataset.deleteAll === "true");
 			}
@@ -825,11 +852,628 @@ function setAccountsRefreshStatus(message, type = "success") {
 	);
 }
 
+const usageCreditsSnapshotStates = new Set(["ready", "refreshing", "stale", "error"]);
+
+function nextUsageCreditsRefreshSequence() {
+	usageCreditsRefreshSequence += 1;
+	return usageCreditsRefreshSequence;
+}
+
+function usageCreditsUpdatedAtMillis(value) {
+	if (!hasUsageCreditsUpdatedAt(value)) return Number.NEGATIVE_INFINITY;
+	return new Date(value).getTime();
+}
+
+function usageCreditsRevision(snapshot) {
+	const revision = Number(snapshot?.revision);
+	return Number.isSafeInteger(revision) && revision >= 0 ? revision : -1;
+}
+
+function invalidateVisibleUsageCredits(accountID = null) {
+	const accounts = accountID == null
+		? currentState.items
+		: currentState.items.filter((item) => Number(item.id) === Number(accountID));
+	for (const account of accounts) {
+		const revision = usageCreditsRevision(account.usage_based_credits);
+		account.usage_based_credits = {
+			state: "unknown",
+			revision: revision >= 0 ? revision + 1 : 0,
+		};
+	}
+	if (accounts.length > 0) renderAccounts(currentState.items);
+}
+
+function compareUsageCreditsSnapshots(left, right) {
+	const leftRevision = usageCreditsRevision(left);
+	const rightRevision = usageCreditsRevision(right);
+	if (leftRevision >= 0 && rightRevision >= 0 && leftRevision !== rightRevision) {
+		return leftRevision - rightRevision;
+	}
+	return (
+		usageCreditsUpdatedAtMillis(left?.updated_at) -
+		usageCreditsUpdatedAtMillis(right?.updated_at)
+	);
+}
+
+function usageCreditsLocalRecord(accountID) {
+	const record = usageCreditsLocalStates.get(Number(accountID));
+	if (!record) return null;
+	// Keep accepting the old string form while a page is being restored from a
+	// previously rendered state.
+	if (typeof record === "string") return { state: record, sequence: 0 };
+	return record;
+}
+
+function usageCreditsForAccount(account) {
+	const raw = account?.usage_based_credits;
+	const accountID = Number(account?.id);
+	const local = usageCreditsLocalRecord(accountID);
+	if (!raw || typeof raw !== "object") {
+		if (local?.snapshot) return local.snapshot;
+		return { state: local?.state || "unknown" };
+	}
+	if (!local) return raw;
+	if (local.snapshot) {
+		const order = compareUsageCreditsSnapshots(local.snapshot, raw);
+		if (order > 0) return local.snapshot;
+		if (order === 0 && local.sequence > 0) {
+			return local.snapshot;
+		}
+		usageCreditsLocalStates.delete(accountID);
+		return raw;
+	}
+	return local.state ? { ...raw, state: local.state } : raw;
+}
+
+function hasUsageCreditsUpdatedAt(value) {
+	return Boolean(
+		typeof value === "string" &&
+		value &&
+		!value.startsWith("0001") &&
+		!Number.isNaN(new Date(value).getTime()),
+	);
+}
+
+function hasUsageCreditsValues(credits) {
+	return Boolean(
+		credits &&
+		usageCreditsSnapshotStates.has(credits.state) &&
+		hasUsageCreditsUpdatedAt(credits.updated_at) &&
+		Number.isFinite(credits.consumed) &&
+		Number.isFinite(credits.budget) &&
+		Number.isFinite(credits.remaining),
+	);
+}
+
+function formatUsageCreditsValue(value) {
+	if (!Number.isFinite(value)) return "";
+	return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(
+		Math.max(0, value),
+	);
+}
+
+function formatUsageCreditsUpdatedAt(value) {
+	if (!hasUsageCreditsUpdatedAt(value)) return "";
+	return `更新于 ${formatLastUsed(value)}`;
+}
+
+function formatUsageCreditsPeriodEnd(value) {
+	if (!hasUsageCreditsUpdatedAt(value)) return "";
+	return `重置于 ${new Date(value).toLocaleString("zh-CN", {
+		year: "numeric",
+		month: "numeric",
+		day: "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+	})}`;
+}
+
+function isUsageCreditsRefreshBusy(accountID, resolvedCredits = null) {
+	let credits = resolvedCredits;
+	if (!credits) {
+		const account = currentState.items.find(
+			(item) => Number(item.id) === Number(accountID),
+		);
+		credits = account ? usageCreditsForAccount(account) : null;
+	}
+	return Boolean(
+		activeUsageCreditsRefreshOperation ||
+		usageCreditsRefreshOperations.has(Number(accountID)) ||
+		credits?.state === "refreshing",
+	);
+}
+
+function getUsageCreditsView(account, resolvedCredits = null) {
+	const credits = resolvedCredits || usageCreditsForAccount(account);
+	const busy = isUsageCreditsRefreshBusy(account?.id, credits);
+	if (hasUsageCreditsValues(credits)) {
+		const remaining = Math.max(0, credits.remaining);
+		const budget = Math.max(0, credits.budget);
+		const consumed = Math.max(0, credits.consumed);
+		const refreshFailed = credits.state === "error";
+		const stale = credits.state === "stale";
+		const depleted = remaining <= 0;
+		const detail = [`已用 ${formatUsageCreditsValue(consumed)}`];
+		if (busy || credits.state === "refreshing") {
+			detail.push("正在刷新…");
+		} else if (refreshFailed) {
+			detail.push("刷新失败");
+		} else if (stale) {
+			detail.push("数据过旧，请刷新");
+		} else if (credits.updated_at) {
+			const updated = formatUsageCreditsUpdatedAt(credits.updated_at);
+			if (updated) detail.push(updated);
+		}
+		const periodEnd = formatUsageCreditsPeriodEnd(credits.period_end);
+		if (periodEnd) detail.push(periodEnd);
+		return {
+			primary: `剩余 ${formatUsageCreditsValue(remaining)} / ${formatUsageCreditsValue(budget)}`,
+			detail: detail.join(" · "),
+			primaryClass:
+				refreshFailed || depleted
+					? "text-red-600 dark:text-red-400"
+					: stale
+						? "usage-credit-stale"
+						: "text-blue-600 dark:text-blue-400",
+			detailClass: refreshFailed
+				? "text-red-600 dark:text-red-400"
+				: stale
+					? "usage-credit-stale"
+					: "text-gray-500 dark:text-gray-400",
+		};
+	}
+
+	if (busy || credits.state === "refreshing") {
+		return {
+			primary: "正在刷新…",
+			detail: "请稍候",
+			primaryClass: "text-blue-600 dark:text-blue-400",
+			detailClass: "text-gray-500 dark:text-gray-400",
+		};
+	}
+	const emptyViews = {
+		no_operation: ["尚无 Credit 数据", "完成请求后可查询"],
+		unsupported: ["Credit 不可用", "当前账号未返回 usage-based 数据"],
+		stale: ["Credit 数据过旧", "请刷新获取最新余额"],
+		error: ["Credit 刷新失败", "请稍后重试"],
+		unknown: ["Credit 未知", "尚未获取数据"],
+	};
+	const [primary, detail] = emptyViews[credits.state] || emptyViews.unknown;
+	return {
+		primary,
+		detail,
+		primaryClass:
+			credits.state === "error"
+				? "text-red-600 dark:text-red-400"
+				: credits.state === "stale"
+					? "usage-credit-stale"
+					: "text-gray-500 dark:text-gray-400",
+		detailClass: "text-gray-500 dark:text-gray-400",
+	};
+}
+
+function usageCreditsRefreshButton(accountID, accountLabel, resolvedCredits = null) {
+	const safeID = Number.isSafeInteger(accountID) && accountID >= 0 ? accountID : 0;
+	const busy = isUsageCreditsRefreshBusy(safeID, resolvedCredits);
+	const escapedLabel = escapeHtml(accountLabel);
+	return `<button type="button" data-action="refresh-credits" data-account-id="${safeID}" ${busy ? 'disabled aria-disabled="true" aria-busy="true"' : ""} class="account-action-button credit-refresh-button rounded-md p-2 text-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-blue-400 transition-colors disabled:cursor-wait disabled:opacity-50" title="刷新账号 ${escapedLabel} Credit" aria-label="刷新账号 ${escapedLabel} Credit">
+        <svg data-credit-refresh-icon xmlns="http://www.w3.org/2000/svg" class="${busy ? "hidden " : ""}h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5.1 15a7 7 0 0011.2 2.1L20 14M4 10l3.7-3.1A7 7 0 0118.9 9" /></svg>
+        <svg data-credit-refresh-loading xmlns="http://www.w3.org/2000/svg" class="${busy ? "" : "hidden "}h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+    </button>`;
+}
+
+function setUsageCreditsRefreshAnnouncement(message) {
+	const announcement = document.getElementById("creditsRefreshAnnouncement");
+	if (announcement) announcement.textContent = message;
+}
+
+function captureUsageCreditsFocus(accountID, refreshAll) {
+	const active = document.activeElement;
+	if (refreshAll) {
+		return active?.id === "refreshAllCredits"
+			? { kind: "all", element: active }
+			: null;
+	}
+	if (
+		active?.dataset?.action !== "refresh-credits" ||
+		Number(active.dataset.accountId) !== Number(accountID)
+	) {
+		return null;
+	}
+	return {
+		kind: "account",
+		accountID: Number(accountID),
+		containerID: active.closest?.("#accountList, #mobileAccountList")?.id || "",
+		element: active,
+	};
+}
+
+function restoreUsageCreditsFocus(focus) {
+	if (!focus) return;
+	const active = document.activeElement;
+	if (
+		active &&
+		active !== document.body &&
+		active !== focus.element &&
+		active.isConnected !== false
+	) {
+		return;
+	}
+	let target = null;
+	if (focus.kind === "all") {
+		target = document.getElementById("refreshAllCredits");
+	} else {
+		const prefix = focus.containerID ? `#${focus.containerID} ` : "";
+		const selector = `${prefix}[data-action="refresh-credits"][data-account-id="${focus.accountID}"]`;
+		const candidates = Array.from(document.querySelectorAll?.(selector) || []);
+		target = candidates.find((candidate) => candidate.offsetParent !== null) || candidates[0];
+	}
+	if (target && !target.disabled) target.focus({ preventScroll: true });
+}
+
+function syncUsageCreditsRefreshControls() {
+	const allBusy = Boolean(activeUsageCreditsRefreshOperation);
+	const anyBusy = allBusy || usageCreditsRefreshOperations.size > 0;
+	const allButton = document.getElementById("refreshAllCredits");
+	if (allButton) {
+		const disabled = !appSessionActive || anyBusy;
+		allButton.disabled = disabled;
+		allButton.setAttribute("aria-disabled", disabled ? "true" : "false");
+		allButton.setAttribute("aria-busy", allBusy ? "true" : "false");
+		const progress = activeUsageCreditsRefreshOperation?.progress;
+		allButton.title = allBusy
+			? progress?.total
+				? `正在刷新全部账号 Credit（${progress.completed}/${progress.total}）`
+				: "正在刷新全部账号 Credit"
+			: anyBusy
+				? "请等待账号 Credit 刷新完成"
+				: "刷新全部账号 Credit";
+		allButton
+			.querySelector("[data-credit-refresh-icon]")
+			?.classList.toggle("hidden", allBusy);
+		allButton
+			.querySelector("[data-credit-refresh-loading]")
+			?.classList.toggle("hidden", !allBusy);
+	}
+	const buttons = document.querySelectorAll?.('[data-action="refresh-credits"]') || [];
+	for (const button of buttons) {
+		const accountID = Number(button.dataset.accountId);
+		const busy = allBusy || isUsageCreditsRefreshBusy(accountID);
+		const disabled = !appSessionActive || busy;
+		button.disabled = disabled;
+		button.setAttribute("aria-busy", busy ? "true" : "false");
+		button.setAttribute("aria-disabled", disabled ? "true" : "false");
+	}
+}
+
+function beginUsageCreditsRefresh(accountID = null, refreshAll = false) {
+	if (!appSessionActive) return null;
+	if (refreshAll) {
+		if (activeUsageCreditsRefreshOperation || usageCreditsRefreshOperations.size > 0) return null;
+	} else if (
+		isUsageCreditsRefreshBusy(Number(accountID))
+	) {
+		return null;
+	}
+	const operation = beginAdminOperation();
+	operation.usageCreditsFocus = captureUsageCreditsFocus(accountID, refreshAll);
+	if (refreshAll) {
+		activeUsageCreditsRefreshOperation = operation;
+		setUsageCreditsRefreshAnnouncement("正在刷新全部账号 Credit");
+	} else {
+		usageCreditsRefreshOperations.set(Number(accountID), operation);
+		setUsageCreditsRefreshAnnouncement(`正在刷新账号 ${Number(accountID)} Credit`);
+	}
+	renderAccounts(currentState.items);
+	return operation;
+}
+
+function finishUsageCreditsRefresh(accountID, operation, refreshAll = false) {
+	finishAdminOperation(operation);
+	if (refreshAll) {
+		if (activeUsageCreditsRefreshOperation === operation) {
+			activeUsageCreditsRefreshOperation = null;
+		}
+	} else if (usageCreditsRefreshOperations.get(Number(accountID)) === operation) {
+		usageCreditsRefreshOperations.delete(Number(accountID));
+	}
+	if (operation && isCurrentSession(operation.generation)) {
+		renderAccounts(currentState.items);
+		restoreUsageCreditsFocus(operation.usageCreditsFocus);
+	}
+}
+
+function markUsageCreditsRefreshFailure(accountIDs, refreshAll = false) {
+	const sequence = nextUsageCreditsRefreshSequence();
+	const ids = refreshAll
+		? currentState.items.map((item) => Number(item.id))
+		: accountIDs;
+	for (const accountID of ids) {
+		const id = Number(accountID);
+		const account = currentState.items.find((item) => Number(item.id) === id);
+		usageCreditsLocalStates.set(id, {
+			state: "error",
+			sequence,
+			baseUpdatedAt: account?.usage_based_credits?.updated_at,
+			baseRevision: account?.usage_based_credits?.revision,
+		});
+	}
+}
+
+function usageCreditsResultAccountID(result) {
+	return Number(result?.id ?? result?.account_id);
+}
+
+function mergeUsageCreditsServerItem(item, requestSequence = 0) {
+	const accountID = usageCreditsResultAccountID(item);
+	if (!Number.isSafeInteger(accountID) || accountID <= 0) return item;
+	const local = usageCreditsLocalRecord(accountID);
+	const serverSnapshot = item?.usage_based_credits;
+	if (!local) return item;
+
+	if (local.snapshot) {
+		if (!serverSnapshot || typeof serverSnapshot !== "object") {
+			item.usage_based_credits = local.snapshot;
+			return item;
+		}
+		const order = compareUsageCreditsSnapshots(serverSnapshot, local.snapshot);
+		const serverIsNewer =
+			order > 0 || (order === 0 && requestSequence >= local.sequence);
+		if (serverIsNewer) {
+			usageCreditsLocalStates.delete(accountID);
+		} else {
+			item.usage_based_credits = local.snapshot;
+		}
+		return item;
+	}
+
+	// A response started before the failed refresh may still contain the old
+	// snapshot. Keep the error for that response, but clear it for a newer
+	// snapshot (or a fresh read of the same snapshot).
+	if (local.state === "error" && serverSnapshot && typeof serverSnapshot === "object") {
+		const failedSnapshot = {
+			revision: local.baseRevision,
+			updated_at: local.baseUpdatedAt,
+		};
+		const order = compareUsageCreditsSnapshots(serverSnapshot, failedSnapshot);
+		if (
+			order > 0 ||
+			(order === 0 && requestSequence >= local.sequence)
+		) {
+			usageCreditsLocalStates.delete(accountID);
+		}
+	}
+	return item;
+}
+
+function mergeUsageCreditsServerItems(items, requestSequence = 0) {
+	if (!Array.isArray(items)) return items;
+	for (const item of items) mergeUsageCreditsServerItem(item, requestSequence);
+	return items;
+}
+
+function applyUsageCreditsRefreshItems(items) {
+	if (!Array.isArray(items)) return;
+	const sequence = nextUsageCreditsRefreshSequence();
+	for (const result of items) {
+		const accountID = usageCreditsResultAccountID(result);
+		if (!Number.isSafeInteger(accountID) || accountID <= 0) continue;
+		const account = currentState.items.find((item) => Number(item.id) === accountID);
+		if (result.usage_based_credits && typeof result.usage_based_credits === "object") {
+			const snapshot = result.usage_based_credits;
+			const currentSnapshot = account?.usage_based_credits;
+			if (
+				currentSnapshot &&
+				typeof currentSnapshot === "object" &&
+				compareUsageCreditsSnapshots(currentSnapshot, snapshot) > 0
+			) {
+				continue;
+			}
+			usageCreditsLocalStates.set(accountID, { snapshot, sequence });
+			if (account) account.usage_based_credits = snapshot;
+		} else {
+			usageCreditsLocalStates.set(accountID, { state: "error", sequence });
+		}
+	}
+	renderAccounts(currentState.items);
+}
+
+function refreshCount(value, fallback = 0) {
+	const count = Number(value);
+	return Number.isFinite(count) && count >= 0 ? Math.floor(count) : fallback;
+}
+
+async function refreshCreditsForAccount(accountID) {
+	if (!appSessionActive) return;
+	const id = Number(accountID);
+	if (!Number.isSafeInteger(id) || id <= 0) return;
+	if (!currentState.items.some((item) => Number(item.id) === id)) {
+		showToast("该账号已不在当前页面，请刷新后重试", "error");
+		return;
+	}
+	const operation = beginUsageCreditsRefresh(id);
+	if (!operation) return;
+	try {
+		const response = await adminFetch(`${API_BASE}/accounts/credits/refresh`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ids: [id] }),
+			signal: operation.controller.signal,
+		}, USAGE_CREDITS_TIMEOUT_MS);
+		if (!isCurrentSession(operation.generation) || operation.controller.signal.aborted) return;
+		if (!response.ok) {
+			throw new Error(await readResponseError(response, "Credit 刷新失败"));
+		}
+		const data = await response.json();
+		if (
+			!isCurrentSession(operation.generation) ||
+			operation.controller.signal.aborted ||
+			!Array.isArray(data.items)
+		) {
+			if (isCurrentSession(operation.generation) && !operation.controller.signal.aborted) {
+				throw new Error("Credit 刷新返回无效数据");
+			}
+			return;
+		}
+		applyUsageCreditsRefreshItems(data.items);
+		const result = data.items.find((item) => usageCreditsResultAccountID(item) === id);
+		const state = result?.usage_based_credits?.state || "unknown";
+		let message = `账号 ${id} Credit 刷新未完成`;
+		let type = "warning";
+		if (state === "ready") {
+			message = `账号 ${id} Credit 已刷新`;
+			type = "success";
+		} else if (state === "error" || refreshCount(data.failed) > 0) {
+			message = `账号 ${id} Credit 刷新失败`;
+			type = "error";
+		} else if (state === "no_operation") {
+			message = `账号 ${id} 尚无可查询的 Credit 操作`;
+		} else if (state === "unsupported") {
+			message = `账号 ${id} 暂无 usage-based Credit 数据`;
+		}
+		showToast(message, type, false);
+		setUsageCreditsRefreshAnnouncement(message);
+	} catch (error) {
+		if (!isCurrentSession(operation.generation) || operation.controller.signal.aborted) return;
+		markUsageCreditsRefreshFailure([id]);
+		const message = requestErrorMessage(error, "Credit 刷新失败");
+		showToast(message, "error", false);
+		setUsageCreditsRefreshAnnouncement(message);
+	} finally {
+		finishUsageCreditsRefresh(id, operation);
+	}
+}
+
+function usageCreditsAccountIDs(items) {
+	const seen = new Set();
+	for (const item of Array.isArray(items) ? items : []) {
+		const id = Number(item?.id);
+		if (Number.isSafeInteger(id) && id > 0) seen.add(id);
+	}
+	return [...seen];
+}
+
+async function loadAllUsageCreditsAccountIDs(operation) {
+	const knownTotal = refreshCount(currentState.total);
+	const visibleIDs = usageCreditsAccountIDs(currentState.items);
+	if (
+		(knownTotal > 0 || visibleIDs.length > 0) &&
+		knownTotal <= visibleIDs.length &&
+		currentState.page === 1
+	) {
+		return visibleIDs;
+	}
+
+	const seen = new Set();
+	let page = 1;
+	let total = knownTotal;
+	for (;;) {
+		const params = new URLSearchParams({
+			page: String(page),
+			size: String(USAGE_CREDITS_LIST_PAGE_SIZE),
+		});
+		const response = await adminFetch(`${API_BASE}/accounts?${params}`, {
+			signal: operation.controller.signal,
+		});
+		if (!isCurrentSession(operation.generation) || operation.controller.signal.aborted) {
+			return [];
+		}
+		if (!response.ok) {
+			throw new Error(await readResponseError(response, "无法读取待刷新账号"));
+		}
+		const data = await response.json();
+		if (!Array.isArray(data.items)) {
+			throw new Error("账号列表返回无效数据");
+		}
+		for (const id of usageCreditsAccountIDs(data.items)) seen.add(id);
+		total = refreshCount(data.total, total);
+		if (
+			data.items.length < USAGE_CREDITS_LIST_PAGE_SIZE ||
+			seen.size >= total
+		) {
+			break;
+		}
+		page += 1;
+	}
+	return [...seen];
+}
+
+async function refreshUsageCreditsBatch(ids, operation) {
+	const response = await adminFetch(`${API_BASE}/accounts/credits/refresh`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ ids }),
+		signal: operation.controller.signal,
+	}, USAGE_CREDITS_TIMEOUT_MS);
+	if (!response.ok) {
+		throw new Error(await readResponseError(response, "Credit 批次刷新失败"));
+	}
+	const data = await response.json();
+	if (!Array.isArray(data.items)) {
+		throw new Error("Credit 刷新返回无效数据");
+	}
+	return data;
+}
+
+async function refreshAllCredits() {
+	if (!appSessionActive) return;
+	const operation = beginUsageCreditsRefresh(null, true);
+	if (!operation) return;
+	try {
+		const ids = await loadAllUsageCreditsAccountIDs(operation);
+		if (!isCurrentSession(operation.generation) || operation.controller.signal.aborted) return;
+		operation.progress = { completed: 0, total: ids.length };
+		syncUsageCreditsRefreshControls();
+		let refreshed = 0;
+		let skipped = 0;
+		let failed = 0;
+		for (let offset = 0; offset < ids.length; offset += USAGE_CREDITS_BATCH_SIZE) {
+			const batch = ids.slice(offset, offset + USAGE_CREDITS_BATCH_SIZE);
+			try {
+				const data = await refreshUsageCreditsBatch(batch, operation);
+				if (!isCurrentSession(operation.generation) || operation.controller.signal.aborted) return;
+				applyUsageCreditsRefreshItems(data.items);
+				const batchRefreshed = refreshCount(data.refreshed);
+				const batchFailed = refreshCount(data.failed);
+				const batchRequested = refreshCount(data.requested, batch.length);
+				const batchSkipped = refreshCount(data.skipped);
+				refreshed += batchRefreshed;
+				failed += batchFailed;
+				skipped += Math.max(
+					batchSkipped,
+					batchRequested - batchRefreshed - batchFailed,
+				);
+			} catch (error) {
+				if (!isCurrentSession(operation.generation) || operation.controller.signal.aborted) return;
+				markUsageCreditsRefreshFailure(batch);
+				failed += batch.length;
+				renderAccounts(currentState.items);
+			}
+			operation.progress.completed += batch.length;
+			const progressMessage = `正在刷新全部账号 Credit（${operation.progress.completed}/${operation.progress.total}）`;
+			setUsageCreditsRefreshAnnouncement(progressMessage);
+			syncUsageCreditsRefreshControls();
+		}
+		const requested = ids.length;
+		const message = `Credit 刷新完成：成功 ${refreshed}，跳过 ${skipped}，失败 ${failed}（共 ${requested}）`;
+		showToast(message, failed > 0 ? "warning" : "success", false);
+		setUsageCreditsRefreshAnnouncement(message);
+	} catch (error) {
+		if (!isCurrentSession(operation.generation) || operation.controller.signal.aborted) return;
+		markUsageCreditsRefreshFailure([], true);
+		showToast(requestErrorMessage(error, "全部 Credit 刷新失败"), "error", false);
+		setUsageCreditsRefreshAnnouncement("全部账号 Credit 刷新失败");
+	} finally {
+		finishUsageCreditsRefresh(null, operation, true);
+	}
+}
+
 async function loadAccounts(isAutoRefresh = false) {
 	if (!appSessionActive) return;
 	if (isAutoRefresh && accountsRequestController) return;
 	cancelAccountsRequest();
 	const requestSequence = accountsRequestSequence;
+	const requestCreditSequence = usageCreditsRefreshSequence;
 	const requestPage = currentState.page;
 	const controller = new AbortController();
 	accountsRequestController = controller;
@@ -863,6 +1507,7 @@ async function loadAccounts(isAutoRefresh = false) {
 		}
 
 		const items = Array.isArray(data.items) ? data.items : [];
+		mergeUsageCreditsServerItems(items, requestCreditSequence);
 		const total = Math.max(0, Number(data.total) || 0);
 		const totalPages = Math.max(1, Math.ceil(total / currentState.size));
 		if (requestPage > totalPages) {
@@ -948,6 +1593,7 @@ function renderAccounts(accounts) {
 		selectAll.checked = false;
 		selectAll.disabled = true;
 		if (focusedList) emptyState.focus({ preventScroll: true });
+		syncUsageCreditsRefreshControls();
 		return;
 	}
 
@@ -968,8 +1614,12 @@ function renderAccounts(accounts) {
 		const accountLabel = getOAuthAccountLabel(acc);
 		const credentialTypeLabel = getCredentialTypeLabel(acc);
 		const canRotateAPIKey = acc.credential_type === "api_key";
+		const resolvedCredits = usageCreditsForAccount(acc);
+		const creditsView = getUsageCreditsView(acc, resolvedCredits);
 		const escapedAccountLabel = escapeHtml(accountLabel);
 		const escapedLastUsedText = escapeHtml(lastUsedText);
+		const escapedCreditsPrimary = escapeHtml(creditsView.primary);
+		const escapedCreditsDetail = escapeHtml(creditsView.detail);
 		const accountId = Number(acc.id);
 		const safeAccountId =
 			Number.isSafeInteger(accountId) && accountId >= 0 ? accountId : 0;
@@ -1011,8 +1661,13 @@ function renderAccounts(accounts) {
                 <div class="text-blue-600 dark:text-blue-400">今日 ${todayUsage}</div>
                 <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">累计 ${totalUsage}</div>
             </td>
+			<td class="usage-credit-cell px-6 py-4 text-center text-sm">
+				<div class="font-medium ${creditsView.primaryClass}">${escapedCreditsPrimary}</div>
+				<div class="usage-credit-detail mt-1 text-xs ${creditsView.detailClass}">${escapedCreditsDetail}</div>
+            </td>
             <td class="px-6 py-4 whitespace-nowrap text-center text-sm font-medium">
 				<div class="flex justify-center gap-3">
+					${usageCreditsRefreshButton(safeAccountId, accountLabel, resolvedCredits)}
 					${canRotateAPIKey ? `<button type="button" data-action="rotate-api-key" data-account-id="${safeAccountId}" class="account-action-button text-blue-600 hover:text-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500 rounded-md transition-colors" title="轮换 API Key" aria-label="轮换 API Key ${escapedAccountLabel}">
 						<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5.1 15a7 7 0 0011.2 2.1L20 14M4 10l3.7-3.1A7 7 0 0118.9 9" /></svg>
 					</button>` : ""}
@@ -1039,6 +1694,7 @@ function renderAccounts(accounts) {
 					<div class="mt-1 text-[11px] text-gray-500 dark:text-gray-400">账号 ID ${safeAccountId}</div>
                 </div>
 				<div class="-mr-1 flex items-center">
+				${usageCreditsRefreshButton(safeAccountId, accountLabel, resolvedCredits)}
 				${canRotateAPIKey ? `<button type="button" data-action="rotate-api-key" data-account-id="${safeAccountId}" class="account-action-button rounded-lg p-2 text-blue-600 hover:bg-blue-50 hover:text-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:hover:bg-blue-900/20 transition-colors" title="轮换 API Key" aria-label="轮换 API Key ${escapedAccountLabel}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5.1 15a7 7 0 0011.2 2.1L20 14M4 10l3.7-3.1A7 7 0 0118.9 9" /></svg></button>` : ""}
 				<button type="button" data-action="delete-account" data-account-id="${safeAccountId}" ${deleteOperationInFlight ? 'disabled aria-disabled="true"' : ""} class="account-action-button rounded-lg p-2 text-red-500 hover:bg-red-50 hover:text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 dark:hover:bg-red-900/20 transition-colors disabled:cursor-wait disabled:opacity-50" title="删除" aria-label="删除账号 ${escapedAccountLabel}">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
@@ -1056,6 +1712,11 @@ function renderAccounts(accounts) {
 					<div class="text-[10px] font-medium uppercase tracking-wider text-gray-500 dark:text-gray-400">使用量</div>
                     <div class="mt-1 text-xs text-blue-600 dark:text-blue-400">今日 ${todayUsage}</div>
                     <div class="mt-0.5 text-[10px] text-gray-500 dark:text-gray-400">累计 ${totalUsage}</div>
+                </div>
+                <div class="col-span-2 border-t border-gray-100 pt-3 dark:border-gray-800">
+					<div class="text-[10px] font-medium uppercase tracking-wider text-gray-500 dark:text-gray-400">剩余 Credit</div>
+                    <div class="mt-1 text-xs font-medium ${creditsView.primaryClass}">${escapedCreditsPrimary}</div>
+					<div class="usage-credit-detail mt-0.5 text-xs ${creditsView.detailClass}">${escapedCreditsDetail}</div>
                 </div>
             </div>
         </article>`;
@@ -1080,6 +1741,7 @@ function renderAccounts(accounts) {
 			)
 			?.focus({ preventScroll: true });
 	}
+	syncUsageCreditsRefreshControls();
 }
 
 // --- Interactions ---
@@ -1221,6 +1883,13 @@ async function batchDelete(deleteAll = false) {
 		alert(`成功删除 ${result.deleted_count || 0} 个账号`);
 
 		// 清空选择并刷新页面
+		if (deleteAll) {
+			usageCreditsLocalStates.clear();
+		} else {
+			for (const id of currentState.selectedIds) {
+				usageCreditsLocalStates.delete(Number(id));
+			}
+		}
 		currentState.selectedIds.clear();
 		await loadAccounts();
 	} catch (error) {
@@ -1585,6 +2254,12 @@ async function completeZencoderOAuth(event) {
 		}
 
 		if (!resetOAuthFlow({ expectedFlow: flow })) return;
+		for (const refresh of usageCreditsRefreshOperations.values()) {
+			refresh.controller.abort();
+		}
+		activeUsageCreditsRefreshOperation?.controller.abort();
+		usageCreditsLocalStates.clear();
+		invalidateVisibleUsageCredits();
 		const completedFlowID = flow.id;
 		currentState.page = 1;
 		currentState.selectedIds.clear();
@@ -1672,6 +2347,7 @@ async function deleteAccount(id) {
 		if (!response.ok) {
 			throw new Error(await readResponseError(response, "删除失败"));
 		}
+		usageCreditsLocalStates.delete(Number(id));
 		await loadAccounts();
 	} catch (error) {
 		if (
@@ -1706,13 +2382,18 @@ function initializeApp() {
 }
 
 // Toast提示功能
-function showToast(message, type = "info") {
+function showToast(message, type = "info", announce = true) {
 	// 创建toast元素
 	const toast = document.createElement("div");
 	const isError = type === "error";
-	toast.setAttribute("role", isError ? "alert" : "status");
-	toast.setAttribute("aria-live", isError ? "assertive" : "polite");
-	toast.setAttribute("aria-atomic", "true");
+	if (announce) {
+		toast.setAttribute("role", isError ? "alert" : "status");
+		toast.setAttribute("aria-live", isError ? "assertive" : "polite");
+		toast.setAttribute("aria-atomic", "true");
+	} else {
+		toast.setAttribute("role", "presentation");
+		toast.setAttribute("aria-hidden", "true");
+	}
 	toast.className = `admin-toast px-6 py-3 rounded-lg shadow-lg transition-all duration-300 transform translate-x-96`;
 
 	// 根据类型设置样式

@@ -33,6 +33,10 @@ go.work.sum
 /API Keys.txt
 *.har
 
+# Local browser test state and screenshots
+/.playwright-cli/
+/output/
+
 # Reverse-engineering inputs and extracted artifacts
 *.vsix
 *.chlz

@@ -102,12 +102,16 @@ func (p *AccountPool) refreshLoop(ctx context.Context) {
 }
 
 func (p *AccountPool) refresh() error {
+	return p.refreshContext(context.Background())
+}
+
+func (p *AccountPool) refreshContext(ctx context.Context) error {
 	db := database.GetDB()
 	if db == nil {
 		return errDatabaseUnavailable
 	}
 	var accounts []model.Account
-	result := db.
+	result := db.WithContext(ctx).
 		Where("(credential_type = ? AND access_token != '') OR (credential_type = ? AND api_key != '')", model.CredentialOAuth, model.CredentialAPIKey).
 		Find(&accounts)
 	if result.Error != nil {
@@ -150,40 +154,53 @@ func GetNextAccountContext(ctx context.Context, tried map[uint]struct{}) (*model
 		return nil, ErrNoAvailableAccount
 	}
 	excluded := make(map[uint]struct{}, len(tried))
+	cacheRefreshed := false
 	for {
 		pool.mu.Lock()
 		accounts := append([]model.Account(nil), pool.accounts...)
-		if len(accounts) == 0 {
-			pool.mu.Unlock()
-			return nil, ErrNoAvailableAccount
-		}
 		now := time.Now()
 		start := pool.index
 		var account *model.Account
+		selectedPosition := 0
+		bestPriority := int(^uint(0) >> 1)
 		for offset := 0; offset < len(accounts); offset++ {
 			position := int((start + uint64(offset)) % uint64(len(accounts)))
 			candidate := accounts[position]
 			if _, alreadyTried := tried[candidate.ID]; alreadyTried {
 				continue
 			}
-			if _, alreadyExcluded := excluded[candidate.ID]; alreadyExcluded || !isAccountHealthy(candidate, now) {
+			if _, alreadyExcluded := excluded[candidate.ID]; alreadyExcluded {
 				continue
 			}
-			// Reserve the position that was actually selected, not merely the
-			// position after the previous start. This preserves fairness when
-			// cached cooldowns skip one or more accounts.
-			pool.index = uint64(position+1) % uint64(len(accounts))
+			priority := accountSchedulingPriority(candidate, now)
+			if priority < 0 || priority >= bestPriority {
+				continue
+			}
+			bestPriority = priority
+			selectedPosition = position
 			account = &candidate
-			break
+		}
+		if account != nil {
+			// Keep round-robin fairness within the best scheduling tier.
+			pool.index = uint64(selectedPosition+1) % uint64(len(accounts))
 		}
 		pool.mu.Unlock()
 		if account == nil {
+			if !cacheRefreshed {
+				cacheRefreshed = true
+				if err := pool.refreshContext(ctx); err == nil {
+					excluded = make(map[uint]struct{}, len(tried))
+					continue
+				} else if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+			}
 			return nil, ErrNoAvailableAccount
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if account.ID != 0 && !accountHealthCurrentContext(ctx, account) {
+		if account.ID != 0 && !accountSchedulingCurrentContext(ctx, account) {
 			excluded[account.ID] = struct{}{}
 			continue
 		}
@@ -197,15 +214,7 @@ func accountAttemptLimit() int {
 	}
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
-	if len(pool.accounts) == 0 {
-		return 1
-	}
-	count := 0
-	for _, account := range pool.accounts {
-		if isAccountHealthy(account, time.Now()) {
-			count++
-		}
-	}
+	count := len(pool.accounts)
 	if count == 0 {
 		return 1
 	}
@@ -227,13 +236,20 @@ func AccountPoolReadyContext(ctx context.Context) bool {
 	if pool == nil {
 		return false
 	}
-	pool.mu.Lock()
-	accounts := append([]model.Account(nil), pool.accounts...)
-	pool.mu.Unlock()
-	now := time.Now()
-	for _, account := range accounts {
-		if isAccountHealthy(account, now) && (account.ID == 0 || accountHealthCurrentContext(ctx, &account)) {
-			return true
+	for attempt := 0; attempt < 2; attempt++ {
+		pool.mu.Lock()
+		accounts := append([]model.Account(nil), pool.accounts...)
+		pool.mu.Unlock()
+		now := time.Now()
+		for _, account := range accounts {
+			if accountSchedulingPriority(account, now) >= 0 && (account.ID == 0 || accountSchedulingCurrentContext(ctx, &account)) {
+				return true
+			}
+		}
+		if attempt == 0 {
+			if err := pool.refreshContext(ctx); err != nil {
+				return false
+			}
 		}
 	}
 	return false
@@ -246,7 +262,46 @@ func isAccountHealthy(account model.Account, now time.Time) bool {
 	return account.CooldownUntil == nil || !account.CooldownUntil.After(now)
 }
 
-func accountHealthCurrentContext(ctx context.Context, account *model.Account) bool {
+// accountSchedulingPriority keeps fresh, positive balances ahead of stale or
+// unsupported snapshots. Accounts without any snapshot are tried first once
+// so the account-level /tokens query can bootstrap them. Failed or refreshing
+// snapshots remain eligible as a lower-priority fallback instead of being
+// treated as a trustworthy balance.
+// Freshly confirmed exhausted accounts are excluded until their snapshot ages.
+func accountSchedulingPriority(account model.Account, now time.Time) int {
+	if !isAccountHealthy(account, now) {
+		return -1
+	}
+	if account.UsageCreditsStatus == UsageCreditsStateReady && usageCreditsSnapshotFresh(account, now) {
+		if account.UsageCreditsRemaining <= 0 {
+			return -1
+		}
+		return 1
+	}
+	if !account.UsageCreditsAvailable &&
+		(account.UsageCreditsStatus == "" || account.UsageCreditsStatus == UsageCreditsStateUnknown ||
+			account.UsageCreditsStatus == UsageCreditsStateNoOperation) {
+		return 0
+	}
+	return 2
+}
+
+func usageCreditsSnapshotFresh(account model.Account, now time.Time) bool {
+	if !account.UsageCreditsAvailable || account.UsageCreditsUpdatedAt == nil || account.UsageCreditsUpdatedAt.IsZero() ||
+		account.UsageCreditsCredentialRevision != account.CredentialRevision {
+		return false
+	}
+	if account.UsageCreditsPeriodEnd != nil && !account.UsageCreditsPeriodEnd.After(now) {
+		return false
+	}
+	interval, err := usageCreditsRefreshInterval()
+	if err != nil {
+		interval = defaultUsageCreditsRefreshInterval
+	}
+	return account.UsageCreditsUpdatedAt.Add(2 * interval).After(now)
+}
+
+func accountSchedulingCurrentContext(ctx context.Context, account *model.Account) bool {
 	if account == nil {
 		return false
 	}
@@ -256,7 +311,8 @@ func accountHealthCurrentContext(ctx context.Context, account *model.Account) bo
 	}
 	var latest model.Account
 	if err := db.WithContext(ctx).
-		Select("health_revision", "health_state", "cooldown_until", "last_error_class", "last_error_at", "failure_count", "reauth_required").
+		Select("credential_revision", "health_revision", "health_state", "cooldown_until", "last_error_class", "last_error_at", "failure_count", "reauth_required",
+			"usage_credits_available", "usage_credits_status", "usage_credits_remaining", "usage_credits_updated_at", "usage_credits_period_end", "usage_credits_credential_revision").
 		First(&latest, account.ID).Error; err != nil {
 		return false
 	}
@@ -267,7 +323,20 @@ func accountHealthCurrentContext(ctx context.Context, account *model.Account) bo
 	account.LastErrorAt = latest.LastErrorAt
 	account.FailureCount = latest.FailureCount
 	account.ReauthRequired = latest.ReauthRequired
-	return isAccountHealthy(*account, time.Now())
+	account.UsageCreditsAvailable = latest.UsageCreditsAvailable
+	account.UsageCreditsStatus = latest.UsageCreditsStatus
+	account.UsageCreditsRemaining = latest.UsageCreditsRemaining
+	account.UsageCreditsUpdatedAt = latest.UsageCreditsUpdatedAt
+	account.UsageCreditsPeriodEnd = latest.UsageCreditsPeriodEnd
+	account.UsageCreditsCredentialRevision = latest.UsageCreditsCredentialRevision
+	// Keep the cached credential revision on the returned copy. ApplyZencoderAuth
+	// uses a revision mismatch to merge a credential rotated by another request
+	// or instance before the copy can send an upstream request. Use a separate
+	// scheduling copy so the credit freshness check still sees the latest
+	// database revision without masking that merge boundary.
+	schedulingAccount := *account
+	schedulingAccount.CredentialRevision = latest.CredentialRevision
+	return accountSchedulingPriority(schedulingAccount, time.Now()) >= 0
 }
 
 // MarkAccountHealthy clears a transient failure after a successful upstream
@@ -518,12 +587,22 @@ func UseCredit(account *model.Account, multiplier float64) {
 // fields, so one completed stream cannot overwrite another request's OAuth
 // token or counters with a stale account copy.
 func UpdateAccountCreditsFromResponse(account *model.Account, resp *http.Response, modelMultiplier float64) {
-	if account == nil || account.ID == 0 || !validMultiplier(modelMultiplier) {
-		return
+	ctx := context.Background()
+	if resp != nil && resp.Request != nil {
+		ctx = resp.Request.Context()
 	}
+	operationID := updateAccountCreditsFromResponse(ctx, account, resp, modelMultiplier)
+	deferAccountCreditsRefresh(ctx, account, resp, operationID)
+}
+
+func updateAccountCreditsFromResponse(ctx context.Context, account *model.Account, resp *http.Response, modelMultiplier float64) string {
+	if account == nil || account.ID == 0 || !validMultiplier(modelMultiplier) {
+		return ""
+	}
+	operationID, _ := operationIDIfPresent(ctx)
 	if resp == nil || resp.Header == nil {
 		UseCredit(account, modelMultiplier)
-		return
+		return operationID
 	}
 
 	periodLimit := resp.Header.Get("Zen-Pricing-Period-Limit")
@@ -570,7 +649,7 @@ func UpdateAccountCreditsFromResponse(account *model.Account, resp *http.Respons
 	db := database.GetDB()
 	if db == nil {
 		logging.Errorf("Record gateway usage failed: %v", errDatabaseUnavailable)
-		return
+		return operationID
 	}
 	// Local counters belong to the account and must include completed requests
 	// even when a credential was rotated while a stream was in flight.
@@ -578,7 +657,6 @@ func UpdateAccountCreditsFromResponse(account *model.Account, resp *http.Respons
 	if result.Error != nil {
 		logging.Errorf("Record gateway usage failed for account %d: %v", account.ID, result.Error)
 	}
-
 	// Gateway quota values are absolute snapshots. They are written only for
 	// the credential revision that started this request and only when the
 	// pricing period is not older than the stored snapshot. Within one period,
@@ -613,6 +691,7 @@ func UpdateAccountCreditsFromResponse(account *model.Account, resp *http.Respons
 		logging.Debugf("gateway usage received: account_id=%d request_cost_present=%t period_cost_present=%t period_limit_present=%t period_end_present=%t",
 			account.ID, requestCost != "", periodCost != "", periodLimit != "", periodEnd != "")
 	}
+	return operationID
 }
 
 func boolToInt(value bool) int {

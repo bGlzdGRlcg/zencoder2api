@@ -15,12 +15,18 @@
 3. 设置积分重置时区和时间，例如 `CREDIT_RESET_TIMEZONE=Asia/Shanghai`、
    `CREDIT_RESET_AT=09:09`。时间使用 IANA 时区和 24 小时 `HH:MM`；多实例通过
    SQLite lease 只执行一次，但 SQLite 备份/恢复必须纳入运维流程。
-4. 让代理只转发 `GET /livez`、`GET /readyz`、`GET /`、`/static/*`、`/api/*` 以及需要的
+4. 使用 `USAGE_CREDITS_REFRESH_INTERVAL` 设置 usage-based Credit 自动刷新间隔，
+   默认 `15m`，允许 `1m` 至 `24h`。每个账号和定时扫描都使用 SQLite lease，
+   多实例不会并发写入同一快照；长批次扫描会续租。余额主查询是
+   `GET /api/v1/quotas/me/tokens`，不需要 operation ID，因此新账号也能直接查询。
+   旧的 operation credits 接口仅作为兼容回退；查询失败只让余额降级为未知或过期，
+   不改变账号健康状态。管理页支持单账号和全部账号手动刷新。
+5. 让代理只转发 `GET /livez`、`GET /readyz`、`GET /`、`/static/*`、`/api/*` 以及需要的
    OAuth 回调；对外部请求移除客户端传入的 `Forwarded`、`X-Forwarded-For`、
    `X-Forwarded-Proto` 和 `X-Request-ID`，由代理重新生成。当前应用不信任
    任意 forwarded header；`TRUSTED_PROXIES` 必须只列出实际代理的 IP/CIDR，
    代理必须是唯一入口并绑定内网地址。留空表示完全不信任 forwarded header。
-5. TLS 最低使用 TLS 1.2，优先 TLS 1.3；启用
+6. TLS 最低使用 TLS 1.2，优先 TLS 1.3；启用
    `Strict-Transport-Security: max-age=31536000; includeSubDomains`
    （确认所有子域都支持 HTTPS 后再加 `preload`）。证书私钥只放在代理的
    secret store，配置自动续期和失效告警。

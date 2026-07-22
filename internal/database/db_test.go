@@ -123,6 +123,9 @@ func TestInitAddsCodeVerifierToVersionOneDatabase(t *testing.T) {
 	if !GetDB().Migrator().HasColumn(&model.OAuthSession{}, "code_verifier") {
 		t.Fatal("version 2 migration did not add OAuth session code_verifier")
 	}
+	if !GetDB().Migrator().HasColumn(&model.Account{}, "usage_credits_period_end") {
+		t.Fatal("version 4 migration did not add usage credit period end")
+	}
 	session := model.OAuthSession{
 		State:        "state",
 		CodeVerifier: "verifier",

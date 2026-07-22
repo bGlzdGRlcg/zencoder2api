@@ -21,7 +21,7 @@ import (
 var DB *gorm.DB
 
 const (
-	currentSchemaVersion       = 2
+	currentSchemaVersion       = 4
 	migrationBusyTimeoutMillis = 30000
 	runtimeBusyTimeoutMillis   = 5000
 	migrationLeaseDuration     = 10 * time.Minute
@@ -129,6 +129,18 @@ func runSchemaMigrations(db *gorm.DB) error {
 			}
 			version = 2
 		}
+		if version < 3 {
+			if err := migrateSchemaVersionThree(tx); err != nil {
+				return err
+			}
+			version = 3
+		}
+		if version < 4 {
+			if err := migrateSchemaVersionFour(tx); err != nil {
+				return err
+			}
+			version = 4
+		}
 		completed := tx.Exec(`UPDATE zencoder_schema_migrations
 			SET version = ?, holder = '', lease_until = ?, updated_at = ?
 			WHERE id = 1 AND holder = ?`, version, time.Now().UTC(), time.Now().UTC(), holder)
@@ -187,6 +199,25 @@ func migrateSchemaVersionTwo(db *gorm.DB) error {
 	}
 	if err := db.Migrator().AddColumn(&model.OAuthSession{}, "CodeVerifier"); err != nil {
 		return fmt.Errorf("add OAuth session verifier: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaVersionThree(db *gorm.DB) error {
+	if err := db.AutoMigrate(&model.Account{}); err != nil {
+		return fmt.Errorf("migrate usage-based credit snapshot: %w", err)
+	}
+	if err := db.Model(&model.Account{}).
+		Where("usage_credits_status = '' OR usage_credits_status IS NULL").
+		Update("usage_credits_status", "unknown").Error; err != nil {
+		return fmt.Errorf("initialize usage-based credit status: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaVersionFour(db *gorm.DB) error {
+	if err := db.AutoMigrate(&model.Account{}); err != nil {
+		return fmt.Errorf("migrate usage-based credit period: %w", err)
 	}
 	return nil
 }

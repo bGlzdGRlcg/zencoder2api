@@ -174,6 +174,17 @@ func zencoderAuthBaseURL() string {
 // ApplyZencoderAuth applies exactly one Gateway credential. OAuth accounts use
 // Bearer while Zen CLI API-key accounts use zencoder-api-key.
 func ApplyZencoderAuth(ctx context.Context, req *http.Request, account *model.Account) error {
+	return applyZencoderAuth(ctx, req, account, true)
+}
+
+// applyZencoderAuthWithoutHealthMutation is used by optional background requests.
+// It still refreshes an expired OAuth token, but a failed refresh cannot mark
+// the account unhealthy or require re-authentication.
+func applyZencoderAuthWithoutHealthMutation(ctx context.Context, req *http.Request, account *model.Account) error {
+	return applyZencoderAuth(ctx, req, account, false)
+}
+
+func applyZencoderAuth(ctx context.Context, req *http.Request, account *model.Account, refreshFailureAffectsHealth bool) error {
 	if err := ensureAccountUsable(ctx, account); err != nil {
 		return err
 	}
@@ -187,11 +198,11 @@ func ApplyZencoderAuth(ctx context.Context, req *http.Request, account *model.Ac
 		if strings.TrimSpace(account.APIKey) != "" {
 			return errors.New("OAuth account contains an API key")
 		}
-		accessToken, err := GetAccessToken(ctx, account)
+		accessToken, err := getAccessTokenWithHealthMode(ctx, account, refreshFailureAffectsHealth)
 		if err != nil {
 			return err
 		}
-		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
 		return nil
 	case model.CredentialAPIKey:
 		if strings.TrimSpace(account.AccessToken) != "" || strings.TrimSpace(account.RefreshToken) != "" {
@@ -214,6 +225,10 @@ func ApplyZencoderAuth(ctx context.Context, req *http.Request, account *model.Ac
 // GetAccessToken returns a valid OAuth access token, refreshing it when it is
 // expired or will expire within one minute.
 func GetAccessToken(ctx context.Context, account *model.Account) (string, error) {
+	return getAccessTokenWithHealthMode(ctx, account, true)
+}
+
+func getAccessTokenWithHealthMode(ctx context.Context, account *model.Account, refreshFailureAffectsHealth bool) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -255,13 +270,24 @@ func GetAccessToken(ctx context.Context, account *model.Account) (string, error)
 	if account.ID == 0 {
 		return refreshTransientOAuthAccount(ctx, account)
 	}
-	return refreshStoredOAuthAccount(ctx, account)
+	return refreshStoredOAuthAccount(ctx, account, refreshFailureAffectsHealth)
 }
 
 // ForceOAuthRefresh performs the single recovery refresh allowed after a
 // Gateway 401. It is deliberately separate from normal expiry checks so a
 // still-dated but revoked access token can be recovered once.
 func ForceOAuthRefresh(ctx context.Context, account *model.Account) error {
+	return forceOAuthRefresh(ctx, account, true)
+}
+
+// forceOAuthRefreshWithoutHealthMutation gives optional background requests a
+// single recovery attempt without allowing a billing endpoint to disable an
+// otherwise usable inference credential.
+func forceOAuthRefreshWithoutHealthMutation(ctx context.Context, account *model.Account) error {
+	return forceOAuthRefresh(ctx, account, false)
+}
+
+func forceOAuthRefresh(ctx context.Context, account *model.Account, refreshFailureAffectsHealth bool) error {
 	if account == nil || account.CredentialType != model.CredentialOAuth {
 		return errors.New("account is not a Zencoder OAuth account")
 	}
@@ -280,7 +306,7 @@ func ForceOAuthRefresh(ctx context.Context, account *model.Account) error {
 			return ErrCredentialInvalidated
 		}
 	}
-	_, err := GetAccessToken(ctx, account)
+	_, err := getAccessTokenWithHealthMode(ctx, account, refreshFailureAffectsHealth)
 	return err
 }
 
@@ -335,7 +361,7 @@ func refreshTransientOAuthAccount(ctx context.Context, account *model.Account) (
 	return strings.TrimSpace(tokens.AccessToken), nil
 }
 
-func refreshStoredOAuthAccount(ctx context.Context, account *model.Account) (string, error) {
+func refreshStoredOAuthAccount(ctx context.Context, account *model.Account, refreshFailureAffectsHealth bool) (string, error) {
 	db := database.GetDB()
 	if db == nil {
 		return "", errDatabaseUnavailable
@@ -394,14 +420,16 @@ func refreshStoredOAuthAccount(ctx context.Context, account *model.Account) (str
 		if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
 			return "", heartbeatErr
 		}
-		var refreshErr *oauthRefreshHTTPError
-		if errors.As(err, &refreshErr) {
-			MarkAccountFailure(account, refreshErr.statusCode, parseRetryAfter(refreshErr.retryAfter), err)
-			if refreshErr.statusCode == http.StatusBadRequest || refreshErr.statusCode == http.StatusUnauthorized {
-				markAccountReauthRequired(account, "invalid_grant")
+		if refreshFailureAffectsHealth {
+			var refreshErr *oauthRefreshHTTPError
+			if errors.As(err, &refreshErr) {
+				MarkAccountFailure(account, refreshErr.statusCode, parseRetryAfter(refreshErr.retryAfter), err)
+				if refreshErr.statusCode == http.StatusBadRequest || refreshErr.statusCode == http.StatusUnauthorized {
+					markAccountReauthRequired(account, "invalid_grant")
+				}
+			} else {
+				MarkAccountFailure(account, 0, 0, err)
 			}
-		} else {
-			MarkAccountFailure(account, 0, 0, err)
 		}
 		return "", err
 	}
@@ -423,23 +451,26 @@ func refreshStoredOAuthAccount(ctx context.Context, account *model.Account) (str
 	if err != nil {
 		return "", fmt.Errorf("encrypt refreshed refresh token: %w", err)
 	}
+	updates := map[string]interface{}{
+		"access_token":        encryptedAccessToken,
+		"refresh_token":       encryptedRefreshToken,
+		"token_expires_at":    tokens.ExpiresAt,
+		"credential_revision": gorm.Expr("credential_revision + 1"),
+		"refresh_lease_id":    "",
+		"refresh_lease_until": gorm.Expr("NULL"),
+	}
+	if refreshFailureAffectsHealth {
+		updates["health_state"] = model.AccountHealthHealthy
+		updates["cooldown_until"] = gorm.Expr("NULL")
+		updates["last_error_class"] = ""
+		updates["last_error_at"] = gorm.Expr("NULL")
+		updates["failure_count"] = 0
+		updates["reauth_required"] = false
+		updates["health_revision"] = gorm.Expr("health_revision + 1")
+	}
 	result := db.WithContext(ctx).Model(&model.Account{}).
 		Where("id = ? AND refresh_lease_id = ? AND credential_revision = ? AND health_revision = ? AND reauth_required = ?", account.ID, holder, refreshRevision, refreshHealthRevision, false).
-		Updates(map[string]interface{}{
-			"access_token":        encryptedAccessToken,
-			"refresh_token":       encryptedRefreshToken,
-			"token_expires_at":    tokens.ExpiresAt,
-			"health_state":        model.AccountHealthHealthy,
-			"cooldown_until":      gorm.Expr("NULL"),
-			"last_error_class":    "",
-			"last_error_at":       gorm.Expr("NULL"),
-			"failure_count":       0,
-			"reauth_required":     false,
-			"health_revision":     gorm.Expr("health_revision + 1"),
-			"credential_revision": gorm.Expr("credential_revision + 1"),
-			"refresh_lease_id":    "",
-			"refresh_lease_until": gorm.Expr("NULL"),
-		})
+		Updates(updates)
 	if result.Error != nil {
 		return "", fmt.Errorf("persist refreshed Zencoder OAuth token: %w", result.Error)
 	}
@@ -449,13 +480,15 @@ func refreshStoredOAuthAccount(ctx context.Context, account *model.Account) (str
 	account.AccessToken = tokens.AccessToken
 	account.RefreshToken = tokens.RefreshToken
 	account.TokenExpiresAt = tokens.ExpiresAt
-	account.HealthState = model.AccountHealthHealthy
-	account.CooldownUntil = nil
-	account.LastErrorClass = ""
-	account.LastErrorAt = nil
-	account.FailureCount = 0
-	account.ReauthRequired = false
-	account.HealthRevision++
+	if refreshFailureAffectsHealth {
+		account.HealthState = model.AccountHealthHealthy
+		account.CooldownUntil = nil
+		account.LastErrorClass = ""
+		account.LastErrorAt = nil
+		account.FailureCount = 0
+		account.ReauthRequired = false
+		account.HealthRevision++
+	}
 	account.CredentialRevision++
 	RefreshAccountPool()
 	return strings.TrimSpace(tokens.AccessToken), nil

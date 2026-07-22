@@ -19,6 +19,11 @@ type AccountHandler struct{}
 
 func NewAccountHandler() *AccountHandler { return &AccountHandler{} }
 
+type accountListItem struct {
+	model.Account
+	UsageBasedCredits service.UsageBasedCreditsDTO `json:"usage_based_credits"`
+}
+
 func (h *AccountHandler) List(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -68,8 +73,15 @@ func (h *AccountHandler) List(c *gin.Context) {
 		return
 	}
 
+	items := make([]accountListItem, 0, len(accounts))
+	for _, account := range accounts {
+		items = append(items, accountListItem{
+			Account:           account,
+			UsageBasedCredits: service.CreditSnapshotForAccount(account),
+		})
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"items": accounts,
+		"items": items,
 		"total": total,
 		"page":  page,
 		"size":  size,
@@ -266,6 +278,7 @@ func (h *AccountHandler) CreateAPIKey(c *gin.Context) {
 		return
 	}
 	service.RefreshAccountPool()
+	service.TriggerAccountCreditsRefresh(c.Request.Context(), &account, "")
 	c.JSON(http.StatusCreated, account)
 }
 
@@ -302,6 +315,14 @@ func (h *AccountHandler) RotateAPIKey(c *gin.Context) {
 		"client_id": clientID, "api_key": encrypted, "health_state": model.AccountHealthHealthy,
 		"cooldown_until": gorm.Expr("NULL"), "last_error_class": "", "last_error_at": gorm.Expr("NULL"),
 		"failure_count": 0, "reauth_required": false, "credential_revision": gorm.Expr("credential_revision + 1"), "updated_at": time.Now(),
+		"usage_credits_operation_credits": 0, "usage_credits_turns": 0,
+		"usage_credits_operation_exists": false, "usage_credits_consumed": 0,
+		"usage_credits_budget": 0, "usage_credits_remaining": 0,
+		"usage_credits_available": false, "usage_credits_status": service.UsageCreditsStateUnknown,
+		"usage_credits_updated_at": gorm.Expr("NULL"), "usage_credits_period_end": gorm.Expr("NULL"), "usage_credits_last_attempt_at": gorm.Expr("NULL"),
+		"usage_credits_operation_id": "", "usage_credits_credential_revision": 0,
+		"usage_credits_query_revision": gorm.Expr("usage_credits_query_revision + 1"),
+		"usage_credits_lease_id":       "", "usage_credits_lease_until": gorm.Expr("NULL"),
 	}
 	if name := strings.TrimSpace(req.Name); name != "" {
 		updates["o_auth_email"] = name
@@ -343,5 +364,6 @@ func (h *AccountHandler) RotateAPIKey(c *gin.Context) {
 	}
 	service.InvalidateAccount(uint(id))
 	service.RefreshAccountPool()
+	service.TriggerAccountCreditsRefresh(c.Request.Context(), &model.Account{ID: uint(id)}, "")
 	c.JSON(http.StatusOK, gin.H{"message": "API key rotated"})
 }

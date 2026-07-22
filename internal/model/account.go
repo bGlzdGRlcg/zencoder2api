@@ -46,10 +46,28 @@ type Account struct {
 	CreditRefreshTime   time.Time  `json:"credit_refresh_time"` // 积分刷新时间（来自Zen-Pricing-Period-End）
 	DailyUsed           float64    `json:"daily_used" gorm:"default:0"`
 	TotalUsed           float64    `json:"total_used" gorm:"default:0"`
-	LastResetDate       string     `json:"last_reset_date"`
-	LastUsed            time.Time  `json:"last_used"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	// UsageCredits* is the independent usage-based billing snapshot. It must
+	// never be confused with the Premium LLM-call quota fields above.
+	UsageCreditsOperationCredits   int64      `json:"-" gorm:"default:0"`
+	UsageCreditsTurns              int64      `json:"-" gorm:"default:0"`
+	UsageCreditsOperationExists    bool       `json:"-" gorm:"default:false"`
+	UsageCreditsConsumed           int64      `json:"-" gorm:"default:0"`
+	UsageCreditsBudget             int64      `json:"-" gorm:"default:0"`
+	UsageCreditsRemaining          int64      `json:"-" gorm:"default:0"`
+	UsageCreditsAvailable          bool       `json:"-" gorm:"default:false"`
+	UsageCreditsStatus             string     `json:"-" gorm:"default:'unknown';index"`
+	UsageCreditsUpdatedAt          *time.Time `json:"-"`
+	UsageCreditsPeriodEnd          *time.Time `json:"-"`
+	UsageCreditsLastAttemptAt      *time.Time `json:"-"`
+	UsageCreditsOperationID        string     `json:"-" gorm:"index"`
+	UsageCreditsCredentialRevision uint64     `json:"-" gorm:"default:0"`
+	UsageCreditsQueryRevision      uint64     `json:"-" gorm:"default:0"`
+	UsageCreditsLeaseID            string     `json:"-" gorm:"index"`
+	UsageCreditsLeaseUntil         *time.Time `json:"-" gorm:"index"`
+	LastResetDate                  string     `json:"last_reset_date"`
+	LastUsed                       time.Time  `json:"last_used"`
+	CreatedAt                      time.Time  `json:"created_at"`
+	UpdatedAt                      time.Time  `json:"updated_at"`
 }
 
 // OAuthSession persists a short-lived PKCE login so callbacks survive process

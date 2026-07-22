@@ -187,6 +187,7 @@ func (s *OAuthService) CompleteZencoderLogin(
 		logging.Errorf("Delete completed OAuth session: %v", err)
 	}
 	RefreshAccountPool()
+	TriggerAccountCreditsRefresh(ctx, account, "")
 	return OAuthCompleteResult{Account: account, Origin: session.Origin}, nil
 }
 
@@ -586,23 +587,39 @@ func upsertOAuthAccountTx(
 		TokenExpiresAt:     tokens.ExpiresAt,
 	}
 	updates := map[string]interface{}{
-		"credential_type":     model.CredentialOAuth,
-		"o_auth_provider":     provider,
-		"o_auth_email":        profile.Email,
-		"o_auth_user_id":      profile.UserID,
-		"o_auth_tenant_id":    profile.TenantID,
-		"o_auth_anonymous_id": anonymousID,
-		"access_token":        encryptedAccessToken,
-		"api_key":             "",
-		"token_expires_at":    tokens.ExpiresAt,
-		"health_state":        model.AccountHealthHealthy,
-		"cooldown_until":      gorm.Expr("NULL"),
-		"last_error_class":    "",
-		"last_error_at":       gorm.Expr("NULL"),
-		"failure_count":       0,
-		"reauth_required":     false,
-		"credential_revision": gorm.Expr("credential_revision + 1"),
-		"updated_at":          time.Now(),
+		"credential_type":                   model.CredentialOAuth,
+		"o_auth_provider":                   provider,
+		"o_auth_email":                      profile.Email,
+		"o_auth_user_id":                    profile.UserID,
+		"o_auth_tenant_id":                  profile.TenantID,
+		"o_auth_anonymous_id":               anonymousID,
+		"access_token":                      encryptedAccessToken,
+		"api_key":                           "",
+		"token_expires_at":                  tokens.ExpiresAt,
+		"health_state":                      model.AccountHealthHealthy,
+		"cooldown_until":                    gorm.Expr("NULL"),
+		"last_error_class":                  "",
+		"last_error_at":                     gorm.Expr("NULL"),
+		"failure_count":                     0,
+		"reauth_required":                   false,
+		"credential_revision":               gorm.Expr("credential_revision + 1"),
+		"usage_credits_operation_credits":   0,
+		"usage_credits_turns":               0,
+		"usage_credits_operation_exists":    false,
+		"usage_credits_consumed":            0,
+		"usage_credits_budget":              0,
+		"usage_credits_remaining":           0,
+		"usage_credits_available":           false,
+		"usage_credits_status":              UsageCreditsStateUnknown,
+		"usage_credits_updated_at":          gorm.Expr("NULL"),
+		"usage_credits_period_end":          gorm.Expr("NULL"),
+		"usage_credits_last_attempt_at":     gorm.Expr("NULL"),
+		"usage_credits_operation_id":        "",
+		"usage_credits_credential_revision": 0,
+		"usage_credits_query_revision":      gorm.Expr("usage_credits_query_revision + 1"),
+		"usage_credits_lease_id":            "",
+		"usage_credits_lease_until":         gorm.Expr("NULL"),
+		"updated_at":                        time.Now(),
 	}
 	if tokens.RefreshToken != "" {
 		updates["refresh_token"] = encryptedRefreshToken

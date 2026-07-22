@@ -1498,6 +1498,12 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .admin-password-input { padding-right: 3rem; }
 .admin-icon-button { min-width: 2.75rem; min-height: 2.75rem; display: inline-flex; align-items: center; justify-content: center; }
 .account-action-button { min-width: 2.75rem; min-height: 2.75rem; display: inline-flex; align-items: center; justify-content: center; touch-action: manipulation; }
+.credit-refresh-button { color: var(--color-blue-600); }
+.usage-credit-cell { min-width: 11.25rem; }
+.usage-credit-detail { overflow-wrap: anywhere; }
+.usage-credit-stale { color: #b45309; }
+.dark .credit-refresh-button { color: var(--color-blue-400); }
+.dark .usage-credit-stale { color: #fbbf24; }
 .account-select-control { min-width: 2.75rem; min-height: 2.75rem; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; touch-action: manipulation; }
 .admin-toast-container { position: fixed; top: 1rem; right: 1rem; left: 1rem; z-index: 50; display: flex; flex-direction: column; align-items: flex-end; gap: .5rem; pointer-events: none; }
 .admin-toast { max-width: min(24rem, 100%); overflow-wrap: anywhere; }
@@ -1512,6 +1518,11 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 
 @media (min-width: 640px) {
   .admin-toast-container { left: auto; }
+}
+
+@media (hover: hover) {
+  .credit-refresh-button:hover { color: var(--color-blue-700); background: var(--color-blue-50); }
+  .dark .credit-refresh-button:hover { background: rgb(30 58 138 / 20%); }
 }
 
 @media (max-width: 639px) {
