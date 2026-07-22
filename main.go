@@ -176,6 +176,10 @@ func loadServerConfig() (serverConfig, error) {
 	if err != nil {
 		return serverConfig{}, err
 	}
+	allowWeakCredentials, err := parseOptionalBool("ALLOW_WEAK_CREDENTIALS")
+	if err != nil {
+		return serverConfig{}, err
+	}
 
 	bindAddress := strings.TrimSpace(os.Getenv("BIND_ADDRESS"))
 	if bindAddress == "" {
@@ -216,10 +220,16 @@ func loadServerConfig() (serverConfig, error) {
 			return serverConfig{}, err
 		}
 	}
-	if err := validateCredential("AUTH_TOKEN", authToken); err != nil {
+	if allowWeakCredentials && !isLoopbackAddress(bindAddress) {
+		parsed, _ := url.Parse(publicBaseURL)
+		if !isLoopbackHost(parsed.Hostname()) {
+			return serverConfig{}, fmt.Errorf("ALLOW_WEAK_CREDENTIALS requires a loopback BIND_ADDRESS or PUBLIC_BASE_URL")
+		}
+	}
+	if err := validateCredential("AUTH_TOKEN", authToken, allowWeakCredentials); err != nil {
 		return serverConfig{}, err
 	}
-	if err := validateCredential("ADMIN_PASSWORD", adminPassword); err != nil {
+	if err := validateCredential("ADMIN_PASSWORD", adminPassword, allowWeakCredentials); err != nil {
 		return serverConfig{}, err
 	}
 	if authToken != "" && constantTimeStringEqual(authToken, adminPassword) {
@@ -383,7 +393,7 @@ func isLoopbackAddress(address string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func validateCredential(name, value string) error {
+func validateCredential(name, value string, allowWeak bool) error {
 	if value == "" {
 		return nil
 	}
@@ -393,7 +403,7 @@ func validateCredential(name, value string) error {
 	if strings.IndexFunc(value, unicode.IsSpace) >= 0 {
 		return fmt.Errorf("%s must not contain whitespace", name)
 	}
-	if len(value) < minimumCredentialLength {
+	if !allowWeak && len(value) < minimumCredentialLength {
 		return fmt.Errorf("%s must contain at least %d characters", name, minimumCredentialLength)
 	}
 	return nil

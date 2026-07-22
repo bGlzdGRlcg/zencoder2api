@@ -22,6 +22,7 @@ func setValidServerEnvironment(t *testing.T) {
 	t.Setenv("PORT", "8080")
 	t.Setenv("PUBLIC_BASE_URL", "")
 	t.Setenv("ALLOW_INSECURE_LOCALHOST", "false")
+	t.Setenv("ALLOW_WEAK_CREDENTIALS", "false")
 	t.Setenv("MAX_REQUEST_BODY_BYTES", "4194304")
 	t.Setenv("MAX_CONCURRENT_REQUESTS", "32")
 	t.Setenv("TRUSTED_PROXIES", "")
@@ -112,12 +113,37 @@ func TestUsageCreditsRefreshConfigurationFailsClosed(t *testing.T) {
 	}
 }
 
-
 func TestLoadServerConfigRejectsCredentialWhitespace(t *testing.T) {
 	setValidServerEnvironment(t)
 	t.Setenv("AUTH_TOKEN", "token with spaces-123456")
 	if _, err := loadServerConfig(); err == nil {
 		t.Fatal("expected whitespace credential error")
+	}
+}
+
+func TestLoadServerConfigRequiresExplicitWeakCredentialOptIn(t *testing.T) {
+	setValidServerEnvironment(t)
+	t.Setenv("AUTH_TOKEN", "hajimi")
+	t.Setenv("ADMIN_PASSWORD", "antioai")
+	if _, err := loadServerConfig(); err == nil {
+		t.Fatal("expected short credentials to be rejected by default")
+	}
+
+	t.Setenv("ALLOW_WEAK_CREDENTIALS", "true")
+	if _, err := loadServerConfig(); err != nil {
+		t.Fatalf("explicit weak credential opt-in failed: %v", err)
+	}
+}
+
+func TestLoadServerConfigRejectsWeakCredentialsForPublicURL(t *testing.T) {
+	setValidServerEnvironment(t)
+	t.Setenv("AUTH_TOKEN", "hajimi")
+	t.Setenv("ADMIN_PASSWORD", "antioai")
+	t.Setenv("ALLOW_WEAK_CREDENTIALS", "true")
+	t.Setenv("BIND_ADDRESS", "0.0.0.0")
+	t.Setenv("PUBLIC_BASE_URL", "https://proxy.example.test")
+	if _, err := loadServerConfig(); err == nil {
+		t.Fatal("expected weak credentials with a public URL to be rejected")
 	}
 }
 
