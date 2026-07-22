@@ -28,9 +28,10 @@ const (
 )
 
 type AccountPool struct {
-	mu       sync.Mutex
-	accounts []model.Account
-	index    uint64
+	mu        sync.Mutex
+	refreshMu sync.Mutex
+	accounts  []model.Account
+	index     uint64
 }
 
 var pool *AccountPool
@@ -106,6 +107,12 @@ func (p *AccountPool) refresh() error {
 }
 
 func (p *AccountPool) refreshContext(ctx context.Context) error {
+	// Serialize full snapshots so an older, slower query cannot publish after
+	// a newer refresh. Incremental health/credit updates remain lock-free with
+	// respect to the database query and are merged below by their revisions.
+	p.refreshMu.Lock()
+	defer p.refreshMu.Unlock()
+
 	db := database.GetDB()
 	if db == nil {
 		return errDatabaseUnavailable
@@ -119,6 +126,7 @@ func (p *AccountPool) refreshContext(ctx context.Context) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	mergeAccountPoolRuntime(accounts, p.accounts)
 	p.accounts = accounts
 	if len(p.accounts) == 0 {
 		p.index = 0
@@ -126,6 +134,47 @@ func (p *AccountPool) refreshContext(ctx context.Context) error {
 		p.index %= uint64(len(p.accounts))
 	}
 	return nil
+}
+
+func mergeAccountPoolRuntime(accounts, cached []model.Account) {
+	if len(accounts) == 0 || len(cached) == 0 {
+		return
+	}
+	byID := make(map[uint]model.Account, len(cached))
+	for _, account := range cached {
+		if account.ID != 0 {
+			byID[account.ID] = account
+		}
+	}
+	for index := range accounts {
+		current, ok := byID[accounts[index].ID]
+		if !ok {
+			continue
+		}
+		if current.CredentialRevision > accounts[index].CredentialRevision {
+			accounts[index] = current
+			continue
+		}
+		if current.CredentialRevision != accounts[index].CredentialRevision {
+			continue
+		}
+		if current.HealthRevision > accounts[index].HealthRevision {
+			copyAccountHealthState(&accounts[index], current)
+		}
+		if usageCreditsSnapshotNewer(current, accounts[index]) {
+			copyUsageCreditsState(&accounts[index], current)
+		}
+	}
+}
+
+func copyAccountHealthState(dst *model.Account, src model.Account) {
+	dst.HealthRevision = src.HealthRevision
+	dst.HealthState = src.HealthState
+	dst.CooldownUntil = src.CooldownUntil
+	dst.LastErrorClass = src.LastErrorClass
+	dst.LastErrorAt = src.LastErrorAt
+	dst.FailureCount = src.FailureCount
+	dst.ReauthRequired = src.ReauthRequired
 }
 
 // GetNextAccount selects OAuth accounts in round-robin order. Accounts are
@@ -312,7 +361,7 @@ func accountSchedulingCurrentContext(ctx context.Context, account *model.Account
 	var latest model.Account
 	if err := db.WithContext(ctx).
 		Select("credential_revision", "health_revision", "health_state", "cooldown_until", "last_error_class", "last_error_at", "failure_count", "reauth_required",
-			"usage_credits_available", "usage_credits_status", "usage_credits_remaining", "usage_credits_updated_at", "usage_credits_period_end", "usage_credits_credential_revision").
+			"usage_credits_available", "usage_credits_status", "usage_credits_source", "usage_credits_remaining", "usage_credits_updated_at", "usage_credits_period_end", "usage_credits_credential_revision").
 		First(&latest, account.ID).Error; err != nil {
 		return false
 	}
@@ -325,6 +374,7 @@ func accountSchedulingCurrentContext(ctx context.Context, account *model.Account
 	account.ReauthRequired = latest.ReauthRequired
 	account.UsageCreditsAvailable = latest.UsageCreditsAvailable
 	account.UsageCreditsStatus = latest.UsageCreditsStatus
+	account.UsageCreditsSource = latest.UsageCreditsSource
 	account.UsageCreditsRemaining = latest.UsageCreditsRemaining
 	account.UsageCreditsUpdatedAt = latest.UsageCreditsUpdatedAt
 	account.UsageCreditsPeriodEnd = latest.UsageCreditsPeriodEnd
@@ -536,13 +586,7 @@ func updatePoolHealth(account model.Account) {
 			if pool.accounts[i].CredentialRevision != account.CredentialRevision || pool.accounts[i].HealthRevision > account.HealthRevision {
 				continue
 			}
-			pool.accounts[i].HealthRevision = account.HealthRevision
-			pool.accounts[i].HealthState = account.HealthState
-			pool.accounts[i].CooldownUntil = account.CooldownUntil
-			pool.accounts[i].LastErrorClass = account.LastErrorClass
-			pool.accounts[i].LastErrorAt = account.LastErrorAt
-			pool.accounts[i].FailureCount = account.FailureCount
-			pool.accounts[i].ReauthRequired = account.ReauthRequired
+			copyAccountHealthState(&pool.accounts[i], account)
 		}
 	}
 }

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -151,6 +152,11 @@ func TestNonStreamingCreditRefreshRecordsOperationBeforeBodyAndQueuesAfterEOF(t 
 	if want := operationIDFromContext(ctx); stored.UsageCreditsOperationID != want {
 		t.Fatalf("operation ID = %q before body read, want %q", stored.UsageCreditsOperationID, want)
 	}
+	refreshAccount := stored
+	refreshRevision, claimed, err := claimCreditRefreshLease(context.Background(), refreshAccount, "", "body-holder")
+	if err != nil || !claimed {
+		t.Fatalf("claiming in-flight refresh: revision=%d claimed=%t err=%v", refreshRevision, claimed, err)
+	}
 	if len(queue) != 0 {
 		t.Fatal("credit query was queued before the response body completed")
 	}
@@ -166,6 +172,19 @@ func TestNonStreamingCreditRefreshRecordsOperationBeforeBodyAndQueuesAfterEOF(t 
 	}
 	if len(queue) != 1 {
 		t.Fatalf("queued credit queries = %d, want 1", len(queue))
+	}
+	var after model.Account
+	if err := database.GetDB().First(&after, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.UsageCreditsQueryRevision != refreshRevision+1 || after.UsageCreditsLeaseID != "" ||
+		after.UsageCreditsStatus != UsageCreditsStateUnknown {
+		t.Fatalf("body completion did not supersede the in-flight refresh: %#v", after)
+	}
+	if err := persistTokenCreditSnapshot(context.Background(), refreshAccount, "body-holder", refreshRevision, parsedTokenCredits{
+		Consumed: 1, Budget: 10, Remaining: 9,
+	}); !errors.Is(err, errCreditRefreshSuperseded) {
+		t.Fatalf("in-flight body refresh CAS error = %v, want superseded", err)
 	}
 }
 
@@ -184,7 +203,7 @@ func TestCreditNoOperationCASDoesNotOverwriteNewOperation(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if _, marked, err := markCreditNoOperation(context.Background(), account); err != nil {
+	if _, marked, err := markCreditNoOperation(context.Background(), account, account.UsageCreditsQueryRevision); err != nil {
 		t.Fatal(err)
 	} else if marked {
 		t.Fatal("stale no-operation update unexpectedly won the CAS")
@@ -195,6 +214,80 @@ func TestCreditNoOperationCASDoesNotOverwriteNewOperation(t *testing.T) {
 	}
 	if stored.UsageCreditsOperationID != "new-operation" || stored.UsageCreditsStatus != UsageCreditsStateUnknown {
 		t.Fatalf("new operation was overwritten: %#v", stored)
+	}
+}
+
+func TestCreditNoOperationCASDoesNotOverwriteNewerRefresh(t *testing.T) {
+	setupCreditsTestDB(t, "no-operation-refresh-cas.db")
+	account := model.Account{
+		ClientID: "credits-no-operation-refresh-cas", CredentialType: model.CredentialAPIKey,
+		CredentialRevision: 1, UsageCreditsStatus: UsageCreditsStateError,
+		UsageCreditsQueryRevision: 1,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := time.Now().UTC()
+	if err := database.GetDB().Model(&model.Account{}).Where("id = ?", account.ID).Updates(map[string]interface{}{
+		"usage_credits_query_revision":      2,
+		"usage_credits_status":              UsageCreditsStateReady,
+		"usage_credits_available":           true,
+		"usage_credits_consumed":            30,
+		"usage_credits_budget":              100,
+		"usage_credits_remaining":           70,
+		"usage_credits_updated_at":          updatedAt,
+		"usage_credits_credential_revision": 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var latest model.Account
+	if err := database.GetDB().First(&latest, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, marked, err := markCreditNoOperation(context.Background(), latest, account.UsageCreditsQueryRevision); err != nil {
+		t.Fatal(err)
+	} else if marked {
+		t.Fatal("stale no-operation update overwrote a newer refresh")
+	}
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsQueryRevision != 2 || stored.UsageCreditsStatus != UsageCreditsStateReady ||
+		stored.UsageCreditsRemaining != 70 {
+		t.Fatalf("newer refresh was overwritten: %#v", stored)
+	}
+}
+
+func TestCreditAttemptWithoutLeaseDoesNotOverwriteNewerRefresh(t *testing.T) {
+	setupCreditsTestDB(t, "attempt-without-lease-cas.db")
+	account := model.Account{
+		ClientID: "credits-attempt-without-lease-cas", CredentialType: model.CredentialAPIKey,
+		CredentialRevision: 1, UsageCreditsStatus: UsageCreditsStateUnknown,
+		UsageCreditsQueryRevision: 1,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.GetDB().Model(&model.Account{}).Where("id = ?", account.ID).Updates(map[string]interface{}{
+		"usage_credits_query_revision": 2,
+		"usage_credits_status":         UsageCreditsStateReady,
+		"usage_credits_available":      true,
+		"usage_credits_remaining":      70,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	markCreditAttemptWithoutLease(context.Background(), account, "", UsageCreditsStateError)
+
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsQueryRevision != 2 || stored.UsageCreditsStatus != UsageCreditsStateReady ||
+		stored.UsageCreditsRemaining != 70 {
+		t.Fatalf("stale pre-lease attempt overwrote a newer refresh: %#v", stored)
 	}
 }
 
@@ -222,6 +315,239 @@ func TestRememberCreditOperationClearsPreviousOperationDetails(t *testing.T) {
 		stored.UsageCreditsConsumed != 1179 || stored.UsageCreditsRemaining != 3821 {
 		t.Fatalf("new operation did not isolate operation details: %#v", stored)
 	}
+}
+
+func TestRememberCreditOperationUsesCurrentDatabaseState(t *testing.T) {
+	setupCreditsTestDB(t, "remember-operation-current-state.db")
+	updatedAt := time.Now().UTC().Add(-time.Minute)
+	periodEnd := time.Now().UTC().Add(time.Hour)
+	account := model.Account{
+		ClientID: "remember-operation-current-state", CredentialType: model.CredentialAPIKey,
+		CredentialRevision: 1, UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+		UsageCreditsConsumed: 30, UsageCreditsBudget: 100, UsageCreditsRemaining: 70,
+		UsageCreditsUpdatedAt: &updatedAt, UsageCreditsPeriodEnd: &periodEnd,
+		UsageCreditsCredentialRevision: 1, UsageCreditsQueryRevision: 4,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	staleCopy := account
+	staleCopy.UsageCreditsAvailable = false
+	staleCopy.UsageCreditsStatus = UsageCreditsStateUnknown
+	staleCopy.UsageCreditsConsumed = 0
+	staleCopy.UsageCreditsBudget = 0
+	staleCopy.UsageCreditsRemaining = 0
+	staleCopy.UsageCreditsQueryRevision = 0
+	if !rememberCreditOperation(context.Background(), &staleCopy, "new-operation") {
+		t.Fatal("remembering the operation failed")
+	}
+
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsStatus != UsageCreditsStateStale || !stored.UsageCreditsAvailable ||
+		stored.UsageCreditsConsumed != 30 || stored.UsageCreditsBudget != 100 || stored.UsageCreditsRemaining != 70 ||
+		stored.UsageCreditsQueryRevision != 5 || stored.UsageCreditsOperationID != "new-operation" ||
+		stored.UsageCreditsPeriodEnd == nil || !stored.UsageCreditsPeriodEnd.Equal(periodEnd) {
+		t.Fatalf("stale request copy overwrote current credit state: %#v", stored)
+	}
+}
+
+func TestRememberCreditOperationSupersedesActiveRefresh(t *testing.T) {
+	setupCreditsTestDB(t, "remember-operation-active-refresh.db")
+	leaseUntil := time.Now().UTC().Add(time.Minute).In(time.FixedZone("UTC-08", -8*60*60))
+	account := model.Account{
+		ClientID: "remember-operation-active-refresh", CredentialType: model.CredentialAPIKey,
+		CredentialRevision: 1, UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateRefreshing,
+		UsageCreditsConsumed: 30, UsageCreditsBudget: 100, UsageCreditsRemaining: 70,
+		UsageCreditsCredentialRevision: 1, UsageCreditsQueryRevision: 7,
+		UsageCreditsLeaseID: "active-holder", UsageCreditsLeaseUntil: &leaseUntil,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	staleCopy := account
+	staleCopy.UsageCreditsAvailable = false
+	staleCopy.UsageCreditsStatus = UsageCreditsStateUnknown
+	if !rememberCreditOperation(context.Background(), &staleCopy, "new-operation") {
+		t.Fatal("remembering the operation failed")
+	}
+
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsStatus != UsageCreditsStateStale || stored.UsageCreditsQueryRevision != 8 ||
+		stored.UsageCreditsLeaseID != "" || stored.UsageCreditsLeaseUntil != nil ||
+		stored.UsageCreditsOperationID != "new-operation" {
+		t.Fatalf("active refresh was not superseded: %#v", stored)
+	}
+	if err := persistTokenCreditSnapshot(context.Background(), account, "active-holder", 7, parsedTokenCredits{
+		Consumed: 20, Budget: 100, Remaining: 80,
+	}); !errors.Is(err, errCreditRefreshSuperseded) {
+		t.Fatalf("old refresh CAS error = %v, want superseded", err)
+	}
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsConsumed != 30 || stored.UsageCreditsRemaining != 70 {
+		t.Fatalf("old refresh changed balance: %#v", stored)
+	}
+}
+
+func TestLateOperationCompletionCannotReplaceNewerOperation(t *testing.T) {
+	setupCreditsTestDB(t, "remember-operation-order.db")
+	account := model.Account{
+		ClientID: "remember-operation-order", CredentialType: model.CredentialAPIKey,
+		CredentialRevision: 1, UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+		UsageCreditsConsumed: 30, UsageCreditsBudget: 100, UsageCreditsRemaining: 70,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !rememberCreditOperation(context.Background(), &account, "operation-a") {
+		t.Fatal("recording operation A failed")
+	}
+	var current model.Account
+	if err := database.GetDB().First(&current, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !rememberCreditOperation(context.Background(), &current, "operation-b") {
+		t.Fatal("recording operation B failed")
+	}
+	if completeAccountCreditsOperation(context.Background(), &account, "operation-a") {
+		t.Fatal("late operation A completion overwrote operation B")
+	}
+	if err := database.GetDB().First(&current, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	revision, claimed, err := claimCreditRefreshLease(context.Background(), current, "", "operation-b-holder")
+	if err != nil || !claimed {
+		t.Fatalf("claiming operation B refresh: revision=%d claimed=%t err=%v", revision, claimed, err)
+	}
+	if completeAccountCreditsOperation(context.Background(), &account, "operation-a") {
+		t.Fatal("late operation A completion cleared operation B refresh")
+	}
+	if err := database.GetDB().First(&current, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if current.UsageCreditsOperationID != "operation-b" || current.UsageCreditsQueryRevision != revision ||
+		current.UsageCreditsLeaseID != "operation-b-holder" {
+		t.Fatalf("operation B state was changed by late A completion: %#v", current)
+	}
+	if !completeAccountCreditsOperation(context.Background(), &current, "operation-b") {
+		t.Fatal("operation B completion did not invalidate its refresh")
+	}
+}
+
+func TestCreditRefreshLeaseUsesAbsoluteTimeAcrossOffsets(t *testing.T) {
+	setupCreditsTestDB(t, "credit-refresh-lease-offset.db")
+	expired := time.Now().UTC().Add(-time.Minute).In(time.FixedZone("UTC+08", 8*60*60))
+	account := model.Account{
+		ClientID: "credit-refresh-lease-offset", CredentialType: model.CredentialAPIKey,
+		CredentialRevision: 1, UsageCreditsStatus: UsageCreditsStateRefreshing,
+		UsageCreditsQueryRevision: 3, UsageCreditsLeaseID: "expired-holder", UsageCreditsLeaseUntil: &expired,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	queryRevision, claimed, err := claimCreditRefreshLease(context.Background(), stored, "", "new-holder")
+	if err != nil || !claimed || queryRevision != 4 {
+		t.Fatalf("expired offset lease was not reclaimed: revision=%d claimed=%t err=%v", queryRevision, claimed, err)
+	}
+	releaseCreditRefreshLease(context.Background(), account.ID, "new-holder")
+}
+
+func TestReleaseCreditRefreshLeaseRestoresVisibleState(t *testing.T) {
+	setupCreditsTestDB(t, "release-credit-refresh-lease.db")
+	claimedAt := time.Now().UTC().Add(-time.Minute)
+	leaseUntil := time.Now().UTC().Add(time.Minute)
+	accounts := []model.Account{
+		{
+			ClientID: "release-available", CredentialType: model.CredentialAPIKey, APIKey: "stored-key",
+			CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+			UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateRefreshing,
+			UsageCreditsRemaining: 70, UsageCreditsQueryRevision: 1,
+			UsageCreditsLastAttemptAt: &claimedAt, UsageCreditsLeaseID: "available-holder", UsageCreditsLeaseUntil: &leaseUntil,
+		},
+		{
+			ClientID: "release-unknown", CredentialType: model.CredentialAPIKey, APIKey: "stored-key",
+			CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+			UsageCreditsStatus: UsageCreditsStateRefreshing, UsageCreditsQueryRevision: 1,
+			UsageCreditsLastAttemptAt: &claimedAt, UsageCreditsLeaseID: "unknown-holder", UsageCreditsLeaseUntil: &leaseUntil,
+		},
+		{
+			ClientID: "release-ready", CredentialType: model.CredentialAPIKey, APIKey: "stored-key",
+			CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+			UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+			UsageCreditsRemaining: 60, UsageCreditsQueryRevision: 1,
+			UsageCreditsLastAttemptAt: &claimedAt, UsageCreditsLeaseID: "ready-holder", UsageCreditsLeaseUntil: &leaseUntil,
+		},
+		{
+			ClientID: "release-wrong-holder", CredentialType: model.CredentialAPIKey, APIKey: "stored-key",
+			CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+			UsageCreditsStatus: UsageCreditsStateRefreshing, UsageCreditsQueryRevision: 1,
+			UsageCreditsLastAttemptAt: &claimedAt, UsageCreditsLeaseID: "actual-holder", UsageCreditsLeaseUntil: &leaseUntil,
+		},
+	}
+	if err := database.GetDB().Create(&accounts).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.refresh(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		pool.mu.Lock()
+		pool.accounts = nil
+		pool.index = 0
+		pool.mu.Unlock()
+	})
+
+	releaseCreditRefreshLease(context.Background(), accounts[0].ID, "available-holder")
+	releaseCreditRefreshLease(context.Background(), accounts[1].ID, "unknown-holder")
+	releaseCreditRefreshLease(context.Background(), accounts[2].ID, "ready-holder")
+	releaseCreditRefreshLease(context.Background(), accounts[3].ID, "wrong-holder")
+
+	var stored []model.Account
+	if err := database.GetDB().Order("id").Find(&stored).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 4 {
+		t.Fatalf("stored accounts = %d, want 4", len(stored))
+	}
+	if stored[0].UsageCreditsStatus != UsageCreditsStateStale || stored[0].UsageCreditsLeaseID != "" ||
+		stored[0].UsageCreditsLeaseUntil != nil || stored[0].UsageCreditsLastAttemptAt == nil ||
+		!stored[0].UsageCreditsLastAttemptAt.After(claimedAt) {
+		t.Fatalf("available snapshot lease was not released safely: %#v", stored[0])
+	}
+	if stored[1].UsageCreditsStatus != UsageCreditsStateUnknown || stored[1].UsageCreditsLeaseID != "" || stored[1].UsageCreditsLeaseUntil != nil {
+		t.Fatalf("unknown snapshot lease was not released safely: %#v", stored[1])
+	}
+	if stored[2].UsageCreditsStatus != UsageCreditsStateReady || stored[2].UsageCreditsLeaseID != "" || stored[2].UsageCreditsLeaseUntil != nil {
+		t.Fatalf("non-refreshing state was changed while releasing lease: %#v", stored[2])
+	}
+	if stored[3].UsageCreditsStatus != UsageCreditsStateRefreshing || stored[3].UsageCreditsLeaseID != "actual-holder" || stored[3].UsageCreditsLeaseUntil == nil {
+		t.Fatalf("mismatched holder changed the lease: %#v", stored[3])
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	for _, cached := range pool.accounts {
+		if cached.ID == accounts[0].ID {
+			if cached.UsageCreditsStatus != UsageCreditsStateStale || cached.UsageCreditsLeaseID != "" {
+				t.Fatalf("released lease was not published to pool: %#v", cached)
+			}
+			return
+		}
+	}
+	t.Fatal("released account missing from pool")
 }
 
 func TestCreditRefreshFailureDoesNotChangeAccountHealth(t *testing.T) {
@@ -644,6 +970,10 @@ func TestCreditCleanupContextDetachesCancellationWithBoundedDeadline(t *testing.
 
 func setupCreditsTestDB(t *testing.T, name string) {
 	t.Helper()
+	pool.mu.Lock()
+	pool.accounts = nil
+	pool.index = 0
+	pool.mu.Unlock()
 	if err := database.Init(filepath.Join(t.TempDir(), name)); err != nil {
 		t.Fatal(err)
 	}

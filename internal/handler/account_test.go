@@ -105,6 +105,7 @@ func TestAPIKeyCreateAndRotateStayEncrypted(t *testing.T) {
 		"usage_credits_query_revision": 20,
 		"usage_credits_available":      true,
 		"usage_credits_status":         "ready",
+		"usage_credits_source":         "tokens",
 		"usage_credits_remaining":      4992,
 		"usage_credits_operation_id":   "old-operation",
 		"usage_credits_lease_id":       "old-holder",
@@ -142,7 +143,7 @@ func TestAPIKeyCreateAndRotateStayEncrypted(t *testing.T) {
 	if account.CredentialRevision != 2 || account.UsageCreditsQueryRevision != 21 {
 		t.Fatalf("rotation revisions = credential:%d credits:%d, want 2 and 21", account.CredentialRevision, account.UsageCreditsQueryRevision)
 	}
-	if account.UsageCreditsAvailable || account.UsageCreditsStatus != "unknown" || account.UsageCreditsRemaining != 0 ||
+	if account.UsageCreditsAvailable || account.UsageCreditsStatus != "unknown" || account.UsageCreditsSource != "" || account.UsageCreditsRemaining != 0 ||
 		account.UsageCreditsOperationID != "" || account.UsageCreditsLeaseID != "" {
 		t.Fatalf("rotation retained the previous credential's credit snapshot: %+v", account)
 	}

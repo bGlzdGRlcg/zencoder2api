@@ -48,14 +48,17 @@ type Account struct {
 	TotalUsed           float64    `json:"total_used" gorm:"default:0"`
 	// UsageCredits* is the independent usage-based billing snapshot. It must
 	// never be confused with the Premium LLM-call quota fields above.
-	UsageCreditsOperationCredits   int64      `json:"-" gorm:"default:0"`
-	UsageCreditsTurns              int64      `json:"-" gorm:"default:0"`
-	UsageCreditsOperationExists    bool       `json:"-" gorm:"default:false"`
-	UsageCreditsConsumed           int64      `json:"-" gorm:"default:0"`
-	UsageCreditsBudget             int64      `json:"-" gorm:"default:0"`
-	UsageCreditsRemaining          int64      `json:"-" gorm:"default:0"`
-	UsageCreditsAvailable          bool       `json:"-" gorm:"default:false"`
-	UsageCreditsStatus             string     `json:"-" gorm:"default:'unknown';index"`
+	UsageCreditsOperationCredits int64  `json:"-" gorm:"default:0"`
+	UsageCreditsTurns            int64  `json:"-" gorm:"default:0"`
+	UsageCreditsOperationExists  bool   `json:"-" gorm:"default:false"`
+	UsageCreditsConsumed         int64  `json:"-" gorm:"default:0"`
+	UsageCreditsBudget           int64  `json:"-" gorm:"default:0"`
+	UsageCreditsRemaining        int64  `json:"-" gorm:"default:0"`
+	UsageCreditsAvailable        bool   `json:"-" gorm:"default:false"`
+	UsageCreditsStatus           string `json:"-" gorm:"default:'unknown';index"`
+	// UsageCreditsSource identifies which endpoint supplied the account-level balance.
+	// An empty value means the provenance is unknown (for pre-v5 rows).
+	UsageCreditsSource             string     `json:"-" gorm:"default:''"`
 	UsageCreditsUpdatedAt          *time.Time `json:"-"`
 	UsageCreditsPeriodEnd          *time.Time `json:"-"`
 	UsageCreditsLastAttemptAt      *time.Time `json:"-"`

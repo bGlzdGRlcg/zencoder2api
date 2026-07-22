@@ -2,6 +2,9 @@
 
 ## Unreleased - 2026-07-19
 
+- 修复并发 LLM 请求期间旧 Credit 查询覆盖新余额的问题；请求完成会废弃在途快照，
+  `/tokens` 与 legacy operation 余额按来源隔离，并增加 SQLite v5 迁移与回归测试；
+  无法从历史数据判定来源的旧快照保持未知状态。
 - 对照 VSIX 3.4.1、JetBrains 3.31.0 和 Zenflow 2.3.5 完成 Provider Gateway
   端点、认证 header、OAuth 和协议转换审计。
 - 修复 Zencoder OAuth：加密持久化 PKCE verifier，按 provider 分流 WorkOS/Frontegg

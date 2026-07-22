@@ -30,9 +30,11 @@ const (
 	UsageCreditsStateError       = "error"
 	UsageCreditsStateStale       = "stale"
 
-	creditRefreshQueueSize = 64
-	maxCreditResponseBytes = 1 << 20
-	creditCleanupTimeout   = 5 * time.Second
+	creditRefreshQueueSize      = 64
+	maxCreditResponseBytes      = 1 << 20
+	creditCleanupTimeout        = 5 * time.Second
+	usageCreditsSourceTokens    = "tokens"
+	usageCreditsSourceOperation = "operation"
 )
 
 var (
@@ -69,10 +71,11 @@ type UsageBasedCreditsDTO struct {
 }
 
 type CreditRefreshResult struct {
-	AccountID   uint                 `json:"account_id"`
-	Snapshot    UsageBasedCreditsDTO `json:"usage_based_credits"`
-	OperationID string               `json:"-"`
-	Err         error                `json:"-"`
+	AccountID       uint                 `json:"account_id"`
+	Snapshot        UsageBasedCreditsDTO `json:"usage_based_credits"`
+	OperationID     string               `json:"-"`
+	Err             error                `json:"-"`
+	attemptRevision uint64
 }
 
 type creditRefreshJob struct {
@@ -81,12 +84,19 @@ type creditRefreshJob struct {
 
 type accountCreditsRefreshBody struct {
 	io.ReadCloser
-	account *model.Account
-	once    sync.Once
+	account     *model.Account
+	ctx         context.Context
+	operationID string
+	once        sync.Once
 }
 
 func (body *accountCreditsRefreshBody) queueRefresh() {
 	body.once.Do(func() {
+		if body.operationID != "" {
+			// The response body is the completion boundary. A refresh that started
+			// while the upstream request was still running must be superseded too.
+			completeAccountCreditsOperation(body.ctx, body.account, body.operationID)
+		}
 		enqueueAccountCreditsRefresh(body.account)
 	})
 }
@@ -100,8 +110,9 @@ func (body *accountCreditsRefreshBody) Read(data []byte) (int, error) {
 }
 
 func (body *accountCreditsRefreshBody) Close() error {
+	err := body.ReadCloser.Close()
 	body.queueRefresh()
-	return body.ReadCloser.Close()
+	return err
 }
 
 func deferAccountCreditsRefresh(ctx context.Context, account *model.Account, resp *http.Response, operationID string) {
@@ -119,8 +130,10 @@ func deferAccountCreditsRefresh(ctx context.Context, account *model.Account, res
 		return
 	}
 	resp.Body = &accountCreditsRefreshBody{
-		ReadCloser: resp.Body,
-		account:    account,
+		ReadCloser:  resp.Body,
+		account:     account,
+		ctx:         ctx,
+		operationID: operationID,
 	}
 }
 
@@ -319,7 +332,7 @@ func RefreshAccountCredits(ctx context.Context, accountID uint) (CreditRefreshRe
 	// Older gateways may not expose /tokens. If no operation exists yet,
 	// preserve that distinction instead of reporting an optional endpoint
 	// failure; the next completed request will attach an operation ID.
-	if _, marked, markErr := markCreditNoOperation(ctx, account); markErr != nil {
+	if _, marked, markErr := markCreditNoOperation(ctx, account, tokenResult.attemptRevision); markErr != nil {
 		return tokenResult, markErr
 	} else if marked {
 		tokenResult.Snapshot = loadCreditSnapshot(context.WithoutCancel(ctx), account.ID, account)
@@ -344,20 +357,22 @@ func creditHTTPStatus(err error) int {
 	return 0
 }
 
-func markCreditNoOperation(ctx context.Context, account model.Account) (*time.Time, bool, error) {
+func markCreditNoOperation(ctx context.Context, account model.Account, attemptRevision uint64) (*time.Time, bool, error) {
 	db := database.GetDB()
 	if db == nil {
 		return nil, false, errDatabaseUnavailable
 	}
 	now := time.Now().UTC()
 	result := db.WithContext(ctx).Model(&model.Account{}).
-		Where("id = ? AND credential_revision = ? AND (usage_credits_operation_id IS NULL OR usage_credits_operation_id = '')", account.ID, account.CredentialRevision).
+		Where("id = ? AND credential_revision = ? AND usage_credits_query_revision = ? AND (usage_credits_operation_id IS NULL OR usage_credits_operation_id = '')",
+			account.ID, account.CredentialRevision, attemptRevision).
 		Updates(map[string]interface{}{
 			"usage_credits_status":            UsageCreditsStateNoOperation,
 			"usage_credits_operation_credits": 0,
 			"usage_credits_turns":             0,
 			"usage_credits_operation_exists":  false,
 			"usage_credits_last_attempt_at":   now,
+			"usage_credits_query_revision":    gorm.Expr("usage_credits_query_revision + 1"),
 		})
 	if result.Error != nil {
 		return nil, false, result.Error
@@ -450,6 +465,15 @@ func rememberAccountCreditsOperation(ctx context.Context, account *model.Account
 	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	return rememberCreditOperation(recordCtx, account, operationID)
+}
+
+func completeAccountCreditsOperation(ctx context.Context, account *model.Account, operationID string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	return completeCreditOperation(recordCtx, account, operationID)
 }
 
 func enqueueAccountCreditsRefresh(account *model.Account) {
@@ -578,39 +602,53 @@ func runUsageCreditsWorker(workerCtx context.Context, queue <-chan creditRefresh
 }
 
 func rememberCreditOperation(ctx context.Context, account *model.Account, operationID string) bool {
+	return updateCreditOperation(ctx, account, operationID, "")
+}
+
+func completeCreditOperation(ctx context.Context, account *model.Account, operationID string) bool {
+	return updateCreditOperation(ctx, account, "", operationID)
+}
+
+func updateCreditOperation(ctx context.Context, account *model.Account, operationID, expectedOperationID string) bool {
 	db := database.GetDB()
 	if db == nil {
 		return false
 	}
-	state := UsageCreditsStateUnknown
-	if account.UsageCreditsAvailable {
-		state = UsageCreditsStateStale
+	query := db.WithContext(ctx).Model(&model.Account{}).
+		Where("id = ? AND credential_revision = ?", account.ID, account.CredentialRevision)
+	if expectedOperationID != "" {
+		query = query.Where("usage_credits_operation_id = ?", expectedOperationID)
 	}
-	result := db.WithContext(ctx).Model(&model.Account{}).
-		Where("id = ? AND credential_revision = ?", account.ID, account.CredentialRevision).
-		Updates(map[string]interface{}{
-			"usage_credits_operation_id":      operationID,
-			"usage_credits_operation_credits": 0,
-			"usage_credits_turns":             0,
-			"usage_credits_operation_exists":  false,
-			// Keep the last account-level balance, but make it a fallback rather
-			// than a fresh scheduling signal until the next /tokens refresh.
-			"usage_credits_status": state,
-		})
+	updates := map[string]interface{}{
+		"usage_credits_operation_credits": 0,
+		"usage_credits_turns":             0,
+		"usage_credits_operation_exists":  false,
+		// Keep the last account-level balance, but make it a fallback until
+		// /tokens observes the completed request. The request account is a
+		// value copy, so derive the visible state from the current row.
+		"usage_credits_status": gorm.Expr(
+			"CASE WHEN usage_credits_available THEN ? ELSE ? END",
+			UsageCreditsStateStale, UsageCreditsStateUnknown,
+		),
+		// Every operation boundary supersedes an earlier balance query. Its
+		// holder can no longer satisfy the revision+lease CAS below.
+		"usage_credits_query_revision": gorm.Expr("usage_credits_query_revision + 1"),
+		"usage_credits_lease_id":       "",
+		"usage_credits_lease_until":    gorm.Expr("NULL"),
+	}
+	if operationID != "" {
+		updates["usage_credits_operation_id"] = operationID
+	}
+	result := query.Updates(updates)
 	if result.Error != nil {
-		logging.Debugf("Remember usage-based credit operation failed: account_id=%d error=%v", account.ID, result.Error)
+		logging.Debugf("Update usage-based credit operation failed: account_id=%d error=%v", account.ID, result.Error)
 		return false
 	}
 	if result.RowsAffected != 1 {
 		return false
 	}
-	updated := *account
-	updated.UsageCreditsOperationID = operationID
-	updated.UsageCreditsOperationCredits = 0
-	updated.UsageCreditsTurns = 0
-	updated.UsageCreditsOperationExists = false
-	updated.UsageCreditsStatus = state
-	syncPoolUsageCredits(updated)
+	// Read back the row instead of publishing fields from the stale request copy.
+	updatePoolCredits(account.ID)
 	return true
 }
 
@@ -634,6 +672,7 @@ func refreshAccountCreditsFromTokens(ctx context.Context, account *model.Account
 		result.Snapshot = loadCreditSnapshot(queryCtx, account.ID, *account)
 		return result, errCreditRefreshBusy
 	}
+	result.attemptRevision = queryRevision
 	defer releaseCreditRefreshLease(context.WithoutCancel(ctx), account.ID, holder)
 
 	credits, err := fetchTokenCredits(req)
@@ -652,11 +691,10 @@ func refreshAccountCreditsFromTokens(ctx context.Context, account *model.Account
 	}
 	if err := persistTokenCreditSnapshot(context.WithoutCancel(ctx), *account, holder, queryRevision, credits); err != nil {
 		if errors.Is(err, errCreditRefreshSuperseded) {
-			state := strings.TrimSpace(account.UsageCreditsStatus)
-			if state == "" {
-				state = UsageCreditsStateUnknown
-			}
-			persistCreditAttempt(context.WithoutCancel(ctx), *account, "", holder, queryRevision, state, nil)
+			// A superseded response must not restore the state from the
+			// request-start account copy. Let the CAS update derive state from
+			// the current database row instead.
+			persistCreditAttempt(context.WithoutCancel(ctx), *account, "", holder, queryRevision, "", nil)
 		}
 		result.Snapshot = loadCreditSnapshot(context.WithoutCancel(ctx), account.ID, *account)
 		return result, err
@@ -934,7 +972,7 @@ func claimCreditRefreshLease(ctx context.Context, account model.Account, operati
 	now := time.Now().UTC()
 	queryRevision := account.UsageCreditsQueryRevision + 1
 	query := db.WithContext(ctx).Model(&model.Account{}).
-		Where("id = ? AND credential_revision = ? AND usage_credits_query_revision = ? AND (usage_credits_lease_id IS NULL OR usage_credits_lease_id = '' OR usage_credits_lease_until IS NULL OR usage_credits_lease_until <= ?)",
+		Where("id = ? AND credential_revision = ? AND usage_credits_query_revision = ? AND (usage_credits_lease_id IS NULL OR usage_credits_lease_id = '' OR usage_credits_lease_until IS NULL OR julianday(usage_credits_lease_until) <= julianday(?))",
 			account.ID, account.CredentialRevision, account.UsageCreditsQueryRevision, now)
 	if operationID != "" {
 		query = query.Where("usage_credits_operation_id = ?", operationID)
@@ -965,7 +1003,26 @@ func persistTokenCreditSnapshot(ctx context.Context, account model.Account, hold
 		Where("id = ? AND credential_revision = ? AND usage_credits_query_revision = ? AND usage_credits_lease_id = ?",
 			account.ID, account.CredentialRevision, queryRevision, holder)
 	if credits.PeriodEnd != nil {
-		query = query.Where("usage_credits_period_end IS NULL OR usage_credits_period_end <= ?", *credits.PeriodEnd)
+		// periodEnd is the only upstream snapshot ordering signal. Within a
+		// known period, total consumed is a high-water mark; remaining may move
+		// in either direction because the service can release reservations or
+		// apply a balance adjustment.
+		query = query.Where(`(
+			usage_credits_available = ? OR
+			usage_credits_period_end IS NULL OR
+			julianday(usage_credits_period_end) < julianday(?) OR
+			(julianday(usage_credits_period_end) = julianday(?) AND usage_credits_consumed <= ?)
+		)`, false, *credits.PeriodEnd, *credits.PeriodEnd, credits.Consumed)
+	} else {
+		// Some compatible gateways omit periodEnd. Preserve a still-active
+		// known period and apply the same high-water check; an expired period is
+		// treated as a reset and cleared below.
+		query = query.Where(`(
+			usage_credits_available = ? OR
+			usage_credits_period_end IS NULL OR
+			julianday(usage_credits_period_end) <= julianday(?) OR
+			usage_credits_consumed <= ?
+		)`, false, now, credits.Consumed)
 	}
 	updates := map[string]interface{}{
 		// /tokens is the authoritative account-level snapshot. Any
@@ -979,6 +1036,7 @@ func persistTokenCreditSnapshot(ctx context.Context, account model.Account, hold
 		"usage_credits_remaining":           credits.Remaining,
 		"usage_credits_available":           true,
 		"usage_credits_status":              UsageCreditsStateReady,
+		"usage_credits_source":              usageCreditsSourceTokens,
 		"usage_credits_updated_at":          now,
 		"usage_credits_last_attempt_at":     now,
 		"usage_credits_credential_revision": account.CredentialRevision,
@@ -987,6 +1045,11 @@ func persistTokenCreditSnapshot(ctx context.Context, account model.Account, hold
 	}
 	if credits.PeriodEnd != nil {
 		updates["usage_credits_period_end"] = credits.PeriodEnd
+	} else {
+		updates["usage_credits_period_end"] = gorm.Expr(
+			"CASE WHEN usage_credits_period_end IS NOT NULL AND julianday(usage_credits_period_end) <= julianday(?) THEN NULL ELSE usage_credits_period_end END",
+			now,
+		)
 	}
 	result := query.Updates(updates)
 	if result.Error != nil {
@@ -995,25 +1058,9 @@ func persistTokenCreditSnapshot(ctx context.Context, account model.Account, hold
 	if result.RowsAffected != 1 {
 		return errCreditRefreshSuperseded
 	}
-	updated := account
-	updated.UsageCreditsOperationCredits = 0
-	updated.UsageCreditsTurns = 0
-	updated.UsageCreditsOperationExists = false
-	updated.UsageCreditsConsumed = credits.Consumed
-	updated.UsageCreditsBudget = credits.Budget
-	updated.UsageCreditsRemaining = credits.Remaining
-	updated.UsageCreditsAvailable = true
-	updated.UsageCreditsStatus = UsageCreditsStateReady
-	updated.UsageCreditsUpdatedAt = &now
-	if credits.PeriodEnd != nil {
-		updated.UsageCreditsPeriodEnd = credits.PeriodEnd
-	}
-	updated.UsageCreditsLastAttemptAt = &now
-	updated.UsageCreditsCredentialRevision = account.CredentialRevision
-	updated.UsageCreditsLeaseID = ""
-	updated.UsageCreditsLeaseUntil = nil
-	updated.UsageCreditsQueryRevision = queryRevision
-	syncPoolUsageCredits(updated)
+	// Read back the accepted row so an omitted/expired periodEnd and any
+	// concurrent state transition are reflected exactly in the scheduler cache.
+	updatePoolCredits(account.ID)
 	return nil
 }
 
@@ -1025,22 +1072,54 @@ func persistCreditSnapshot(ctx context.Context, account model.Account, operation
 	now := time.Now().UTC()
 	cleanupCtx, cancel := cleanupContext(ctx)
 	defer cancel()
+	tokenSnapshot := "usage_credits_source = ?"
 	result := creditRefreshRowQuery(db.WithContext(cleanupCtx).Model(&model.Account{}), account, operationID, queryRevision, holder).
 		Updates(map[string]interface{}{
-			"usage_credits_operation_credits":   credits.OperationCredits,
-			"usage_credits_turns":               credits.Turns,
-			"usage_credits_operation_exists":    operationExists,
-			"usage_credits_consumed":            credits.Consumed,
-			"usage_credits_budget":              credits.Budget,
-			"usage_credits_remaining":           credits.Remaining,
-			"usage_credits_available":           true,
-			"usage_credits_status":              UsageCreditsStateReady,
-			"usage_credits_updated_at":          now,
-			"usage_credits_period_end":          gorm.Expr("NULL"),
-			"usage_credits_last_attempt_at":     now,
-			"usage_credits_credential_revision": account.CredentialRevision,
-			"usage_credits_lease_id":            "",
-			"usage_credits_lease_until":         gorm.Expr("NULL"),
+			"usage_credits_operation_credits": credits.OperationCredits,
+			"usage_credits_turns":             credits.Turns,
+			"usage_credits_operation_exists":  operationExists,
+			// /tokens is authoritative even when a compatible gateway omits
+			// periodEnd. Legacy operation values may only fill the balance when
+			// no token snapshot has ever been accepted for this credential.
+			"usage_credits_consumed": gorm.Expr(
+				"CASE WHEN "+tokenSnapshot+" THEN usage_credits_consumed ELSE ? END",
+				usageCreditsSourceTokens, credits.Consumed,
+			),
+			"usage_credits_budget": gorm.Expr(
+				"CASE WHEN "+tokenSnapshot+" THEN usage_credits_budget ELSE ? END",
+				usageCreditsSourceTokens, credits.Budget,
+			),
+			"usage_credits_remaining": gorm.Expr(
+				"CASE WHEN "+tokenSnapshot+" THEN usage_credits_remaining ELSE ? END",
+				usageCreditsSourceTokens, credits.Remaining,
+			),
+			"usage_credits_available": gorm.Expr(
+				"CASE WHEN "+tokenSnapshot+" THEN usage_credits_available ELSE ? END",
+				usageCreditsSourceTokens, true,
+			),
+			"usage_credits_status": gorm.Expr(
+				"CASE WHEN "+tokenSnapshot+" THEN CASE WHEN usage_credits_available THEN ? ELSE ? END ELSE ? END",
+				usageCreditsSourceTokens, UsageCreditsStateStale, UsageCreditsStateUnknown, UsageCreditsStateReady,
+			),
+			"usage_credits_source": gorm.Expr(
+				"CASE WHEN "+tokenSnapshot+" THEN usage_credits_source ELSE ? END",
+				usageCreditsSourceTokens, usageCreditsSourceOperation,
+			),
+			"usage_credits_updated_at": gorm.Expr(
+				"CASE WHEN "+tokenSnapshot+" THEN usage_credits_updated_at ELSE ? END",
+				usageCreditsSourceTokens, now,
+			),
+			"usage_credits_period_end": gorm.Expr(
+				"CASE WHEN "+tokenSnapshot+" THEN usage_credits_period_end ELSE NULL END",
+				usageCreditsSourceTokens,
+			),
+			"usage_credits_last_attempt_at": now,
+			"usage_credits_credential_revision": gorm.Expr(
+				"CASE WHEN "+tokenSnapshot+" THEN usage_credits_credential_revision ELSE ? END",
+				usageCreditsSourceTokens, account.CredentialRevision,
+			),
+			"usage_credits_lease_id":    "",
+			"usage_credits_lease_until": gorm.Expr("NULL"),
 		})
 	if result.Error != nil {
 		return fmt.Errorf("persist usage-based credit snapshot: %w", result.Error)
@@ -1057,11 +1136,18 @@ func persistCreditAttempt(ctx context.Context, account model.Account, operationI
 	if db == nil {
 		return
 	}
+	now := time.Now().UTC()
 	updates := map[string]interface{}{
 		"usage_credits_status":          state,
-		"usage_credits_last_attempt_at": time.Now().UTC(),
+		"usage_credits_last_attempt_at": now,
 		"usage_credits_lease_id":        "",
 		"usage_credits_lease_until":     gorm.Expr("NULL"),
+	}
+	if state == "" {
+		updates["usage_credits_status"] = gorm.Expr(
+			"CASE WHEN usage_credits_available THEN ? ELSE ? END",
+			UsageCreditsStateStale, UsageCreditsStateUnknown,
+		)
 	}
 	if credits != nil {
 		updates["usage_credits_operation_credits"] = credits.OperationCredits
@@ -1086,10 +1172,12 @@ func markCreditAttemptWithoutLease(ctx context.Context, account model.Account, o
 	defer cancel()
 	now := time.Now().UTC()
 	_ = creditRefreshRowQuery(db.WithContext(cleanupCtx).Model(&model.Account{}), account, operationID, 0, "").
-		Where("usage_credits_lease_id IS NULL OR usage_credits_lease_id = '' OR usage_credits_lease_until IS NULL OR usage_credits_lease_until <= ?", now).
+		Where("usage_credits_query_revision = ?", account.UsageCreditsQueryRevision).
+		Where("(usage_credits_lease_id IS NULL OR usage_credits_lease_id = '' OR usage_credits_lease_until IS NULL OR julianday(usage_credits_lease_until) <= julianday(?))", now).
 		Updates(map[string]interface{}{
 			"usage_credits_status":          state,
 			"usage_credits_last_attempt_at": now,
+			"usage_credits_query_revision":  gorm.Expr("usage_credits_query_revision + 1"),
 		}).Error
 	updatePoolCredits(account.ID)
 }
@@ -1112,12 +1200,24 @@ func releaseCreditRefreshLease(ctx context.Context, accountID uint, holder strin
 	}
 	cleanupCtx, cancel := cleanupContext(ctx)
 	defer cancel()
-	_ = db.WithContext(cleanupCtx).Model(&model.Account{}).
+	result := db.WithContext(cleanupCtx).Model(&model.Account{}).
 		Where("id = ? AND usage_credits_lease_id = ?", accountID, holder).
 		Updates(map[string]interface{}{
 			"usage_credits_lease_id":    "",
 			"usage_credits_lease_until": gorm.Expr("NULL"),
-		}).Error
+			"usage_credits_status": gorm.Expr(
+				"CASE WHEN usage_credits_status = ? THEN CASE WHEN usage_credits_available THEN ? ELSE ? END ELSE usage_credits_status END",
+				UsageCreditsStateRefreshing, UsageCreditsStateStale, UsageCreditsStateUnknown,
+			),
+			"usage_credits_last_attempt_at": time.Now().UTC(),
+		})
+	if result.Error != nil {
+		logging.Debugf("Release usage-based credit refresh lease failed: account_id=%d error=%v", accountID, result.Error)
+		return
+	}
+	if result.RowsAffected == 1 {
+		updatePoolCredits(accountID)
+	}
 }
 
 func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -1155,12 +1255,50 @@ func updatePoolCredits(accountID uint) {
 	if err := db.WithContext(ctx).Select(
 		"id", "credential_revision", "usage_credits_operation_credits", "usage_credits_turns", "usage_credits_operation_exists",
 		"usage_credits_consumed", "usage_credits_budget", "usage_credits_remaining", "usage_credits_available",
-		"usage_credits_status", "usage_credits_updated_at", "usage_credits_period_end", "usage_credits_last_attempt_at", "usage_credits_operation_id",
+		"usage_credits_status", "usage_credits_source", "usage_credits_updated_at", "usage_credits_period_end", "usage_credits_last_attempt_at", "usage_credits_operation_id",
 		"usage_credits_credential_revision", "usage_credits_query_revision", "usage_credits_lease_id", "usage_credits_lease_until",
 	).First(&latest, accountID).Error; err != nil {
 		return
 	}
 	syncPoolUsageCredits(latest)
+}
+
+func usageCreditsSnapshotTimestamp(account model.Account) time.Time {
+	latest := time.Time{}
+	if account.UsageCreditsUpdatedAt != nil && account.UsageCreditsUpdatedAt.After(latest) {
+		latest = *account.UsageCreditsUpdatedAt
+	}
+	if account.UsageCreditsLastAttemptAt != nil && account.UsageCreditsLastAttemptAt.After(latest) {
+		latest = *account.UsageCreditsLastAttemptAt
+	}
+	return latest
+}
+
+func usageCreditsSnapshotNewer(candidate, current model.Account) bool {
+	if candidate.UsageCreditsQueryRevision != current.UsageCreditsQueryRevision {
+		return candidate.UsageCreditsQueryRevision > current.UsageCreditsQueryRevision
+	}
+	return usageCreditsSnapshotTimestamp(candidate).After(usageCreditsSnapshotTimestamp(current))
+}
+
+func copyUsageCreditsState(dst *model.Account, src model.Account) {
+	dst.UsageCreditsOperationCredits = src.UsageCreditsOperationCredits
+	dst.UsageCreditsTurns = src.UsageCreditsTurns
+	dst.UsageCreditsOperationExists = src.UsageCreditsOperationExists
+	dst.UsageCreditsConsumed = src.UsageCreditsConsumed
+	dst.UsageCreditsBudget = src.UsageCreditsBudget
+	dst.UsageCreditsRemaining = src.UsageCreditsRemaining
+	dst.UsageCreditsAvailable = src.UsageCreditsAvailable
+	dst.UsageCreditsStatus = src.UsageCreditsStatus
+	dst.UsageCreditsSource = src.UsageCreditsSource
+	dst.UsageCreditsUpdatedAt = src.UsageCreditsUpdatedAt
+	dst.UsageCreditsPeriodEnd = src.UsageCreditsPeriodEnd
+	dst.UsageCreditsLastAttemptAt = src.UsageCreditsLastAttemptAt
+	dst.UsageCreditsOperationID = src.UsageCreditsOperationID
+	dst.UsageCreditsCredentialRevision = src.UsageCreditsCredentialRevision
+	dst.UsageCreditsQueryRevision = src.UsageCreditsQueryRevision
+	dst.UsageCreditsLeaseID = src.UsageCreditsLeaseID
+	dst.UsageCreditsLeaseUntil = src.UsageCreditsLeaseUntil
 }
 
 // syncPoolUsageCredits applies a known database snapshot to the in-memory
@@ -1178,25 +1316,12 @@ func syncPoolUsageCredits(latest model.Account) {
 			continue
 		}
 		if pool.accounts[index].CredentialRevision != latest.CredentialRevision ||
-			pool.accounts[index].UsageCreditsQueryRevision > latest.UsageCreditsQueryRevision {
+			pool.accounts[index].UsageCreditsQueryRevision > latest.UsageCreditsQueryRevision ||
+			(pool.accounts[index].UsageCreditsQueryRevision == latest.UsageCreditsQueryRevision &&
+				usageCreditsSnapshotTimestamp(latest).Before(usageCreditsSnapshotTimestamp(pool.accounts[index]))) {
 			continue
 		}
-		pool.accounts[index].UsageCreditsOperationCredits = latest.UsageCreditsOperationCredits
-		pool.accounts[index].UsageCreditsTurns = latest.UsageCreditsTurns
-		pool.accounts[index].UsageCreditsOperationExists = latest.UsageCreditsOperationExists
-		pool.accounts[index].UsageCreditsConsumed = latest.UsageCreditsConsumed
-		pool.accounts[index].UsageCreditsBudget = latest.UsageCreditsBudget
-		pool.accounts[index].UsageCreditsRemaining = latest.UsageCreditsRemaining
-		pool.accounts[index].UsageCreditsAvailable = latest.UsageCreditsAvailable
-		pool.accounts[index].UsageCreditsStatus = latest.UsageCreditsStatus
-		pool.accounts[index].UsageCreditsUpdatedAt = latest.UsageCreditsUpdatedAt
-		pool.accounts[index].UsageCreditsPeriodEnd = latest.UsageCreditsPeriodEnd
-		pool.accounts[index].UsageCreditsLastAttemptAt = latest.UsageCreditsLastAttemptAt
-		pool.accounts[index].UsageCreditsOperationID = latest.UsageCreditsOperationID
-		pool.accounts[index].UsageCreditsCredentialRevision = latest.UsageCreditsCredentialRevision
-		pool.accounts[index].UsageCreditsQueryRevision = latest.UsageCreditsQueryRevision
-		pool.accounts[index].UsageCreditsLeaseID = latest.UsageCreditsLeaseID
-		pool.accounts[index].UsageCreditsLeaseUntil = latest.UsageCreditsLeaseUntil
+		copyUsageCreditsState(&pool.accounts[index], latest)
 	}
 }
 

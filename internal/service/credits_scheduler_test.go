@@ -60,6 +60,59 @@ func TestAccountSchedulingUsesFreshUsageCredits(t *testing.T) {
 	}
 }
 
+func TestMergeAccountPoolRuntimePreservesNewerCachedState(t *testing.T) {
+	older := time.Now().UTC().Add(-time.Minute)
+	newer := time.Now().UTC()
+	queried := []model.Account{
+		{ID: 1, ClientID: "old-credential", CredentialRevision: 1},
+		{
+			ID: 2, CredentialRevision: 1, HealthRevision: 1, HealthState: model.AccountHealthHealthy,
+			UsageCreditsQueryRevision: 5, UsageCreditsRemaining: 50,
+		},
+		{
+			ID: 3, CredentialRevision: 1, HealthRevision: 2, HealthState: model.AccountHealthHealthy,
+			UsageCreditsQueryRevision: 3, UsageCreditsRemaining: 30,
+		},
+		{
+			ID: 4, CredentialRevision: 1, UsageCreditsQueryRevision: 5,
+			UsageCreditsStatus: UsageCreditsStateRefreshing, UsageCreditsRemaining: 70, UsageCreditsLastAttemptAt: &older,
+		},
+	}
+	cached := []model.Account{
+		{ID: 1, ClientID: "new-credential", CredentialRevision: 2},
+		{
+			ID: 2, CredentialRevision: 1, HealthRevision: 2, HealthState: accountErrorRateLimit, ReauthRequired: true,
+			UsageCreditsQueryRevision: 4, UsageCreditsRemaining: 40,
+		},
+		{
+			ID: 3, CredentialRevision: 1, HealthRevision: 1, HealthState: accountErrorRateLimit,
+			UsageCreditsQueryRevision: 4, UsageCreditsRemaining: 20,
+		},
+		{
+			ID: 4, CredentialRevision: 1, UsageCreditsQueryRevision: 5,
+			UsageCreditsStatus: UsageCreditsStateStale, UsageCreditsRemaining: 60, UsageCreditsLastAttemptAt: &newer,
+		},
+	}
+
+	mergeAccountPoolRuntime(queried, cached)
+
+	if queried[0].CredentialRevision != 2 || queried[0].ClientID != "new-credential" {
+		t.Fatalf("newer credential was overwritten: %#v", queried[0])
+	}
+	if queried[1].HealthRevision != 2 || queried[1].HealthState != accountErrorRateLimit || !queried[1].ReauthRequired ||
+		queried[1].UsageCreditsQueryRevision != 5 || queried[1].UsageCreditsRemaining != 50 {
+		t.Fatalf("health merge replaced unrelated credit state: %#v", queried[1])
+	}
+	if queried[2].HealthRevision != 2 || queried[2].HealthState != model.AccountHealthHealthy ||
+		queried[2].UsageCreditsQueryRevision != 4 || queried[2].UsageCreditsRemaining != 20 {
+		t.Fatalf("credit merge replaced unrelated health state: %#v", queried[2])
+	}
+	if queried[3].UsageCreditsStatus != UsageCreditsStateStale || queried[3].UsageCreditsRemaining != 60 ||
+		queried[3].UsageCreditsLastAttemptAt == nil || !queried[3].UsageCreditsLastAttemptAt.Equal(newer) {
+		t.Fatalf("newer same-revision credit state was overwritten: %#v", queried[3])
+	}
+}
+
 func TestAccountPoolSelectionUsesCreditTiers(t *testing.T) {
 	setCreditsTestKey(t)
 	setupCreditsTestDB(t, "pool-credit-tiers.db")

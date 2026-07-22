@@ -182,7 +182,8 @@ func TestRefreshAccountCreditsUsesTokensWithoutOperationID(t *testing.T) {
 	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if stored.UsageCreditsConsumed != 9 || stored.UsageCreditsBudget != 5000 || stored.UsageCreditsRemaining != 4991 {
+	if stored.UsageCreditsConsumed != 9 || stored.UsageCreditsBudget != 5000 || stored.UsageCreditsRemaining != 4991 ||
+		stored.UsageCreditsSource != usageCreditsSourceTokens {
 		t.Fatalf("token snapshot was not persisted: %#v", stored)
 	}
 }
@@ -325,7 +326,7 @@ func TestTokenCreditSnapshotPreservesKnownPeriodWhenResponseOmitsIt(t *testing.T
 	account := model.Account{
 		ClientID: "tokens-preserve-period", CredentialType: model.CredentialAPIKey,
 		APIKey: encrypted, CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
-		UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+		UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady, UsageCreditsSource: usageCreditsSourceTokens,
 		UsageCreditsConsumed: 3, UsageCreditsBudget: 20, UsageCreditsRemaining: 16,
 		UsageCreditsUpdatedAt: &updatedAt, UsageCreditsPeriodEnd: &periodEnd,
 		UsageCreditsCredentialRevision: 1,
@@ -374,7 +375,7 @@ func TestUpdatePoolCreditsPublishesDatabaseCredentialRevisionAndState(t *testing
 	account := model.Account{
 		ClientID: "pool-credit-state", CredentialType: model.CredentialAPIKey, APIKey: encrypted,
 		CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
-		UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+		UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady, UsageCreditsSource: usageCreditsSourceTokens,
 		UsageCreditsConsumed: 5, UsageCreditsBudget: 10, UsageCreditsRemaining: 0,
 		UsageCreditsUpdatedAt: &updatedAt, UsageCreditsCredentialRevision: 1,
 	}
@@ -403,7 +404,8 @@ func TestUpdatePoolCreditsPublishesDatabaseCredentialRevisionAndState(t *testing
 	defer pool.mu.Unlock()
 	for _, cached := range pool.accounts {
 		if cached.ID == account.ID {
-			if cached.CredentialRevision != 1 || cached.UsageCreditsStatus != UsageCreditsStateError {
+			if cached.CredentialRevision != 1 || cached.UsageCreditsStatus != UsageCreditsStateError ||
+				cached.UsageCreditsSource != usageCreditsSourceTokens {
 				t.Fatalf("pool did not publish the current credit state: %#v", cached)
 			}
 			return
@@ -443,20 +445,187 @@ func TestTokenCreditSnapshotRejectsOlderBillingPeriod(t *testing.T) {
 	if !errors.Is(err, errCreditRefreshSuperseded) {
 		t.Fatalf("error = %v, want superseded", err)
 	}
-	if result.Snapshot.State != UsageCreditsStateReady || result.Snapshot.Remaining != 90 ||
+	if result.Snapshot.State != UsageCreditsStateStale || result.Snapshot.Remaining != 90 ||
 		result.Snapshot.PeriodEnd == nil || !result.Snapshot.PeriodEnd.Equal(newPeriod) {
 		t.Fatalf("older period replaced current snapshot: %#v", result.Snapshot)
 	}
 }
 
+func TestTokenCreditSnapshotRejectsSamePeriodConsumedRegression(t *testing.T) {
+	setCreditsTestKey(t)
+	periodEnd := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"periodEnd":%q,"totalConsumedByUser":20,"totalUserBudget":100,"remaining":80}`, periodEnd.Format(time.RFC3339))
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_GATEWAY_BASE_URL", server.URL)
+	setupCreditsTestDB(t, "tokens-same-period-regression.db")
+	encrypted, err := secret.Encrypt("zencoder-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := time.Now().UTC().Add(-time.Minute)
+	account := model.Account{
+		ClientID: "tokens-same-period-regression", CredentialType: model.CredentialAPIKey,
+		APIKey: encrypted, CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+		UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+		UsageCreditsConsumed: 30, UsageCreditsBudget: 100, UsageCreditsRemaining: 70,
+		UsageCreditsUpdatedAt: &updatedAt, UsageCreditsPeriodEnd: &periodEnd,
+		UsageCreditsCredentialRevision: 1,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RefreshAccountCredits(context.Background(), account.ID); !errors.Is(err, errCreditRefreshSuperseded) {
+		t.Fatalf("error = %v, want superseded", err)
+	}
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsConsumed != 30 || stored.UsageCreditsRemaining != 70 || stored.UsageCreditsBudget != 100 ||
+		stored.UsageCreditsUpdatedAt == nil || !stored.UsageCreditsUpdatedAt.Equal(updatedAt) ||
+		stored.UsageCreditsStatus != UsageCreditsStateStale {
+		t.Fatalf("same-period regression changed accepted snapshot: %#v", stored)
+	}
+}
+
+func TestTokenCreditSnapshotRejectsConsumedRegressionWhenResponseOmitsPeriod(t *testing.T) {
+	setCreditsTestKey(t)
+	periodEnd := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"totalConsumedByUser":20,"totalUserBudget":100,"remaining":80}`))
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_GATEWAY_BASE_URL", server.URL)
+	setupCreditsTestDB(t, "tokens-missing-period-regression.db")
+	encrypted, err := secret.Encrypt("zencoder-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := model.Account{
+		ClientID: "tokens-missing-period-regression", CredentialType: model.CredentialAPIKey,
+		APIKey: encrypted, CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+		UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+		UsageCreditsConsumed: 30, UsageCreditsBudget: 100, UsageCreditsRemaining: 70,
+		UsageCreditsPeriodEnd: &periodEnd, UsageCreditsCredentialRevision: 1,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RefreshAccountCredits(context.Background(), account.ID); !errors.Is(err, errCreditRefreshSuperseded) {
+		t.Fatalf("error = %v, want superseded", err)
+	}
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsConsumed != 30 || stored.UsageCreditsRemaining != 70 || stored.UsageCreditsPeriodEnd == nil ||
+		!stored.UsageCreditsPeriodEnd.Equal(periodEnd) {
+		t.Fatalf("missing-period response regressed known snapshot: %#v", stored)
+	}
+}
+
+func TestTokenCreditSnapshotAllowsNewPeriodAndBalanceAdjustment(t *testing.T) {
+	setCreditsTestKey(t)
+	oldPeriod := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	newPeriod := oldPeriod.Add(time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"periodEnd":%q,"totalConsumedByUser":5,"totalUserBudget":100,"remaining":95}`, newPeriod.Format(time.RFC3339))
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_GATEWAY_BASE_URL", server.URL)
+	setupCreditsTestDB(t, "tokens-new-period.db")
+	encrypted, err := secret.Encrypt("zencoder-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := model.Account{
+		ClientID: "tokens-new-period", CredentialType: model.CredentialAPIKey,
+		APIKey: encrypted, CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+		UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+		UsageCreditsConsumed: 30, UsageCreditsBudget: 100, UsageCreditsRemaining: 70,
+		UsageCreditsPeriodEnd: &oldPeriod, UsageCreditsCredentialRevision: 1,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err := RefreshAccountCredits(context.Background(), account.ID)
+	if err != nil || result.Snapshot.State != UsageCreditsStateReady || result.Snapshot.Consumed != 5 ||
+		result.Snapshot.Remaining != 95 || result.Snapshot.PeriodEnd == nil || !result.Snapshot.PeriodEnd.Equal(newPeriod) {
+		t.Fatalf("new period was not accepted: result=%#v err=%v", result.Snapshot, err)
+	}
+}
+
+func TestTokenCreditSnapshotAllowsSamePeriodBalanceAdjustment(t *testing.T) {
+	setCreditsTestKey(t)
+	periodEnd := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"periodEnd":%q,"totalConsumedByUser":30,"totalUserBudget":150,"remaining":120}`, periodEnd.Format(time.RFC3339))
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_GATEWAY_BASE_URL", server.URL)
+	setupCreditsTestDB(t, "tokens-balance-adjustment.db")
+	encrypted, err := secret.Encrypt("zencoder-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := model.Account{
+		ClientID: "tokens-balance-adjustment", CredentialType: model.CredentialAPIKey,
+		APIKey: encrypted, CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+		UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+		UsageCreditsConsumed: 30, UsageCreditsBudget: 100, UsageCreditsRemaining: 70,
+		UsageCreditsPeriodEnd: &periodEnd, UsageCreditsCredentialRevision: 1,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err := RefreshAccountCredits(context.Background(), account.ID)
+	if err != nil || result.Snapshot.State != UsageCreditsStateReady || result.Snapshot.Budget != 150 || result.Snapshot.Remaining != 120 {
+		t.Fatalf("same-period balance adjustment was rejected: result=%#v err=%v", result.Snapshot, err)
+	}
+}
+
+func TestTokenCreditSnapshotClearsExpiredPeriodWhenResponseOmitsIt(t *testing.T) {
+	setCreditsTestKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"totalConsumedByUser":5,"totalUserBudget":100,"remaining":95}`))
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_GATEWAY_BASE_URL", server.URL)
+	setupCreditsTestDB(t, "tokens-expired-period.db")
+	encrypted, err := secret.Encrypt("zencoder-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredPeriod := time.Now().Add(-time.Hour)
+	account := model.Account{
+		ClientID: "tokens-expired-period", CredentialType: model.CredentialAPIKey,
+		APIKey: encrypted, CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+		UsageCreditsAvailable: true, UsageCreditsStatus: UsageCreditsStateReady,
+		UsageCreditsConsumed: 30, UsageCreditsBudget: 100, UsageCreditsRemaining: 70,
+		UsageCreditsPeriodEnd: &expiredPeriod, UsageCreditsCredentialRevision: 1,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err := RefreshAccountCredits(context.Background(), account.ID)
+	if err != nil || result.Snapshot.State != UsageCreditsStateReady || result.Snapshot.Consumed != 5 ||
+		result.Snapshot.Remaining != 95 || result.Snapshot.PeriodEnd != nil {
+		t.Fatalf("expired period was not reset: result=%#v err=%v", result.Snapshot, err)
+	}
+}
+
 func TestRefreshAccountCreditsFallsBackWhenTokensAreUnsupported(t *testing.T) {
 	setCreditsTestKey(t)
+	var operationCalls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/quotas/me/tokens":
 			http.NotFound(w, r)
 		case "/api/v1/quotas/me/operations/legacy-op/credits":
-			_, _ = w.Write([]byte(`{"operationId":"legacy-op","totalOperationCredits":4,"turns":1,"totalUserConsumedCredits":6,"totalUserBudget":10}`))
+			consumed := 5 + operationCalls.Add(1)
+			_, _ = fmt.Fprintf(w, `{"operationId":"legacy-op","totalOperationCredits":%d,"turns":1,"totalUserConsumedCredits":%d,"totalUserBudget":10}`, consumed-2, consumed)
 		default:
 			t.Fatalf("unexpected fallback path: %s", r.URL.Path)
 		}
@@ -483,9 +652,136 @@ func TestRefreshAccountCreditsFallsBackWhenTokensAreUnsupported(t *testing.T) {
 	if result.Snapshot.State != UsageCreditsStateReady || result.Snapshot.Remaining != 4 || !result.Snapshot.OperationExists {
 		t.Fatalf("unexpected fallback snapshot: %#v", result.Snapshot)
 	}
+	result, err = RefreshAccountCredits(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Snapshot.Remaining != 3 || result.Snapshot.OperationCredits != 5 {
+		t.Fatalf("legacy fallback did not update a prior operation snapshot: %#v", result.Snapshot)
+	}
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsSource != usageCreditsSourceOperation {
+		t.Fatalf("legacy snapshot source = %q", stored.UsageCreditsSource)
+	}
 }
 
-func TestOperationFallbackClearsStaleTokenPeriodEnd(t *testing.T) {
+func TestOperationFallbackDoesNotReplaceTokenSnapshotWithoutPeriodEnd(t *testing.T) {
+	setCreditsTestKey(t)
+	var tokensAvailable atomic.Bool
+	tokensAvailable.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/quotas/me/tokens":
+			if tokensAvailable.Load() {
+				_, _ = w.Write([]byte(`{"totalConsumedByUser":30,"totalUserBudget":100,"remaining":70}`))
+				return
+			}
+			http.NotFound(w, r)
+		case "/api/v1/quotas/me/operations/no-period-op/credits":
+			_, _ = w.Write([]byte(`{"operationId":"no-period-op","totalOperationCredits":2,"turns":1,"totalUserConsumedCredits":20,"totalUserBudget":100}`))
+		default:
+			t.Fatalf("unexpected credit path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_GATEWAY_BASE_URL", server.URL)
+	setupCreditsTestDB(t, "tokens-no-period-fallback.db")
+	encrypted, err := secret.Encrypt("zencoder-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := model.Account{
+		ClientID: "tokens-no-period-fallback", CredentialType: model.CredentialAPIKey,
+		APIKey: encrypted, CredentialRevision: 1, HealthState: model.AccountHealthHealthy,
+		UsageCreditsOperationID: "no-period-op",
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RefreshAccountCredits(context.Background(), account.ID); err != nil {
+		t.Fatal(err)
+	}
+	var tokenSnapshot model.Account
+	if err := database.GetDB().First(&tokenSnapshot, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := tokenSnapshot.UsageCreditsUpdatedAt
+	if tokenSnapshot.UsageCreditsSource != usageCreditsSourceTokens || tokenSnapshot.UsageCreditsPeriodEnd != nil {
+		t.Fatalf("token snapshot provenance = %#v", tokenSnapshot)
+	}
+	tokensAvailable.Store(false)
+	result, err := RefreshAccountCredits(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Snapshot.Consumed != 30 || result.Snapshot.Budget != 100 || result.Snapshot.Remaining != 70 ||
+		result.Snapshot.OperationCredits != 2 || !result.Snapshot.OperationExists {
+		t.Fatalf("legacy fallback replaced token balance without periodEnd: %#v", result.Snapshot)
+	}
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsSource != usageCreditsSourceTokens || stored.UsageCreditsUpdatedAt == nil ||
+		updatedAt == nil || !stored.UsageCreditsUpdatedAt.Equal(*updatedAt) {
+		t.Fatalf("token provenance or timestamp changed during legacy fallback: %#v", stored)
+	}
+}
+
+func TestOperationFallbackPreservesActiveTokenSnapshot(t *testing.T) {
+	setCreditsTestKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/quotas/me/tokens":
+			http.NotFound(w, r)
+		case "/api/v1/quotas/me/operations/legacy-active/credits":
+			_, _ = w.Write([]byte(`{"operationId":"legacy-active","totalOperationCredits":2,"turns":1,"totalUserConsumedCredits":20,"totalUserBudget":100}`))
+		default:
+			t.Fatalf("unexpected fallback path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("ZENCODER_GATEWAY_BASE_URL", server.URL)
+	setupCreditsTestDB(t, "tokens-fallback-active-period.db")
+	encrypted, err := secret.Encrypt("zencoder-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	periodEnd := time.Now().Add(time.Hour)
+	updatedAt := time.Now().UTC().Add(-time.Minute)
+	account := model.Account{
+		ClientID: "tokens-fallback-active-period", CredentialType: model.CredentialAPIKey,
+		APIKey: encrypted, CredentialRevision: 2, HealthState: model.AccountHealthHealthy,
+		UsageCreditsOperationID: "legacy-active", UsageCreditsAvailable: true,
+		UsageCreditsStatus: UsageCreditsStateReady, UsageCreditsSource: usageCreditsSourceTokens, UsageCreditsConsumed: 30,
+		UsageCreditsBudget: 100, UsageCreditsRemaining: 69, UsageCreditsUpdatedAt: &updatedAt,
+		UsageCreditsPeriodEnd: &periodEnd, UsageCreditsCredentialRevision: 1,
+	}
+	if err := database.GetDB().Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err := RefreshAccountCredits(context.Background(), account.ID)
+	if err != nil || result.Snapshot.State != UsageCreditsStateStale || !result.Snapshot.OperationExists ||
+		result.Snapshot.OperationCredits != 2 || result.Snapshot.Consumed != 30 ||
+		result.Snapshot.Budget != 100 || result.Snapshot.Remaining != 69 ||
+		result.Snapshot.PeriodEnd == nil || !result.Snapshot.PeriodEnd.Equal(periodEnd) ||
+		result.Snapshot.UpdatedAt == nil || !result.Snapshot.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("legacy fallback replaced active token snapshot: result=%#v err=%v", result.Snapshot, err)
+	}
+	var stored model.Account
+	if err := database.GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsStatus != UsageCreditsStateStale || stored.UsageCreditsSource != usageCreditsSourceTokens ||
+		stored.UsageCreditsCredentialRevision != 1 {
+		t.Fatalf("legacy fallback rebound the token snapshot to the current credential: %#v", stored)
+	}
+}
+
+func TestOperationFallbackClearsUnattributedStalePeriodEnd(t *testing.T) {
 	setCreditsTestKey(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

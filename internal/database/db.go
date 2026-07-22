@@ -21,7 +21,7 @@ import (
 var DB *gorm.DB
 
 const (
-	currentSchemaVersion       = 4
+	currentSchemaVersion       = 5
 	migrationBusyTimeoutMillis = 30000
 	runtimeBusyTimeoutMillis   = 5000
 	migrationLeaseDuration     = 10 * time.Minute
@@ -141,6 +141,12 @@ func runSchemaMigrations(db *gorm.DB) error {
 			}
 			version = 4
 		}
+		if version < 5 {
+			if err := migrateSchemaVersionFive(tx); err != nil {
+				return err
+			}
+			version = 5
+		}
 		completed := tx.Exec(`UPDATE zencoder_schema_migrations
 			SET version = ?, holder = '', lease_until = ?, updated_at = ?
 			WHERE id = 1 AND holder = ?`, version, time.Now().UTC(), time.Now().UTC(), holder)
@@ -218,6 +224,24 @@ func migrateSchemaVersionThree(db *gorm.DB) error {
 func migrateSchemaVersionFour(db *gorm.DB) error {
 	if err := db.AutoMigrate(&model.Account{}); err != nil {
 		return fmt.Errorf("migrate usage-based credit period: %w", err)
+	}
+	return nil
+}
+
+func migrateSchemaVersionFive(db *gorm.DB) error {
+	if err := db.AutoMigrate(&model.Account{}); err != nil {
+		return fmt.Errorf("migrate usage-based credit source: %w", err)
+	}
+	// A non-empty periodEnd, or a balance with no operation ID, could only have
+	// come from the authoritative /tokens endpoint in pre-v5 data. Rows that
+	// have neither signal remain unknown because their historical source is
+	// genuinely ambiguous.
+	if err := db.Model(&model.Account{}).
+		Where(`(usage_credits_period_end IS NOT NULL OR
+			(usage_credits_available = ? AND (usage_credits_operation_id IS NULL OR usage_credits_operation_id = '')))
+			AND (usage_credits_source = '' OR usage_credits_source IS NULL)`, true).
+		Update("usage_credits_source", "tokens").Error; err != nil {
+		return fmt.Errorf("backfill usage-based credit source: %w", err)
 	}
 	return nil
 }

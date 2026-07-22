@@ -611,6 +611,7 @@ func upsertOAuthAccountTx(
 		"usage_credits_remaining":           0,
 		"usage_credits_available":           false,
 		"usage_credits_status":              UsageCreditsStateUnknown,
+		"usage_credits_source":              "",
 		"usage_credits_updated_at":          gorm.Expr("NULL"),
 		"usage_credits_period_end":          gorm.Expr("NULL"),
 		"usage_credits_last_attempt_at":     gorm.Expr("NULL"),

@@ -146,6 +146,92 @@ func TestInitAddsCodeVerifierToVersionOneDatabase(t *testing.T) {
 	}
 }
 
+func TestInitAddsUsageCreditSourceToVersionFourDatabase(t *testing.T) {
+	t.Setenv("TOKEN_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString([]byte(strings.Repeat("v", 32))))
+	path := filepath.Join(t.TempDir(), "version-four.db")
+	legacy, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	periodEnd := time.Now().UTC().Add(time.Hour)
+	account := model.Account{
+		ClientID: "v4-token-account", CredentialType: model.CredentialAPIKey,
+		UsageCreditsAvailable: true, UsageCreditsConsumed: 12, UsageCreditsBudget: 20,
+		UsageCreditsRemaining: 8, UsageCreditsPeriodEnd: &periodEnd,
+	}
+	noPeriodAccount := model.Account{
+		ClientID: "v4-token-no-period", CredentialType: model.CredentialAPIKey,
+		UsageCreditsAvailable: true, UsageCreditsConsumed: 3, UsageCreditsBudget: 10,
+		UsageCreditsRemaining: 7,
+	}
+	if err := legacy.AutoMigrate(&model.Account{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Create(&noPeriodAccount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Migrator().DropColumn(&model.Account{}, "usage_credits_source"); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Exec(`CREATE TABLE zencoder_schema_migrations (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		version INTEGER NOT NULL,
+		holder TEXT NOT NULL,
+		lease_until DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL
+	)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Exec(`INSERT INTO zencoder_schema_migrations
+		(id, version, holder, lease_until, updated_at) VALUES (1, 4, '', ?, ?)`,
+		time.Unix(1, 0).UTC(), time.Now().UTC()).Error; err != nil {
+		t.Fatal(err)
+	}
+	legacySQL, err := legacy.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacySQL.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Init(path); err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := GetDB().DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	if !GetDB().Migrator().HasColumn(&model.Account{}, "usage_credits_source") {
+		t.Fatal("version 5 migration did not add usage credit source")
+	}
+	var stored model.Account
+	if err := GetDB().First(&stored, account.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageCreditsSource != "tokens" {
+		t.Fatalf("legacy token snapshot source = %q, want tokens", stored.UsageCreditsSource)
+	}
+	var noPeriodStored model.Account
+	if err := GetDB().Where("client_id = ?", noPeriodAccount.ClientID).First(&noPeriodStored).Error; err != nil {
+		t.Fatal(err)
+	}
+	if noPeriodStored.UsageCreditsSource != "tokens" {
+		t.Fatalf("period-less token snapshot source = %q, want tokens", noPeriodStored.UsageCreditsSource)
+	}
+	var version int
+	if err := GetDB().Raw("SELECT version FROM zencoder_schema_migrations WHERE id = 1").Scan(&version).Error; err != nil {
+		t.Fatal(err)
+	}
+	if version != currentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersion)
+	}
+}
+
 func TestInitHelperProcess(t *testing.T) {
 	if os.Getenv("ZENCODER_DB_INIT_HELPER") != "1" {
 		return

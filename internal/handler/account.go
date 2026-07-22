@@ -318,7 +318,7 @@ func (h *AccountHandler) RotateAPIKey(c *gin.Context) {
 		"usage_credits_operation_credits": 0, "usage_credits_turns": 0,
 		"usage_credits_operation_exists": false, "usage_credits_consumed": 0,
 		"usage_credits_budget": 0, "usage_credits_remaining": 0,
-		"usage_credits_available": false, "usage_credits_status": service.UsageCreditsStateUnknown,
+		"usage_credits_available": false, "usage_credits_status": service.UsageCreditsStateUnknown, "usage_credits_source": "",
 		"usage_credits_updated_at": gorm.Expr("NULL"), "usage_credits_period_end": gorm.Expr("NULL"), "usage_credits_last_attempt_at": gorm.Expr("NULL"),
 		"usage_credits_operation_id": "", "usage_credits_credential_revision": 0,
 		"usage_credits_query_revision": gorm.Expr("usage_credits_query_revision + 1"),

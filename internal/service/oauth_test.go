@@ -258,6 +258,7 @@ func TestUpsertOAuthAccountUpdatesExistingIdentity(t *testing.T) {
 		"usage_credits_query_revision": 20,
 		"usage_credits_available":      true,
 		"usage_credits_status":         UsageCreditsStateReady,
+		"usage_credits_source":         usageCreditsSourceTokens,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +275,7 @@ func TestUpsertOAuthAccountUpdatesExistingIdentity(t *testing.T) {
 	if second.UsageCreditsQueryRevision != 21 {
 		t.Fatalf("OAuth upsert did not advance the Credit query revision: %d", second.UsageCreditsQueryRevision)
 	}
-	if second.UsageCreditsAvailable || second.UsageCreditsStatus != UsageCreditsStateUnknown ||
+	if second.UsageCreditsAvailable || second.UsageCreditsStatus != UsageCreditsStateUnknown || second.UsageCreditsSource != "" ||
 		second.UsageCreditsRemaining != 0 || second.UsageCreditsOperationID != "" {
 		t.Fatalf("OAuth upsert retained the previous credential's Credit snapshot: %+v", second)
 	}

@@ -30,41 +30,37 @@ var errUpstreamStreamTruncated = errors.New("upstream stream ended without a ter
 
 type accountFinalizingBody struct {
 	io.ReadCloser
-	ctx                 context.Context
-	resp                *http.Response
-	account             *model.Account
-	multiplier          float64
-	protocol            streamProtocol
-	tail                []byte
-	finalized           atomic.Bool
-	closed              atomic.Bool
-	refreshOnce         sync.Once
-	operationRemembered bool
+	ctx         context.Context
+	resp        *http.Response
+	account     *model.Account
+	multiplier  float64
+	protocol    streamProtocol
+	tail        []byte
+	finalized   atomic.Bool
+	closed      atomic.Bool
+	refreshOnce sync.Once
 }
 
 func finalizeStreamingAccount(ctx context.Context, resp *http.Response, account *model.Account, multiplier float64, protocol streamProtocol) {
-	operationRemembered := false
 	if operationID, ok := operationIDIfPresent(ctx); ok {
-		operationRemembered = rememberAccountCreditsOperation(ctx, account, operationID)
+		rememberAccountCreditsOperation(ctx, account, operationID)
 	}
 	resp.Body = &accountFinalizingBody{
-		ReadCloser:          resp.Body,
-		ctx:                 ctx,
-		resp:                resp,
-		account:             account,
-		multiplier:          multiplier,
-		protocol:            protocol,
-		operationRemembered: operationRemembered,
+		ReadCloser: resp.Body,
+		ctx:        ctx,
+		resp:       resp,
+		account:    account,
+		multiplier: multiplier,
+		protocol:   protocol,
 	}
 }
 
 func (body *accountFinalizingBody) queueRefresh() {
 	body.refreshOnce.Do(func() {
-		operationID, _ := operationIDIfPresent(body.ctx)
-		if !body.operationRemembered {
-			if normalized, ok := validCreditOperationID(operationID); ok {
-				body.operationRemembered = rememberAccountCreditsOperation(body.ctx, body.account, normalized)
-			}
+		if operationID, ok := operationIDIfPresent(body.ctx); ok {
+			// Streaming completion is a second operation boundary: supersede a
+			// balance query that may have started while the stream was open.
+			completeAccountCreditsOperation(body.ctx, body.account, operationID)
 		}
 		enqueueAccountCreditsRefresh(body.account)
 	})
@@ -94,8 +90,9 @@ func (body *accountFinalizingBody) Read(data []byte) (int, error) {
 
 func (body *accountFinalizingBody) Close() error {
 	body.closed.Store(true)
+	err := body.ReadCloser.Close()
 	body.queueRefresh()
-	return body.ReadCloser.Close()
+	return err
 }
 
 func streamTerminalSeen(protocol streamProtocol, data []byte) bool {
