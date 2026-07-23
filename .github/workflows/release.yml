@@ -99,7 +99,7 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.IMAGE_NAME }}
-          flavor: latest=false
+          flavor: latest=auto
           tags: |
             type=ref,event=tag
             type=semver,pattern={{version}}
