@@ -152,7 +152,7 @@ jobs:
         run: sha256sum dist/*.tar.gz dist/*.zip dist/sbom.spdx.json > dist/checksums.txt
 
       - name: Attest release assets
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: dist/*
 
@@ -220,7 +220,7 @@ jobs:
           sbom: true
 
       - name: Attest image digest
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}
