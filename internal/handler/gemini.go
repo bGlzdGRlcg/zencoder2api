@@ -1,11 +1,8 @@
 package handler
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -41,11 +38,25 @@ func (h *GeminiHandler) ListModels(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"models": items})
 }
 
-// generateTraceID 生成一个随机的 trace ID
-func generateGeminiTraceID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+// GetModel implements Gemini's single-model discovery endpoint.
+func (h *GeminiHandler) GetModel(c *gin.Context) {
+	modelName := strings.TrimPrefix(strings.TrimSpace(c.Param("model")), "models/")
+	zenModel, ok := model.GetZenModel(modelName)
+	if !ok || zenModel.ProviderID != "gemini" {
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{
+			"message": "model not found",
+			"status":  "NOT_FOUND",
+		}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"name":                       "models/" + zenModel.ID,
+		"baseModelId":                zenModel.ID,
+		"version":                    "preview",
+		"displayName":                zenModel.DisplayName,
+		"description":                zenModel.DisplayName,
+		"supportedGenerationMethods": []string{"generateContent", "streamGenerateContent"},
+	})
 }
 
 // HandleRequest 处理 POST /v1beta/models/*path
@@ -67,21 +78,26 @@ func (h *GeminiHandler) HandleRequest(c *gin.Context) {
 	// "models/gemini-3-flash-preview". Some SDKs pass that full resource name
 	// back in the request path, while others pass only the model ID.
 	modelName = strings.TrimPrefix(modelName, "models/")
+	zenModel, known := model.GetZenModel(modelName)
+	if !known || zenModel.ProviderID != "gemini" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "unknown Gemini model", "type": "invalid_request_error"}})
+		return
+	}
 	action := parts[1]
 
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := readRequestBody(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(bodyErrorStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 
 	switch action {
 	case "generateContent":
-		if err := h.svc.GenerateContentProxy(c.Request.Context(), c.Writer, modelName, body); err != nil {
+		if err := h.svc.GenerateContentProxy(c.Request.Context(), c.Writer, modelName, body); err != nil && !c.Writer.Written() {
 			h.handleError(c, err)
 		}
 	case "streamGenerateContent":
-		if err := h.svc.StreamGenerateContentProxy(c.Request.Context(), c.Writer, modelName, body); err != nil {
+		if err := h.svc.StreamGenerateContentProxy(c.Request.Context(), c.Writer, modelName, body); err != nil && !c.Writer.Written() {
 			h.handleError(c, err)
 		}
 	default:
@@ -105,10 +121,14 @@ func (h *GeminiHandler) handleError(c *gin.Context, err error) {
 		return
 	}
 	if errors.Is(err, service.ErrNoAvailableAccount) {
-		traceID := generateGeminiTraceID()
+		traceID := requestTraceID(c)
 		errMsg := fmt.Sprintf("没有可用token（traceid: %s）", traceID)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsg})
 		return
 	}
-	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	traceID := requestTraceID(c)
+	c.Header("X-Request-ID", traceID)
+	c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+		"message": "upstream request failed", "status": "INTERNAL", "trace_id": traceID,
+	}})
 }

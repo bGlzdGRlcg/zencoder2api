@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"html"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -41,14 +44,8 @@ func (h *OAuthHandler) CompleteZencoder(c *gin.Context) {
 	var request struct {
 		CallbackURL string `json:"callback_url"`
 	}
-	decoder := json.NewDecoder(io.LimitReader(c.Request.Body, 64<<10))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
+	if err := decodeStrictJSON(c, &request, 64<<10); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式无效，请提交 callback_url"})
-		return
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求中只能包含一个 JSON 对象"})
 		return
 	}
 
@@ -136,6 +133,17 @@ func (h *OAuthHandler) ZencoderCallback(c *gin.Context) {
 }
 
 func (h *OAuthHandler) renderCallback(c *gin.Context, origin string, success bool, message string) {
+	var nonceBytes [24]byte
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to render OAuth callback"})
+		return
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(nonceBytes[:])
+	c.Header("Cache-Control", "no-store, max-age=0")
+	c.Header("Pragma", "no-cache")
+	c.Header("Referrer-Policy", "no-referrer")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header("Content-Security-Policy", fmt.Sprintf("default-src 'none'; style-src 'nonce-%s'; script-src 'nonce-%s'; base-uri 'none'; frame-ancestors 'none'", nonce, nonce))
 	if origin == "" {
 		origin, _ = publicOrigin(c.Request)
 	}
@@ -162,11 +170,15 @@ func (h *OAuthHandler) renderCallback(c *gin.Context, origin string, success boo
 	fallbackJSON, _ := json.Marshal(fallback)
 	page := fmt.Sprintf(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>%s</title><style>body{margin:0;font-family:system-ui,sans-serif;background:#f8fafc;color:#0f172a;display:grid;place-items:center;min-height:100vh}.card{max-width:28rem;margin:2rem;padding:2rem;border:1px solid #e2e8f0;border-radius:1rem;background:white;box-shadow:0 12px 32px rgba(15,23,42,.08);text-align:center}h1{font-size:1.25rem;margin:0 0 .75rem}p{color:#64748b;margin:0}</style></head>
-<body><main class="card"><h1>%s</h1><p>%s</p></main><script>
+<title>%s</title><style nonce="%s">body{margin:0;font-family:system-ui,sans-serif;background:#f8fafc;color:#0f172a;display:grid;place-items:center;min-height:100vh}.card{max-width:28rem;margin:2rem;padding:2rem;border:1px solid #e2e8f0;border-radius:1rem;background:white;box-shadow:0 12px 32px rgba(15,23,42,.08);text-align:center}h1{font-size:1.25rem;margin:0 0 .75rem}p{color:#64748b;margin:0}</style></head>
+<body><main class="card"><h1>%s</h1><p>%s</p></main><script nonce="%s">
 (function(){const payload=%s;const origin=%s;const fallback=%s;if(window.opener&&!window.opener.closed){window.opener.postMessage(payload,origin);setTimeout(()=>window.close(),300);}else{window.location.replace(fallback);}})();
-</script></body></html>`, status, status, message, payload, targetOrigin, fallbackJSON)
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(page))
+</script></body></html>`, html.EscapeString(status), nonce, html.EscapeString(status), html.EscapeString(message), nonce, payload, targetOrigin, fallbackJSON)
+	responseStatus := http.StatusOK
+	if !success {
+		responseStatus = http.StatusBadGateway
+	}
+	c.Data(responseStatus, "text/html; charset=utf-8", []byte(page))
 }
 
 func publicOrigin(req *http.Request) (string, error) {
@@ -177,14 +189,12 @@ func publicOrigin(req *http.Request) (string, error) {
 	if req.TLS != nil {
 		scheme = "https"
 	}
-	if forwarded := firstForwardedValue(req.Header.Get("X-Forwarded-Proto")); forwarded != "" {
-		scheme = forwarded
-	}
 	host := req.Host
-	if forwarded := firstForwardedValue(req.Header.Get("X-Forwarded-Host")); forwarded != "" {
-		host = forwarded
+	parsed, err := url.Parse(scheme + "://" + host)
+	if err != nil || !isLoopbackOAuthHost(parsed.Hostname()) {
+		return "", errors.New("PUBLIC_BASE_URL is required for non-loopback OAuth origins")
 	}
-	return validatePublicOrigin(scheme + "://" + host)
+	return validatePublicOrigin(parsed.String())
 }
 
 func validatePublicOrigin(raw string) (string, error) {
@@ -198,7 +208,10 @@ func validatePublicOrigin(raw string) (string, error) {
 	return parsed.Scheme + "://" + parsed.Host + strings.TrimRight(parsed.EscapedPath(), "/"), nil
 }
 
-func firstForwardedValue(value string) string {
-	value = strings.SplitN(value, ",", 2)[0]
-	return strings.TrimSpace(value)
+func isLoopbackOAuthHost(host string) bool {
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

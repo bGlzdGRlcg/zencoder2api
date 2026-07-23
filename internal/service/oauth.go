@@ -19,21 +19,22 @@ import (
 	"time"
 
 	"zencoder-2api/internal/database"
+	"zencoder-2api/internal/logging"
 	"zencoder-2api/internal/model"
+	"zencoder-2api/internal/secret"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
-const oauthSessionTTL = 10 * time.Minute
+const (
+	oauthSessionTTL                    = 10 * time.Minute
+	oauthSessionClaimTTL               = 2 * time.Minute
+	oauthSessionClaimHeartbeatInterval = oauthSessionClaimTTL / 3
+	oauthSessionCleanupTimeout         = 5 * time.Second
+)
 
 var ErrOAuthSessionInvalidOrExpired = errors.New("OAuth session is invalid or expired")
-
-type oauthSession struct {
-	CodeVerifier string
-	AnonymousID  string
-	Origin       string
-	ExpiresAt    time.Time
-}
 
 type OAuthStartResult struct {
 	AuthorizationURL string `json:"authorization_url"`
@@ -41,15 +42,14 @@ type OAuthStartResult struct {
 }
 
 type OAuthService struct {
-	mu       sync.Mutex
-	sessions map[string]oauthSession
-	client   *http.Client
+	client                 *http.Client
+	claimHeartbeatInterval time.Duration
 }
 
 func NewOAuthService() *OAuthService {
 	return &OAuthService{
-		sessions: make(map[string]oauthSession),
-		client:   newDirectHTTPClient(15 * time.Second),
+		client:                 zencoderOAuthHTTPClient,
+		claimHeartbeatInterval: oauthSessionClaimHeartbeatInterval,
 	}
 }
 
@@ -69,26 +69,14 @@ func (s *OAuthService) StartZencoderLogin(origin string) (OAuthStartResult, erro
 	if err != nil {
 		return OAuthStartResult{}, err
 	}
+	encryptedVerifier, err := secret.Encrypt(verifier)
+	if err != nil {
+		return OAuthStartResult{}, fmt.Errorf("encrypt OAuth code verifier: %w", err)
+	}
 	callbackURL, err := loopbackCallbackURL(origin, state)
 	if err != nil {
 		return OAuthStartResult{}, err
 	}
-
-	s.mu.Lock()
-	now := time.Now()
-	for key, session := range s.sessions {
-		if now.After(session.ExpiresAt) {
-			delete(s.sessions, key)
-		}
-	}
-	s.sessions[state] = oauthSession{
-		CodeVerifier: verifier,
-		AnonymousID:  anonymousID,
-		Origin:       strings.TrimRight(origin, "/"),
-		ExpiresAt:    now.Add(oauthSessionTTL),
-	}
-	s.mu.Unlock()
-
 	signInURL, err := url.Parse(zencoderAuthBaseURL() + "/extension/signin")
 	if err != nil {
 		return OAuthStartResult{}, err
@@ -98,6 +86,26 @@ func (s *OAuthService) StartZencoderLogin(origin string) (OAuthStartResult, erro
 	query.Set("redirect_uri", callbackURL)
 	query.Set("code_challenge", pkceChallenge(verifier))
 	signInURL.RawQuery = query.Encode()
+
+	now := time.Now()
+	db := database.GetDB()
+	if db == nil {
+		return OAuthStartResult{}, errors.New("database is not initialized")
+	}
+	if err := db.Where("expires_at <= ?", now).Delete(&model.OAuthSession{}).Error; err != nil {
+		return OAuthStartResult{}, fmt.Errorf("delete expired OAuth sessions: %w", err)
+	}
+	if err := db.Create(&model.OAuthSession{
+		State:        state,
+		CodeVerifier: encryptedVerifier,
+		AnonymousID:  anonymousID,
+		Origin:       strings.TrimRight(origin, "/"),
+		RedirectURL:  callbackURL,
+		ExpiresAt:    now.Add(oauthSessionTTL),
+	}).Error; err != nil {
+		return OAuthStartResult{}, fmt.Errorf("persist OAuth session: %w", err)
+	}
+
 	return OAuthStartResult{AuthorizationURL: signInURL.String(), State: state}, nil
 }
 
@@ -112,36 +120,235 @@ func (s *OAuthService) CompleteZencoderLogin(
 	code string,
 	provider string,
 ) (OAuthCompleteResult, error) {
-	s.mu.Lock()
-	session, exists := s.sessions[state]
-	if exists {
-		delete(s.sessions, state)
-	}
-	s.mu.Unlock()
-	if !exists || time.Now().After(session.ExpiresAt) {
-		return OAuthCompleteResult{}, ErrOAuthSessionInvalidOrExpired
-	}
 	if strings.TrimSpace(code) == "" {
-		return OAuthCompleteResult{Origin: session.Origin}, errors.New("OAuth callback has no authorization code")
+		return OAuthCompleteResult{}, errors.New("OAuth callback has no authorization code")
 	}
-	if provider != "workos" {
+	if !strings.EqualFold(strings.TrimSpace(provider), "workos") {
 		provider = "frontegg"
+	} else {
+		provider = "workos"
 	}
+	session, err := claimOAuthSession(ctx, state)
+	if err != nil {
+		return OAuthCompleteResult{}, err
+	}
+	claimCtx, heartbeat := startOAuthSessionClaimHeartbeat(
+		ctx,
+		session.ID,
+		session.ClaimID,
+		s.claimHeartbeatInterval,
+	)
+	release := true
+	defer func() {
+		_ = heartbeat.Stop()
+		if !release {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), oauthSessionCleanupTimeout)
+		defer cancel()
+		if err := releaseOAuthSession(cleanupCtx, session.ID, session.ClaimID); err != nil {
+			logging.Errorf("Release OAuth session: %v", err)
+		}
+	}()
 
-	tokens, err := s.exchangeCode(ctx, provider, code, session.CodeVerifier, session.AnonymousID)
+	codeVerifier, err := secret.Decrypt(session.CodeVerifier)
+	if err != nil {
+		return OAuthCompleteResult{Origin: session.Origin}, fmt.Errorf("decrypt OAuth code verifier: %w", err)
+	}
+	tokens, err := s.exchangeCode(claimCtx, provider, code, codeVerifier, session.AnonymousID)
+	if claimErr := heartbeat.Err(); claimErr != nil {
+		return OAuthCompleteResult{Origin: session.Origin}, claimErr
+	}
 	if err != nil {
 		return OAuthCompleteResult{Origin: session.Origin}, err
 	}
-	profile, err := s.fetchProfile(ctx, tokens.AccessToken)
+	profile, err := oauthProfileFromAccessToken(tokens.AccessToken)
+	if err != nil {
+		profile, err = s.fetchProfile(claimCtx, tokens.AccessToken)
+	}
+	if claimErr := heartbeat.Err(); claimErr != nil {
+		return OAuthCompleteResult{Origin: session.Origin}, claimErr
+	}
 	if err != nil {
 		return OAuthCompleteResult{Origin: session.Origin}, err
 	}
-	account, err := upsertOAuthAccount(provider, session.AnonymousID, tokens, profile)
+	// Stop renewal before the final transaction. The transaction only performs
+	// narrow local writes: account upsert and session consume are atomic, while
+	// all external HTTP work above remains outside the transaction.
+	if err := heartbeat.Stop(); err != nil {
+		return OAuthCompleteResult{Origin: session.Origin}, err
+	}
+	account, err := upsertAndConsumeOAuthAccount(ctx, session.ID, session.ClaimID, provider, session.AnonymousID, tokens, profile)
 	if err != nil {
 		return OAuthCompleteResult{Origin: session.Origin}, err
+	}
+	release = false
+	if err := deleteOAuthSession(ctx, session.ID, session.ClaimID); err != nil {
+		logging.Errorf("Delete completed OAuth session: %v", err)
 	}
 	RefreshAccountPool()
+	TriggerAccountCreditsRefresh(ctx, account, "")
 	return OAuthCompleteResult{Account: account, Origin: session.Origin}, nil
+}
+
+func claimOAuthSession(ctx context.Context, state string) (*model.OAuthSession, error) {
+	if strings.TrimSpace(state) == "" {
+		return nil, ErrOAuthSessionInvalidOrExpired
+	}
+	db := database.GetDB()
+	if db == nil {
+		return nil, errors.New("database is not initialized")
+	}
+
+	claimID, err := randomURLToken(18)
+	if err != nil {
+		return nil, fmt.Errorf("create OAuth session claim: %w", err)
+	}
+	var session model.OAuthSession
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+		staleClaim := now.Add(-oauthSessionClaimTTL)
+		if err := tx.Where("state = ? AND consumed_at IS NULL AND expires_at > ? AND (claimed_at IS NULL OR claimed_at <= ?)", state, now, staleClaim).
+			First(&session).Error; err != nil {
+			return err
+		}
+		result := tx.Model(&model.OAuthSession{}).
+			Where("id = ? AND consumed_at IS NULL AND expires_at > ? AND (claimed_at IS NULL OR claimed_at <= ?)", session.ID, now, staleClaim).
+			Updates(map[string]interface{}{"claim_id": claimID, "claimed_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrOAuthSessionInvalidOrExpired
+		}
+		session.ClaimID = claimID
+		session.ClaimedAt = &now
+		return nil
+	})
+	if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, ErrOAuthSessionInvalidOrExpired) {
+		return nil, ErrOAuthSessionInvalidOrExpired
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim OAuth session: %w", err)
+	}
+	return &session, nil
+}
+
+type oauthSessionClaimHeartbeat struct {
+	cancel   context.CancelFunc
+	done     chan struct{}
+	stopOnce sync.Once
+	errMu    sync.Mutex
+	err      error
+}
+
+func startOAuthSessionClaimHeartbeat(
+	parent context.Context,
+	id uint,
+	claimID string,
+	interval time.Duration,
+) (context.Context, *oauthSessionClaimHeartbeat) {
+	if interval <= 0 || interval >= oauthSessionClaimTTL {
+		interval = oauthSessionClaimHeartbeatInterval
+	}
+	ctx, cancel := context.WithCancel(parent)
+	heartbeat := &oauthSessionClaimHeartbeat{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	go heartbeat.run(ctx, id, claimID, interval)
+	return ctx, heartbeat
+}
+
+func (h *oauthSessionClaimHeartbeat) run(ctx context.Context, id uint, claimID string, interval time.Duration) {
+	defer close(h.done)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := renewOAuthSessionClaim(ctx, id, claimID); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				h.errMu.Lock()
+				h.err = fmt.Errorf("renew OAuth session claim: %w", err)
+				h.errMu.Unlock()
+				h.cancel()
+				return
+			}
+		}
+	}
+}
+
+func (h *oauthSessionClaimHeartbeat) Err() error {
+	h.errMu.Lock()
+	defer h.errMu.Unlock()
+	return h.err
+}
+
+func (h *oauthSessionClaimHeartbeat) Stop() error {
+	h.stopOnce.Do(func() {
+		h.cancel()
+		<-h.done
+	})
+	return h.Err()
+}
+
+func renewOAuthSessionClaim(ctx context.Context, id uint, claimID string) error {
+	db := database.GetDB()
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
+	now := time.Now()
+	result := db.WithContext(ctx).Model(&model.OAuthSession{}).
+		Where("id = ? AND claim_id = ? AND consumed_at IS NULL AND expires_at > ?", id, claimID, now).
+		Update("claimed_at", now)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrOAuthSessionInvalidOrExpired
+	}
+	return nil
+}
+
+func releaseOAuthSession(ctx context.Context, id uint, claimID string) error {
+	db := database.GetDB()
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
+	return db.WithContext(ctx).Model(&model.OAuthSession{}).
+		Where("id = ? AND claim_id = ? AND consumed_at IS NULL", id, claimID).
+		Updates(map[string]interface{}{"claim_id": "", "claimed_at": gorm.Expr("NULL")}).Error
+}
+
+func deleteOAuthSession(ctx context.Context, id uint, claimID string) error {
+	db := database.GetDB()
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
+	return db.WithContext(ctx).Where("id = ? AND claim_id = ?", id, claimID).Delete(&model.OAuthSession{}).Error
+}
+
+func consumeOAuthSession(ctx context.Context, id uint, claimID string) error {
+	db := database.GetDB()
+	if db == nil {
+		return errors.New("database is not initialized")
+	}
+	now := time.Now()
+	result := db.WithContext(ctx).Model(&model.OAuthSession{}).
+		Where("id = ? AND claim_id = ? AND consumed_at IS NULL AND expires_at > ?", id, claimID, now).
+		Update("consumed_at", now)
+	if result.Error != nil {
+		return fmt.Errorf("consume OAuth session: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return ErrOAuthSessionInvalidOrExpired
+	}
+	return nil
 }
 
 func loopbackCallbackURL(origin string, state string) (string, error) {
@@ -168,11 +375,14 @@ func (s *OAuthService) exchangeCode(
 	codeVerifier string,
 	anonymousID string,
 ) (zencoderOAuthTokens, error) {
+	body := map[string]string{
+		"code":         code,
+		"codeVerifier": codeVerifier,
+	}
 	endpoint := "/api/oauth/token"
-	body := map[string]interface{}{"code": code, "codeVerifier": codeVerifier}
 	if provider == "workos" {
+		body["provider"] = provider
 		endpoint = "/api/auth/token"
-		body["provider"] = "workos"
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -183,6 +393,10 @@ func (s *OAuthService) exchangeCode(
 		return zencoderOAuthTokens{}, err
 	}
 	setOAuthServiceHeaders(req, anonymousID)
+	logging.Debugf(
+		"Zencoder OAuth exchange request request_id=%s provider=%s endpoint=%s plugin_version=%s code_bytes=%d verifier_bytes=%d",
+		logging.RequestIDFromContext(ctx), provider, oauthLogURL(req.URL), req.Header.Get("x-zencoder-plugin-version"), len(code), len(codeVerifier),
+	)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return zencoderOAuthTokens{}, fmt.Errorf("exchange Zencoder OAuth code: %w", err)
@@ -192,17 +406,52 @@ func (s *OAuthService) exchangeCode(
 	if err != nil {
 		return zencoderOAuthTokens{}, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	logOAuthHTTPResponse(ctx, "exchange", resp, responseBody)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return zencoderOAuthTokens{}, fmt.Errorf("exchange Zencoder OAuth code: HTTP %d", resp.StatusCode)
 	}
-	return parseOAuthTokens(responseBody)
+	tokens, err := parseOAuthTokens(responseBody)
+	if err != nil {
+		return zencoderOAuthTokens{}, err
+	}
+	if tokens.RefreshToken == "" {
+		return zencoderOAuthTokens{}, errors.New("zencoder OAuth response has no refresh token")
+	}
+	return tokens, nil
 }
 
 type zencoderOAuthProfile struct {
 	UserID   string
 	TenantID string
 	Email    string
-	Name     string
+}
+
+func oauthProfileFromAccessToken(accessToken string) (zencoderOAuthProfile, error) {
+	payload, err := decodeJWTPayload(accessToken)
+	if err != nil {
+		return zencoderOAuthProfile{}, err
+	}
+	var claims struct {
+		Subject        string `json:"sub"`
+		UserID         string `json:"user_id"`
+		UserIDCamel    string `json:"userId"`
+		TenantID       string `json:"tenant_id"`
+		TenantIDCamel  string `json:"tenantId"`
+		OrganizationID string `json:"org_id"`
+		Email          string `json:"email"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return zencoderOAuthProfile{}, fmt.Errorf("decode zencoder OAuth token claims: %w", err)
+	}
+	profile := zencoderOAuthProfile{
+		UserID:   firstNonEmpty(claims.UserID, claims.UserIDCamel, claims.Subject),
+		TenantID: firstNonEmpty(claims.TenantID, claims.TenantIDCamel, claims.OrganizationID),
+		Email:    strings.TrimSpace(claims.Email),
+	}
+	if profile.UserID == "" || profile.TenantID == "" {
+		return zencoderOAuthProfile{}, errors.New("zencoder OAuth token is missing account identity")
+	}
+	return profile, nil
 }
 
 func (s *OAuthService) fetchProfile(ctx context.Context, accessToken string) (zencoderOAuthProfile, error) {
@@ -220,6 +469,7 @@ func (s *OAuthService) fetchProfile(ctx context.Context, accessToken string) (ze
 	if err != nil {
 		return zencoderOAuthProfile{}, err
 	}
+	logOAuthHTTPResponse(ctx, "profile", resp, body)
 	if resp.StatusCode != http.StatusOK {
 		return zencoderOAuthProfile{}, fmt.Errorf("fetch zencoder OAuth profile: HTTP %d", resp.StatusCode)
 	}
@@ -227,7 +477,6 @@ func (s *OAuthService) fetchProfile(ctx context.Context, accessToken string) (ze
 		UserID   string `json:"user_id"`
 		TenantID string `json:"org_id"`
 		Email    string `json:"email"`
-		Name     string `json:"name"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return zencoderOAuthProfile{}, fmt.Errorf("decode zencoder OAuth profile: %w", err)
@@ -235,55 +484,173 @@ func (s *OAuthService) fetchProfile(ctx context.Context, accessToken string) (ze
 	if raw.UserID == "" || raw.TenantID == "" {
 		return zencoderOAuthProfile{}, errors.New("zencoder OAuth profile is missing account identity")
 	}
-	return zencoderOAuthProfile{UserID: raw.UserID, TenantID: raw.TenantID, Email: raw.Email, Name: raw.Name}, nil
+	return zencoderOAuthProfile{UserID: raw.UserID, TenantID: raw.TenantID, Email: raw.Email}, nil
 }
 
 func upsertOAuthAccount(
+	ctx context.Context,
 	provider string,
 	anonymousID string,
 	tokens zencoderOAuthTokens,
 	profile zencoderOAuthProfile,
 ) (*model.Account, error) {
-	digest := sha256.Sum256([]byte(provider + ":" + profile.TenantID + ":" + profile.UserID))
-	clientID := "oauth-" + hex.EncodeToString(digest[:8])
 	db := database.GetDB()
+	if db == nil {
+		return nil, errors.New("database is not initialized")
+	}
 	var account model.Account
-	result := db.Where("client_id = ?", clientID).First(&account)
-	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-		account = model.Account{
-			ClientID:         clientID,
-			CredentialType:   model.CredentialOAuth,
-			OAuthProvider:    provider,
-			OAuthEmail:       profile.Email,
-			OAuthUserID:      profile.UserID,
-			OAuthTenantID:    profile.TenantID,
-			OAuthAnonymousID: anonymousID,
-			AccessToken:      tokens.AccessToken,
-			RefreshToken:     tokens.RefreshToken,
-			TokenExpiresAt:   tokens.ExpiresAt,
-		}
-		if err := db.Create(&account).Error; err != nil {
-			return nil, fmt.Errorf("create OAuth account: %w", err)
-		}
-		return &account, nil
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		account, err = upsertOAuthAccountTx(tx, provider, anonymousID, tokens, profile)
+		return err
+	}); err != nil {
+		return nil, err
 	}
-	if result.Error != nil {
-		return nil, fmt.Errorf("find OAuth account: %w", result.Error)
-	}
-
-	account.CredentialType = model.CredentialOAuth
-	account.OAuthProvider = provider
-	account.OAuthEmail = profile.Email
-	account.OAuthUserID = profile.UserID
-	account.OAuthTenantID = profile.TenantID
-	account.OAuthAnonymousID = anonymousID
-	account.AccessToken = tokens.AccessToken
-	account.RefreshToken = tokens.RefreshToken
-	account.TokenExpiresAt = tokens.ExpiresAt
-	if err := db.Save(&account).Error; err != nil {
-		return nil, fmt.Errorf("update OAuth account: %w", err)
+	if err := decryptOAuthAccountTokens(&account); err != nil {
+		return nil, err
 	}
 	return &account, nil
+}
+
+// upsertAndConsumeOAuthAccount commits the credential mutation and one-time
+// session transition together. No network operation belongs in this
+// transaction; callers must complete exchange/profile HTTP first.
+func upsertAndConsumeOAuthAccount(
+	ctx context.Context,
+	sessionID uint,
+	claimID string,
+	provider string,
+	anonymousID string,
+	tokens zencoderOAuthTokens,
+	profile zencoderOAuthProfile,
+) (*model.Account, error) {
+	db := database.GetDB()
+	if db == nil {
+		return nil, errors.New("database is not initialized")
+	}
+	var account model.Account
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		account, err = upsertOAuthAccountTx(tx, provider, anonymousID, tokens, profile)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		result := tx.Model(&model.OAuthSession{}).
+			Where("id = ? AND claim_id = ? AND consumed_at IS NULL AND expires_at > ?", sessionID, claimID, now).
+			Update("consumed_at", now)
+		if result.Error != nil {
+			return fmt.Errorf("consume OAuth session: %w", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return ErrOAuthSessionInvalidOrExpired
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := decryptOAuthAccountTokens(&account); err != nil {
+		return nil, err
+	}
+	return &account, nil
+}
+
+func upsertOAuthAccountTx(
+	db *gorm.DB,
+	provider string,
+	anonymousID string,
+	tokens zencoderOAuthTokens,
+	profile zencoderOAuthProfile,
+) (model.Account, error) {
+	digest := sha256.Sum256([]byte(provider + ":" + profile.TenantID + ":" + profile.UserID))
+	clientID := "oauth-" + hex.EncodeToString(digest[:])
+	encryptedAccessToken, err := secret.Encrypt(tokens.AccessToken)
+	if err != nil {
+		return model.Account{}, fmt.Errorf("encrypt OAuth access token: %w", err)
+	}
+	encryptedRefreshToken, err := secret.Encrypt(tokens.RefreshToken)
+	if err != nil {
+		return model.Account{}, fmt.Errorf("encrypt OAuth refresh token: %w", err)
+	}
+	account := model.Account{
+		ClientID:           clientID,
+		CredentialType:     model.CredentialOAuth,
+		OAuthProvider:      provider,
+		OAuthEmail:         profile.Email,
+		OAuthUserID:        profile.UserID,
+		OAuthTenantID:      profile.TenantID,
+		OAuthAnonymousID:   anonymousID,
+		AccessToken:        encryptedAccessToken,
+		RefreshToken:       encryptedRefreshToken,
+		CredentialRevision: 1,
+		TokenExpiresAt:     tokens.ExpiresAt,
+	}
+	updates := map[string]interface{}{
+		"credential_type":                   model.CredentialOAuth,
+		"o_auth_provider":                   provider,
+		"o_auth_email":                      profile.Email,
+		"o_auth_user_id":                    profile.UserID,
+		"o_auth_tenant_id":                  profile.TenantID,
+		"o_auth_anonymous_id":               anonymousID,
+		"access_token":                      encryptedAccessToken,
+		"api_key":                           "",
+		"token_expires_at":                  tokens.ExpiresAt,
+		"health_state":                      model.AccountHealthHealthy,
+		"cooldown_until":                    gorm.Expr("NULL"),
+		"last_error_class":                  "",
+		"last_error_at":                     gorm.Expr("NULL"),
+		"failure_count":                     0,
+		"reauth_required":                   false,
+		"credential_revision":               gorm.Expr("credential_revision + 1"),
+		"usage_credits_operation_credits":   0,
+		"usage_credits_turns":               0,
+		"usage_credits_operation_exists":    false,
+		"usage_credits_consumed":            0,
+		"usage_credits_budget":              0,
+		"usage_credits_remaining":           0,
+		"usage_credits_available":           false,
+		"usage_credits_status":              UsageCreditsStateUnknown,
+		"usage_credits_source":              "",
+		"usage_credits_updated_at":          gorm.Expr("NULL"),
+		"usage_credits_period_end":          gorm.Expr("NULL"),
+		"usage_credits_last_attempt_at":     gorm.Expr("NULL"),
+		"usage_credits_operation_id":        "",
+		"usage_credits_credential_revision": 0,
+		"usage_credits_query_revision":      gorm.Expr("usage_credits_query_revision + 1"),
+		"usage_credits_lease_id":            "",
+		"usage_credits_lease_until":         gorm.Expr("NULL"),
+		"updated_at":                        time.Now(),
+	}
+	if tokens.RefreshToken != "" {
+		updates["refresh_token"] = encryptedRefreshToken
+	}
+	if err := db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "client_id"}},
+		DoUpdates: clause.Assignments(updates),
+	}).Create(&account).Error; err != nil {
+		return model.Account{}, fmt.Errorf("upsert OAuth account: %w", err)
+	}
+	if err := db.Where("client_id = ?", clientID).First(&account).Error; err != nil {
+		return model.Account{}, fmt.Errorf("load OAuth account after upsert: %w", err)
+	}
+	return account, nil
+}
+
+func decryptOAuthAccountTokens(account *model.Account) error {
+	if account == nil {
+		return errors.New("OAuth account is nil")
+	}
+	var err error
+	account.AccessToken, err = secret.Decrypt(account.AccessToken)
+	if err != nil {
+		return fmt.Errorf("decrypt OAuth access token after upsert: %w", err)
+	}
+	account.RefreshToken, err = secret.Decrypt(account.RefreshToken)
+	if err != nil {
+		return fmt.Errorf("decrypt OAuth refresh token after upsert: %w", err)
+	}
+	return nil
 }
 
 func randomURLToken(size int) (string, error) {

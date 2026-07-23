@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -18,10 +17,11 @@ import (
 const OpenAIBaseURL = "https://api.zencoder.ai/openai"
 
 func openAICompatibleBaseURL(providerID string) string {
+	baseURL := zencoderGatewayBaseURL()
 	if providerID == "" || providerID == "openai" {
-		return OpenAIBaseURL
+		return baseURL + "/openai"
 	}
-	return "https://api.zencoder.ai/" + providerID
+	return baseURL + "/" + strings.Trim(providerID, "/")
 }
 
 type OpenAIService struct{}
@@ -32,8 +32,10 @@ func NewOpenAIService() *OpenAIService {
 
 // ChatCompletions 处理/v1/chat/completions请求
 func (s *OpenAIService) ChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
+	ctx = ensureOperationID(ctx)
 	var req struct {
-		Model string `json:"model"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid request body: %w", err)
@@ -41,6 +43,10 @@ func (s *OpenAIService) ChatCompletions(ctx context.Context, body []byte) (*http
 
 	if req.Model == "" {
 		return nil, fmt.Errorf("model is required")
+	}
+	zenModel, known := model.GetZenModel(req.Model)
+	if !known {
+		return nil, unknownModelError(req.Model)
 	}
 
 	// The gateway catalog exposes Anthropic-compatible providers such as GLM
@@ -61,12 +67,16 @@ func (s *OpenAIService) ChatCompletions(ctx context.Context, body []byte) (*http
 	DebugLogRequest(ctx, "OpenAI", "/v1/chat/completions", req.Model)
 
 	var lastErr error
-	for i := 0; i < maxAccountAttempts; i++ {
-		account, err := GetNextAccount()
+	tried := make(map[uint]struct{})
+	refreshedAfter401 := make(map[uint]struct{})
+	attemptLimit := accountAttemptLimit()
+	for i := 0; i < attemptLimit; i++ {
+		account, err := GetNextAccountContext(ctx, tried)
 		if err != nil {
 			DebugLogRequestEnd(ctx, "OpenAI", false, err)
 			return nil, err
 		}
+		tried[account.ID] = struct{}{}
 		DebugLogAccountSelected(ctx, "OpenAI", account.ID, account.OAuthEmail)
 
 		// Chat Completions and Responses are different APIs. Keep the incoming
@@ -74,42 +84,56 @@ func (s *OpenAIService) ChatCompletions(ctx context.Context, body []byte) (*http
 		resp, err := s.doRequest(ctx, account, req.Model, "/v1/chat/completions", body)
 		if err != nil {
 			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			MarkAccountFailure(account, 0, 0, err)
 			DebugLogRetry(ctx, "OpenAI", i+1, account.ID, err)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
 		DebugLogResponseReceived(ctx, "OpenAI", resp.StatusCode)
 		DebugLogResponseHeaders(ctx, "OpenAI", resp.Header)
 
-		// 总是输出重要的响应头信息
-		if resp.Header.Get("Zen-Pricing-Period-Limit") != "" ||
-			resp.Header.Get("Zen-Pricing-Period-Cost") != "" ||
-			resp.Header.Get("Zen-Request-Cost") != "" {
-			log.Printf("[OpenAI] 积分信息 - 周期限额: %s, 周期消耗: %s, 本次消耗: %s",
-				resp.Header.Get("Zen-Pricing-Period-Limit"),
-				resp.Header.Get("Zen-Pricing-Period-Cost"),
-				resp.Header.Get("Zen-Request-Cost"))
-		}
-
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 300 {
 			// 读取错误响应内容
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := readUpstreamErrorBody(resp.Body)
 			resp.Body.Close()
 			DebugLogErrorResponse(ctx, "OpenAI", resp.StatusCode, string(errBody))
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			_, alreadyRefreshed := refreshedAfter401[account.ID]
+			if resp.StatusCode == http.StatusUnauthorized && account.CredentialType == model.CredentialOAuth && !alreadyRefreshed {
+				if err := ForceOAuthRefresh(ctx, account); err == nil {
+					refreshedAfter401[account.ID] = struct{}{}
+					delete(tried, account.ID)
+					i--
+					continue
+				}
+			}
 
 			// 400和500错误直接返回，不进行账号错误计数
-			if resp.StatusCode == 400 || resp.StatusCode == 500 {
+			if !shouldRetryUpstreamStatus(resp.StatusCode) {
 				DebugLogRequestEnd(ctx, "OpenAI", false, fmt.Errorf("API error: %d", resp.StatusCode))
 				return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 			}
 
 			lastErr = &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+			MarkAccountFailure(account, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")), lastErr)
 			DebugLogRetry(ctx, "OpenAI", i+1, account.ID, lastErr)
 			continue
 		}
 
-		zenModel := model.ResolveOpenAIModel(req.Model)
-		UpdateAccountCreditsFromResponse(account, resp, zenModel.Multiplier)
+		if req.Stream {
+			finalizeStreamingAccount(ctx, resp, account, zenModel.Multiplier, streamOpenAIChat)
+		} else {
+			UpdateAccountCreditsFromResponse(account, resp, zenModel.Multiplier)
+			MarkAccountHealthy(account)
+		}
 
 		DebugLogRequestEnd(ctx, "OpenAI", true, nil)
 		return resp, nil
@@ -121,6 +145,9 @@ func (s *OpenAIService) ChatCompletions(ctx context.Context, body []byte) (*http
 
 func requiresResponsesForFunctionTools(modelID string, body []byte) bool {
 	zenModel := model.ResolveOpenAIModel(modelID)
+	if zenModel.ProviderID != "openai" {
+		return false
+	}
 	// Any catalog model with reasoning parameters can hit the gateway rule
 	// that rejects function tools on Chat Completions. Use the Responses route
 	// generically instead of maintaining a model-name denylist.
@@ -138,7 +165,7 @@ func requiresResponsesForFunctionTools(modelID string, body []byte) bool {
 func (s *OpenAIService) chatCompletionsViaResponses(ctx context.Context, modelID string, body []byte) (*http.Response, error) {
 	responsesBody, err := s.convertChatToResponsesBody(body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to convert Chat Completions request: %w", err)
+		return nil, openAICompatibilityError(err)
 	}
 
 	resp, err := s.Responses(ctx, responsesBody)
@@ -166,7 +193,7 @@ func (s *OpenAIService) chatCompletionsViaResponses(ctx context.Context, modelID
 }
 
 func convertResponsesResponseToChat(resp *http.Response, modelID string) (*http.Response, error) {
-	body, err := io.ReadAll(resp.Body)
+	body, err := readCompatibilityResponseBody(resp.Body)
 	resp.Body.Close()
 	if err != nil {
 		return nil, err
@@ -189,9 +216,19 @@ func convertResponsesJSONToChat(body []byte, modelID string) ([]byte, error) {
 		return nil, err
 	}
 	removeUndefinedPlaceholders(raw)
+	if status := stringValue(raw["status"]); status == "failed" {
+		message := "Responses request failed"
+		if failure, ok := raw["error"].(map[string]interface{}); ok && stringValue(failure["message"]) != "" {
+			message = stringValue(failure["message"])
+		}
+		return nil, &UpstreamError{StatusCode: http.StatusBadGateway, Body: []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"upstream_error"}}`, message))}
+	}
 
 	content := ""
 	toolCalls := make([]interface{}, 0)
+	reasoning := strings.Builder{}
+	var refusal string
+	annotations := make([]interface{}, 0)
 	if output, ok := raw["output"].([]interface{}); ok {
 		for _, item := range output {
 			itemMap, ok := item.(map[string]interface{})
@@ -209,6 +246,27 @@ func convertResponsesJSONToChat(body []byte, modelID string) ([]byte, error) {
 						if text, ok := partMap["text"].(string); ok {
 							content += text
 						}
+						if value, ok := partMap["annotations"].([]interface{}); ok {
+							annotations = append(annotations, value...)
+						}
+						if partMap["type"] == "refusal" {
+							refusal += stringValue(partMap["refusal"])
+						}
+					}
+				}
+				if value, ok := itemMap["reasoning_summary"].([]interface{}); ok {
+					for _, summary := range value {
+						if summaryMap, ok := summary.(map[string]interface{}); ok {
+							reasoning.WriteString(stringValue(summaryMap["text"]))
+						}
+					}
+				}
+			case "reasoning":
+				if summary, ok := itemMap["summary"].([]interface{}); ok {
+					for _, value := range summary {
+						if summaryMap, ok := value.(map[string]interface{}); ok {
+							reasoning.WriteString(stringValue(summaryMap["text"]))
+						}
 					}
 				}
 			case "function_call":
@@ -217,10 +275,12 @@ func convertResponsesJSONToChat(body []byte, modelID string) ([]byte, error) {
 					"arguments": itemMap["arguments"],
 				}
 				toolCalls = append(toolCalls, map[string]interface{}{
-					"id":       itemMap["call_id"],
+					"id":       firstNonEmptyString(itemMap["call_id"], stringValue(itemMap["id"])),
 					"type":     "function",
 					"function": function,
 				})
+			default:
+				return nil, fmt.Errorf("Responses output type %q cannot be represented by Chat Completions", stringValue(itemMap["type"]))
 			}
 		}
 	}
@@ -237,12 +297,24 @@ func convertResponsesJSONToChat(body []byte, modelID string) ([]byte, error) {
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
 	}
+	if reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
+	}
+	if refusal != "" {
+		message["refusal"] = refusal
+	}
+	if len(annotations) > 0 {
+		message["annotations"] = annotations
+	}
 
 	finishReason := "stop"
 	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
 	} else if status, _ := raw["status"].(string); status == "incomplete" {
 		finishReason = "length"
+		if details, ok := raw["incomplete_details"].(map[string]interface{}); ok && stringValue(details["reason"]) == "content_filter" {
+			finishReason = "content_filter"
+		}
 	}
 
 	usage := map[string]interface{}{}
@@ -300,6 +372,8 @@ func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, 
 	nextToolIndex := 0
 	eventName := ""
 	dataLines := make([]string, 0, 1)
+	terminalSeen := false
+	doneWritten := false
 
 	writeChunk := func(delta map[string]interface{}, finishReason interface{}) error {
 		chunk := map[string]interface{}{
@@ -322,10 +396,47 @@ func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, 
 		_, err = fmt.Fprintf(destination, "data: %s\n\n", encoded)
 		return err
 	}
+	writeUsage := func(source map[string]interface{}) error {
+		if len(source) == 0 {
+			return nil
+		}
+		usage := map[string]interface{}{
+			"prompt_tokens":     source["input_tokens"],
+			"completion_tokens": source["output_tokens"],
+			"total_tokens":      source["total_tokens"],
+		}
+		if details, ok := source["input_tokens_details"].(map[string]interface{}); ok {
+			usage["prompt_tokens_details"] = map[string]interface{}{"cached_tokens": details["cached_tokens"]}
+		}
+		if details, ok := source["output_tokens_details"].(map[string]interface{}); ok {
+			usage["completion_tokens_details"] = map[string]interface{}{"reasoning_tokens": details["reasoning_tokens"]}
+		}
+		encoded, err := json.Marshal(map[string]interface{}{
+			"id": operationID, "object": "chat.completion.chunk", "created": created,
+			"model": modelID, "choices": []interface{}{}, "usage": usage,
+		})
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(destination, "data: %s\n\n", encoded)
+		return err
+	}
 
 	writeDone := func() error {
+		if doneWritten {
+			return nil
+		}
+		doneWritten = true
 		_, err := io.WriteString(destination, "data: [DONE]\n\n")
 		return err
+	}
+	writeStreamError := func(message string) error {
+		terminalSeen = true
+		encoded, _ := json.Marshal(map[string]interface{}{"error": map[string]interface{}{"message": message, "type": "upstream_error"}})
+		if _, err := fmt.Fprintf(destination, "data: %s\n\n", encoded); err != nil {
+			return err
+		}
+		return writeDone()
 	}
 
 	processEvent := func() error {
@@ -335,16 +446,18 @@ func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, 
 		payload := strings.Join(dataLines, "\n")
 		dataLines = dataLines[:0]
 		if payload == "[DONE]" {
-			return writeDone()
+			return nil
 		}
 
 		var event map[string]interface{}
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			return nil
+			return writeStreamError("invalid upstream Responses SSE event")
 		}
 		if eventName == "" {
 			eventName, _ = event["type"].(string)
 		}
+		currentEvent := eventName
+		eventName = ""
 
 		if response, ok := event["response"].(map[string]interface{}); ok {
 			if id, ok := response["id"].(string); ok && id != "" {
@@ -355,17 +468,28 @@ func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, 
 			}
 		}
 
-		switch eventName {
+		switch currentEvent {
 		case "response.output_text.delta":
 			delta, _ := event["delta"].(string)
 			if delta != "" {
 				return writeChunk(map[string]interface{}{"content": delta}, nil)
+			}
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			delta, _ := event["delta"].(string)
+			if delta != "" {
+				return writeChunk(map[string]interface{}{"reasoning_content": delta}, nil)
+			}
+		case "response.refusal.delta":
+			delta, _ := event["delta"].(string)
+			if delta != "" {
+				return writeChunk(map[string]interface{}{"refusal": delta}, nil)
 			}
 		case "response.output_item.added":
 			item, _ := event["item"].(map[string]interface{})
 			if itemType, _ := item["type"].(string); itemType == "function_call" {
 				toolCallSeen = true
 				itemID, _ := item["id"].(string)
+				callID := firstNonEmptyString(item["call_id"], itemID)
 				index := nextToolIndex
 				nextToolIndex++
 				if itemID != "" {
@@ -375,7 +499,7 @@ func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, 
 					"role": "assistant",
 					"tool_calls": []interface{}{map[string]interface{}{
 						"index": index,
-						"id":    item["call_id"],
+						"id":    callID,
 						"type":  "function",
 						"function": map[string]interface{}{
 							"name":      item["name"],
@@ -400,25 +524,52 @@ func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, 
 					},
 				}},
 			}, nil)
-		case "response.completed", "response.failed", "response.incomplete":
+		case "response.failed":
+			terminalSeen = true
+			message := "Responses request failed"
+			if response, ok := event["response"].(map[string]interface{}); ok {
+				if failure, ok := response["error"].(map[string]interface{}); ok && stringValue(failure["message"]) != "" {
+					message = stringValue(failure["message"])
+				}
+			}
+			return writeStreamError(message)
+		case "error":
+			terminalSeen = true
+			message := "Responses stream failed"
+			if failure, ok := event["error"].(map[string]interface{}); ok && stringValue(failure["message"]) != "" {
+				message = stringValue(failure["message"])
+			}
+			return writeStreamError(message)
+		case "response.completed", "response.incomplete":
+			terminalSeen = true
+			response, _ := event["response"].(map[string]interface{})
 			finishReason := "stop"
 			if toolCallSeen {
 				finishReason = "tool_calls"
 			}
-			if eventName != "response.completed" {
+			if currentEvent != "response.completed" {
 				finishReason = "length"
+				if response != nil {
+					if details, ok := response["incomplete_details"].(map[string]interface{}); ok && stringValue(details["reason"]) == "content_filter" {
+						finishReason = "content_filter"
+					}
+				}
 			}
 			if err := writeChunk(map[string]interface{}{}, finishReason); err != nil {
 				return err
 			}
+			if usage, ok := response["usage"].(map[string]interface{}); ok {
+				if err := writeUsage(usage); err != nil {
+					return err
+				}
+			}
 			return writeDone()
 		}
-		eventName = ""
 		return nil
 	}
 
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readSSELine(reader)
 		trimmed := strings.TrimRight(line, "\r\n")
 		switch {
 		case strings.HasPrefix(trimmed, "event:"):
@@ -432,6 +583,12 @@ func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, 
 		}
 		if err != nil {
 			if err == io.EOF {
+				if err := processEvent(); err != nil {
+					return err
+				}
+				if !terminalSeen {
+					return writeStreamError("upstream Responses stream ended without a terminal event")
+				}
 				return nil
 			}
 			return err
@@ -441,8 +598,10 @@ func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, 
 
 // Responses 处理/v1/responses请求
 func (s *OpenAIService) Responses(ctx context.Context, body []byte) (*http.Response, error) {
+	ctx = ensureOperationID(ctx)
 	var req struct {
-		Model string `json:"model"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid request body: %w", err)
@@ -451,64 +610,80 @@ func (s *OpenAIService) Responses(ctx context.Context, body []byte) (*http.Respo
 	if req.Model == "" {
 		return nil, fmt.Errorf("model is required")
 	}
+	zenModel, known := model.GetZenModel(req.Model)
+	if !known {
+		return nil, unknownModelError(req.Model)
+	}
 
 	DebugLogRequest(ctx, "OpenAI", "/v1/responses", req.Model)
 
 	var lastErr error
-	for i := 0; i < maxAccountAttempts; i++ {
-		account, err := GetNextAccount()
+	tried := make(map[uint]struct{})
+	refreshedAfter401 := make(map[uint]struct{})
+	attemptLimit := accountAttemptLimit()
+	for i := 0; i < attemptLimit; i++ {
+		account, err := GetNextAccountContext(ctx, tried)
 		if err != nil {
 			DebugLogRequestEnd(ctx, "OpenAI", false, err)
 			return nil, err
 		}
+		tried[account.ID] = struct{}{}
 		DebugLogAccountSelected(ctx, "OpenAI", account.ID, account.OAuthEmail)
 
 		resp, err := s.doRequest(ctx, account, req.Model, "/v1/responses", body)
 		if err != nil {
 			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			MarkAccountFailure(account, 0, 0, err)
 			DebugLogRetry(ctx, "OpenAI", i+1, account.ID, err)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
 		DebugLogResponseReceived(ctx, "OpenAI", resp.StatusCode)
 		DebugLogResponseHeaders(ctx, "OpenAI", resp.Header)
 
-		// 总是输出重要的响应头信息
-		if resp.Header.Get("Zen-Pricing-Period-Limit") != "" ||
-			resp.Header.Get("Zen-Pricing-Period-Cost") != "" ||
-			resp.Header.Get("Zen-Request-Cost") != "" {
-			log.Printf("[OpenAI] 积分信息 - 周期限额: %s, 周期消耗: %s, 本次消耗: %s",
-				resp.Header.Get("Zen-Pricing-Period-Limit"),
-				resp.Header.Get("Zen-Pricing-Period-Cost"),
-				resp.Header.Get("Zen-Request-Cost"))
-		}
-
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 300 {
 			// 读取错误响应内容
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := readUpstreamErrorBody(resp.Body)
 			resp.Body.Close()
 
-			// 429 错误特殊处理 - 直接返回，不重试
-			if resp.StatusCode == 429 {
-				DebugLogErrorResponse(ctx, "OpenAI", resp.StatusCode, string(errBody))
-				return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+			DebugLogErrorResponse(ctx, "OpenAI", resp.StatusCode, string(errBody))
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			_, alreadyRefreshed := refreshedAfter401[account.ID]
+			if resp.StatusCode == http.StatusUnauthorized && account.CredentialType == model.CredentialOAuth && !alreadyRefreshed {
+				if err := ForceOAuthRefresh(ctx, account); err == nil {
+					refreshedAfter401[account.ID] = struct{}{}
+					delete(tried, account.ID)
+					i--
+					continue
+				}
 			}
 
-			DebugLogErrorResponse(ctx, "OpenAI", resp.StatusCode, string(errBody))
-
 			// 400和500错误直接返回，不进行账号错误计数
-			if resp.StatusCode == 400 || resp.StatusCode == 500 {
+			if !shouldRetryUpstreamStatus(resp.StatusCode) {
 				DebugLogRequestEnd(ctx, "OpenAI", false, fmt.Errorf("API error: %d", resp.StatusCode))
 				return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 			}
 
 			lastErr = &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+			MarkAccountFailure(account, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")), lastErr)
 			DebugLogRetry(ctx, "OpenAI", i+1, account.ID, lastErr)
 			continue
 		}
 
-		zenModel := model.ResolveOpenAIModel(req.Model)
-		UpdateAccountCreditsFromResponse(account, resp, zenModel.Multiplier)
+		if req.Stream {
+			finalizeStreamingAccount(ctx, resp, account, zenModel.Multiplier, streamOpenAIResponses)
+		} else {
+			UpdateAccountCreditsFromResponse(account, resp, zenModel.Multiplier)
+			MarkAccountHealthy(account)
+		}
 
 		DebugLogRequestEnd(ctx, "OpenAI", true, nil)
 		return resp, nil
@@ -523,6 +698,17 @@ func (s *OpenAIService) convertChatToResponsesBody(body []byte) ([]byte, error) 
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
+	}
+	for _, field := range []string{"frequency_penalty", "presence_penalty", "logit_bias", "logprobs", "top_logprobs", "modalities", "audio", "user", "stream_options"} {
+		if value, ok := raw[field]; ok && value != nil {
+			return nil, fmt.Errorf("Responses compatibility path cannot preserve field %q", field)
+		}
+	}
+	if value, ok := raw["n"]; ok {
+		if intValue(value) != 1 {
+			return nil, fmt.Errorf("Responses compatibility path cannot preserve n=%v", value)
+		}
+		delete(raw, "n")
 	}
 
 	// Convert Chat Completions function tools to Responses function tools.
@@ -569,10 +755,20 @@ func (s *OpenAIService) convertChatToResponsesBody(body []byte) ([]byte, error) 
 		}
 	}
 
-	// 移除 /v1/responses API 不支持的参数
-	delete(raw, "stream_options") // 不支持 stream_options.include_usage 等
-	delete(raw, "function_call")  // 旧版函数调用参数
-	delete(raw, "functions")      // 旧版函数定义参数
+	// Legacy function definitions and selection use the same Responses tool
+	// choice shape after conversion.
+	if _, exists := raw["tool_choice"]; !exists {
+		switch choice := raw["function_call"].(type) {
+		case string:
+			raw["tool_choice"] = choice
+		case map[string]interface{}:
+			if name := stringValue(choice["name"]); name != "" {
+				raw["tool_choice"] = map[string]interface{}{"type": "function", "name": name}
+			}
+		}
+	}
+	delete(raw, "function_call") // 旧版函数调用参数
+	delete(raw, "functions")     // 旧版函数定义参数
 	if toolChoice, ok := raw["tool_choice"].(map[string]interface{}); ok {
 		if function, ok := toolChoice["function"].(map[string]interface{}); ok {
 			converted := map[string]interface{}{"type": "function"}
@@ -581,6 +777,45 @@ func (s *OpenAIService) convertChatToResponsesBody(body []byte) ([]byte, error) 
 			}
 			raw["tool_choice"] = converted
 		}
+	}
+	if format, ok := raw["response_format"].(map[string]interface{}); ok {
+		if formatType := stringValue(format["type"]); formatType != "json_object" && formatType != "json_schema" {
+			return nil, fmt.Errorf("Responses compatibility path cannot preserve response_format type %q", formatType)
+		}
+		textConfig, _ := raw["text"].(map[string]interface{})
+		if textConfig == nil {
+			textConfig = map[string]interface{}{}
+		}
+		convertedFormat := map[string]interface{}{}
+		for _, key := range []string{"type", "name", "description", "schema", "strict"} {
+			if value, exists := format[key]; exists {
+				convertedFormat[key] = value
+			}
+		}
+		if schema, ok := format["json_schema"].(map[string]interface{}); ok {
+			for _, key := range []string{"name", "description", "schema", "strict"} {
+				if value, exists := schema[key]; exists {
+					convertedFormat[key] = value
+				}
+			}
+			convertedFormat["type"] = "json_schema"
+		}
+		if len(convertedFormat) > 0 {
+			textConfig["format"] = convertedFormat
+			raw["text"] = textConfig
+		}
+		delete(raw, "response_format")
+	}
+	if effort, ok := raw["reasoning_effort"]; ok {
+		reasoning, _ := raw["reasoning"].(map[string]interface{})
+		if reasoning == nil {
+			reasoning = map[string]interface{}{}
+		}
+		if _, exists := reasoning["effort"]; !exists {
+			reasoning["effort"] = effort
+		}
+		raw["reasoning"] = reasoning
+		delete(raw, "reasoning_effort")
 	}
 
 	// 转换 token 限制参数
@@ -608,6 +843,7 @@ func (s *OpenAIService) convertChatToResponsesBody(body []byte) ([]byte, error) 
 
 func convertChatMessagesToResponsesInput(messages []interface{}) []interface{} {
 	input := make([]interface{}, 0, len(messages))
+	legacyCallID := ""
 
 	for messageIndex, item := range messages {
 		message, ok := item.(map[string]interface{})
@@ -617,10 +853,13 @@ func convertChatMessagesToResponsesInput(messages []interface{}) []interface{} {
 
 		role, _ := message["role"].(string)
 		switch role {
-		case "tool":
+		case "tool", "function":
 			callID, _ := message["tool_call_id"].(string)
 			if callID == "" {
 				callID, _ = message["call_id"].(string)
+			}
+			if callID == "" && role == "function" {
+				callID = legacyCallID
 			}
 			if callID == "" {
 				continue
@@ -639,7 +878,13 @@ func convertChatMessagesToResponsesInput(messages []interface{}) []interface{} {
 				input = appendResponsesFunctionCalls(input, toolCalls, messageIndex)
 			}
 			if functionCall, ok := message["function_call"].(map[string]interface{}); ok {
-				input = appendResponsesFunctionCalls(input, []interface{}{functionCall}, messageIndex)
+				call := make(map[string]interface{}, len(functionCall)+1)
+				for key, value := range functionCall {
+					call[key] = value
+				}
+				legacyCallID = fmt.Sprintf("call_%d_0", messageIndex)
+				call["call_id"] = legacyCallID
+				input = appendResponsesFunctionCalls(input, []interface{}{call}, messageIndex)
 			}
 		default:
 			input = append(input, copyChatMessageWithoutToolCalls(message))
@@ -837,6 +1082,9 @@ func prepareGatewayRequestBody(body []byte, modelID, path string, zenModel model
 
 	raw["model"] = zenModel.Model
 	if path == "/v1/chat/completions" {
+		if zenModel.ProviderID == "xai" && strings.Contains(strings.ToLower(modelID), "grok-code") {
+			raw["temperature"] = 0
+		}
 		if isOpenAIProvider {
 			if _, ok := raw["max_completion_tokens"]; !ok {
 				if value, ok := raw["max_tokens"]; ok {
@@ -890,14 +1138,24 @@ func prepareGatewayRequestBody(body []byte, modelID, path string, zenModel model
 			}
 		}
 
-		// reasoning_effort belongs to Chat Completions, not Responses.
-		delete(raw, "reasoning_effort")
-		if zenModel.Parameters != nil && zenModel.Parameters.Reasoning != nil {
-			raw["reasoning"] = map[string]interface{}{
-				"effort": zenModel.Parameters.Reasoning.Effort,
+		// Preserve caller reasoning; fill a missing effort from the catalog only.
+		if effort, ok := raw["reasoning_effort"]; ok {
+			reasoning, _ := raw["reasoning"].(map[string]interface{})
+			if reasoning == nil {
+				reasoning = map[string]interface{}{}
 			}
-		} else if isKnownModel {
-			delete(raw, "reasoning")
+			if _, exists := reasoning["effort"]; !exists {
+				reasoning["effort"] = effort
+			}
+			raw["reasoning"] = reasoning
+			delete(raw, "reasoning_effort")
+		}
+		if zenModel.Parameters != nil && zenModel.Parameters.Reasoning != nil {
+			if _, exists := raw["reasoning"]; !exists {
+				raw["reasoning"] = map[string]interface{}{"effort": zenModel.Parameters.Reasoning.Effort}
+			}
+		} else if isKnownModel && raw["reasoning"] != nil {
+			return nil, fmt.Errorf("model %q does not support Responses reasoning", modelID)
 		}
 		// Some third-party clients still send the legacy top-level verbosity.
 		// Responses requires it under text.verbosity.
@@ -971,11 +1229,7 @@ func (s *OpenAIService) doRequest(ctx context.Context, account *model.Account, m
 	}
 
 	// 添加模型配置的额外请求头
-	if zenModel.Parameters != nil && zenModel.Parameters.ExtraHeaders != nil {
-		for k, v := range zenModel.Parameters.ExtraHeaders {
-			httpReq.Header.Set(k, v)
-		}
-	}
+	ApplyModelExtraHeaders(httpReq, zenModel)
 
 	// 记录请求头用于调试
 	DebugLogRequestHeaders(ctx, "OpenAI", httpReq.Header)
@@ -1018,6 +1272,9 @@ func (s *OpenAIService) ResponsesProxy(ctx context.Context, w http.ResponseWrite
 	if isAnthropicCompatibleModel(req.Model) {
 		return s.responsesViaAnthropic(ctx, w, body)
 	}
+	if zenModel := model.ResolveOpenAIModel(req.Model); zenModel.ProviderID == "xai" {
+		return s.responsesViaChat(ctx, w, body)
+	}
 
 	resp, err := s.Responses(ctx, body)
 	if err != nil {
@@ -1029,4 +1286,36 @@ func (s *OpenAIService) ResponsesProxy(ctx context.Context, w http.ResponseWrite
 		return StreamResponse(w, resp)
 	}
 	return CopyResponse(w, resp)
+}
+
+func (s *OpenAIService) responsesViaChat(ctx context.Context, w http.ResponseWriter, body []byte) error {
+	chatBody, modelID, stream, err := convertResponsesToChat(body)
+	if err != nil {
+		return openAICompatibilityError(err)
+	}
+	resp, err := s.ChatCompletions(ctx, chatBody)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		errBody, _ := readUpstreamErrorBody(resp.Body)
+		return &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+	}
+	if stream {
+		return streamChatAsResponses(w, resp, modelID)
+	}
+	chatResponse, err := readCompatibilityResponseBody(resp.Body)
+	if err != nil {
+		return err
+	}
+	converted, err := convertChatJSONToResponses(chatResponse, modelID)
+	if err != nil {
+		return openAICompatibilityError(err)
+	}
+	copyResponseHeaders(w.Header(), resp.Header, true)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write(converted)
+	return err
 }

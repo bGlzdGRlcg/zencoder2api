@@ -6,12 +6,27 @@ package logging
 // Startup errors (Fatal/Fatalf) always write to stderr regardless of level.
 
 import (
+	"context"
 	"io"
 	"log"
 	"os"
 	"strings"
 	"sync"
 )
+
+type requestIDContextKey struct{}
+
+// WithRequestID carries the server-generated request ID across package
+// boundaries without trusting a client-supplied header.
+func WithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, requestIDContextKey{}, id)
+}
+
+// RequestIDFromContext returns the server-generated request ID, if present.
+func RequestIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDContextKey{}).(string)
+	return id
+}
 
 // Level controls which log messages are emitted.
 type Level int

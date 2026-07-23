@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -31,7 +30,7 @@ func (s *GeminiService) MessagesProxy(ctx context.Context, w http.ResponseWriter
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= http.StatusBadRequest {
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := readUpstreamErrorBody(resp.Body)
 			return &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 		}
 		return streamGeminiAsAnthropic(w, resp, modelID)
@@ -43,10 +42,10 @@ func (s *GeminiService) MessagesProxy(ctx context.Context, w http.ResponseWriter
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= http.StatusBadRequest {
-		errBody, _ := io.ReadAll(resp.Body)
+		errBody, _ := readUpstreamErrorBody(resp.Body)
 		return &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 	}
-	nativeResponse, err := io.ReadAll(resp.Body)
+	nativeResponse, err := readCompatibilityResponseBody(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -69,6 +68,7 @@ type geminiAnthropicTool struct {
 	name       string
 	blockIndex int
 	started    bool
+	arguments  string
 }
 
 func streamGeminiAsAnthropic(w http.ResponseWriter, resp *http.Response, modelID string) error {
@@ -84,10 +84,16 @@ func streamGeminiAsAnthropic(w http.ResponseWriter, resp *http.Response, modelID
 	messageID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	usage := map[string]interface{}{"input_tokens": 0, "output_tokens": 0}
 	textStarted := false
+	thinkingStarted := false
+	thinkingSignatureSeen := false
+	textBlockIndex := -1
+	thinkingBlockIndex := -1
+	nextBlockIndex := 0
 	text := strings.Builder{}
 	tools := make(map[int]*geminiAnthropicTool)
 	toolOrder := make([]int, 0)
 	finishReason := "end_turn"
+	terminalSeen := false
 
 	writeEvent := func(eventType string, value interface{}) error {
 		encoded, err := json.Marshal(value)
@@ -114,25 +120,43 @@ func streamGeminiAsAnthropic(w http.ResponseWriter, resp *http.Response, modelID
 			return nil
 		}
 		textStarted = true
+		textBlockIndex = nextBlockIndex
+		nextBlockIndex++
 		return writeEvent("content_block_start", map[string]interface{}{
-			"type": "content_block_start", "index": 0,
+			"type": "content_block_start", "index": textBlockIndex,
 			"content_block": map[string]interface{}{"type": "text", "text": ""},
 		})
 	}
+	startThinking := func() error {
+		if thinkingStarted {
+			return nil
+		}
+		thinkingStarted = true
+		thinkingBlockIndex = nextBlockIndex
+		nextBlockIndex++
+		return writeEvent("content_block_start", map[string]interface{}{
+			"type": "content_block_start", "index": thinkingBlockIndex,
+			"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+		})
+	}
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 4096), 4*1024*1024)
+	scanner.Buffer(make([]byte, 4096), maxSSELineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
+		if payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
 			continue
 		}
 		var raw map[string]interface{}
-		if json.Unmarshal([]byte(payload), &raw) != nil {
-			continue
+		if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+			_ = writeEvent("error", map[string]interface{}{"type": "error", "error": map[string]interface{}{"type": "invalid_request_error", "message": "invalid upstream Gemini SSE event"}})
+			return nil
 		}
 		if metadata, ok := raw["usageMetadata"].(map[string]interface{}); ok {
 			usage["input_tokens"] = intValue(metadata["promptTokenCount"])
@@ -140,15 +164,28 @@ func streamGeminiAsAnthropic(w http.ResponseWriter, resp *http.Response, modelID
 		}
 		candidates, _ := raw["candidates"].([]interface{})
 		if len(candidates) == 0 {
+			if reason := geminiPromptBlockReason(raw); reason != "" {
+				finishReason = "refusal"
+				terminalSeen = true
+			}
 			continue
+		}
+		if len(candidates) > 1 {
+			_ = writeEvent("error", map[string]interface{}{"type": "error", "error": map[string]interface{}{"type": "invalid_request_error", "message": "Gemini returned multiple candidates; Anthropic Messages has no lossless multi-candidate representation"}})
+			return nil
 		}
 		candidate, _ := candidates[0].(map[string]interface{})
 		if reason := stringValue(candidate["finishReason"]); reason != "" {
+			terminalSeen = true
 			switch reason {
 			case "MAX_TOKENS":
 				finishReason = "max_tokens"
+			case "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "RECITATION", "MALFORMED_FUNCTION_CALL":
+				finishReason = "refusal"
 			case "STOP":
 				finishReason = "end_turn"
+			default:
+				finishReason = "refusal"
 			}
 		}
 		content, _ := candidate["content"].(map[string]interface{})
@@ -156,13 +193,26 @@ func streamGeminiAsAnthropic(w http.ResponseWriter, resp *http.Response, modelID
 		for _, item := range parts {
 			part, _ := item.(map[string]interface{})
 			if value := stringValue(part["text"]); value != "" {
-				if thought, _ := part["thought"].(bool); !thought {
+				if thought, _ := part["thought"].(bool); thought {
+					if err := startThinking(); err != nil {
+						return err
+					}
+					if err := writeEvent("content_block_delta", map[string]interface{}{"type": "content_block_delta", "index": thinkingBlockIndex, "delta": map[string]interface{}{"type": "thinking_delta", "thinking": value}}); err != nil {
+						return err
+					}
+					if signature := geminiThoughtSignature(part); signature != "" && !thinkingSignatureSeen {
+						thinkingSignatureSeen = true
+						if err := writeEvent("content_block_delta", map[string]interface{}{"type": "content_block_delta", "index": thinkingBlockIndex, "delta": map[string]interface{}{"type": "signature_delta", "signature": signature}}); err != nil {
+							return err
+						}
+					}
+				} else {
 					if err := startText(); err != nil {
 						return err
 					}
 					text.WriteString(value)
 					if err := writeEvent("content_block_delta", map[string]interface{}{
-						"type": "content_block_delta", "index": 0,
+						"type": "content_block_delta", "index": textBlockIndex,
 						"delta": map[string]interface{}{"type": "text_delta", "text": value},
 					}); err != nil {
 						return err
@@ -179,10 +229,8 @@ func streamGeminiAsAnthropic(w http.ResponseWriter, resp *http.Response, modelID
 			}
 			state := tools[index]
 			if state == nil {
-				blockIndex := len(toolOrder)
-				if textStarted {
-					blockIndex++
-				}
+				blockIndex := nextBlockIndex
+				nextBlockIndex++
 				state = &geminiAnthropicTool{id: fmt.Sprintf("toolu_%d", index), blockIndex: blockIndex}
 				tools[index] = state
 				toolOrder = append(toolOrder, index)
@@ -204,27 +252,38 @@ func streamGeminiAsAnthropic(w http.ResponseWriter, resp *http.Response, modelID
 				if err != nil {
 					return err
 				}
-				if err := writeEvent("content_block_delta", map[string]interface{}{
-					"type": "content_block_delta", "index": state.blockIndex,
-					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": string(encoded)},
-				}); err != nil {
-					return err
-				}
+				state.arguments = string(encoded)
 			}
 			finishReason = "tool_use"
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return writeEvent("error", map[string]interface{}{"type": "error", "error": map[string]interface{}{"type": "api_error", "message": err.Error()}})
+	}
+	if !terminalSeen {
+		return writeEvent("error", map[string]interface{}{"type": "error", "error": map[string]interface{}{"type": "api_error", "message": "upstream Gemini stream ended without a terminal event"}})
+	}
+	if thinkingStarted {
+		if err := writeEvent("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": thinkingBlockIndex}); err != nil {
+			return err
+		}
 	}
 	if textStarted {
-		if err := writeEvent("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": 0}); err != nil {
+		if err := writeEvent("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": textBlockIndex}); err != nil {
 			return err
 		}
 	}
 	for _, index := range toolOrder {
 		state := tools[index]
 		if state.started {
+			if state.arguments != "" {
+				if err := writeEvent("content_block_delta", map[string]interface{}{
+					"type": "content_block_delta", "index": state.blockIndex,
+					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": state.arguments},
+				}); err != nil {
+					return err
+				}
+			}
 			if err := writeEvent("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": state.blockIndex}); err != nil {
 				return err
 			}

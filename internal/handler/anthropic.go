@@ -1,13 +1,11 @@
 package handler
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"strings"
 
 	"zencoder-2api/internal/model"
 	"zencoder-2api/internal/service"
@@ -29,18 +27,11 @@ func NewAnthropicHandler() *AnthropicHandler {
 	}
 }
 
-// generateTraceID 生成一个随机的 trace ID
-func generateAnthropicTraceID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
 // Messages 处理 POST /v1/messages
 func (h *AnthropicHandler) Messages(c *gin.Context) {
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := readRequestBody(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(bodyErrorStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 
@@ -53,25 +44,40 @@ func (h *AnthropicHandler) Messages(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if strings.TrimSpace(req.Model) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "model is required", "type": "invalid_request_error"}})
+		return
+	}
 
 	// Cherry can use the Anthropic protocol for an OpenAI model. Adapt that
 	// request at the proxy boundary instead of forwarding Anthropic thinking
 	// parameters to the OpenAI gateway.
-	providerID := model.ResolveOpenAIModel(req.Model).ProviderID
+	zenModel, known := model.GetZenModel(req.Model)
+	if !known {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "unknown model", "type": "invalid_request_error"}})
+		return
+	}
+	providerID := zenModel.ProviderID
 	if providerID == "openai" {
-		if err := h.openAISvc.MessagesProxy(ctx, c.Writer, body); err != nil {
+		if err := h.openAISvc.MessagesProxy(ctx, c.Writer, body); err != nil && !c.Writer.Written() {
+			h.handleError(c, err)
+		}
+		return
+	}
+	if providerID == "xai" {
+		if err := h.openAISvc.MessagesProxy(ctx, c.Writer, body); err != nil && !c.Writer.Written() {
 			h.handleError(c, err)
 		}
 		return
 	}
 	if providerID == "gemini" {
-		if err := h.geminiSvc.MessagesProxy(ctx, c.Writer, body); err != nil {
+		if err := h.geminiSvc.MessagesProxy(ctx, c.Writer, body); err != nil && !c.Writer.Written() {
 			h.handleError(c, err)
 		}
 		return
 	}
 
-	if err := h.svc.MessagesProxy(ctx, c.Writer, body); err != nil {
+	if err := h.svc.MessagesProxy(ctx, c.Writer, body); err != nil && !c.Writer.Written() {
 		h.handleError(c, err)
 	}
 }
@@ -92,10 +98,14 @@ func (h *AnthropicHandler) handleError(c *gin.Context, err error) {
 		return
 	}
 	if errors.Is(err, service.ErrNoAvailableAccount) {
-		traceID := generateAnthropicTraceID()
+		traceID := requestTraceID(c)
 		errMsg := fmt.Sprintf("没有可用token（traceid: %s）", traceID)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsg})
 		return
 	}
-	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	traceID := requestTraceID(c)
+	c.Header("X-Request-ID", traceID)
+	c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+		"type": "api_error", "message": "upstream request failed", "trace_id": traceID,
+	}})
 }

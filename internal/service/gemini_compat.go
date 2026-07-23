@@ -41,7 +41,7 @@ func (s *GeminiService) ChatCompletionsProxy(ctx context.Context, w http.Respons
 	}
 	defer resp.Body.Close()
 
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := readCompatibilityResponseBody(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -60,12 +60,21 @@ func convertOpenAIChatToGemini(body []byte) (string, bool, []byte, error) {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return "", false, nil, err
 	}
+	if err := rejectUnsupportedFields(raw, "Gemini Chat", "model", "messages", "stream", "temperature", "top_p", "top_k", "seed", "max_completion_tokens", "max_tokens", "stop", "tools", "tool_choice", "response_format", "n", "reasoning_effort", "frequency_penalty", "presence_penalty", "thinking"); err != nil {
+		return "", false, nil, err
+	}
 
 	modelID, _ := raw["model"].(string)
 	if modelID == "" {
 		return "", false, nil, fmt.Errorf("model is required")
 	}
 
+	if err := validateGeminiChatMessages(raw["messages"]); err != nil {
+		return "", false, nil, err
+	}
+	if err := validateGeminiToolChoice(raw["tool_choice"]); err != nil {
+		return "", false, nil, err
+	}
 	native := make(map[string]interface{})
 	contents, systemInstruction, _ := convertChatMessagesToGemini(raw["messages"])
 	if len(contents) == 0 {
@@ -79,6 +88,9 @@ func convertOpenAIChatToGemini(body []byte) (string, bool, []byte, error) {
 	}
 
 	if tools, ok := raw["tools"].([]interface{}); ok {
+		if err := validateGeminiTools(tools); err != nil {
+			return "", false, nil, err
+		}
 		if converted := convertChatToolsToGemini(tools); len(converted) > 0 {
 			native["tools"] = []interface{}{map[string]interface{}{
 				"functionDeclarations": converted,
@@ -112,6 +124,42 @@ func convertOpenAIChatToGemini(body []byte) (string, bool, []byte, error) {
 			generationConfig["stopSequences"] = value
 		}
 	}
+	if value, ok := raw["n"]; ok {
+		count := intValue(value)
+		if count < 1 || count > 8 {
+			return "", false, nil, fmt.Errorf("n must be between 1 and 8 for Gemini")
+		}
+		generationConfig["candidateCount"] = count
+	}
+	if value, ok := raw["frequency_penalty"]; ok {
+		generationConfig["frequencyPenalty"] = value
+	}
+	if value, ok := raw["presence_penalty"]; ok {
+		generationConfig["presencePenalty"] = value
+	}
+	if value, ok := raw["reasoning_effort"]; ok {
+		effort, ok := value.(string)
+		if !ok {
+			return "", false, nil, fmt.Errorf("reasoning_effort must be a string")
+		}
+		level := map[string]string{"minimal": "MINIMAL", "low": "LOW", "medium": "MEDIUM", "high": "HIGH"}[effort]
+		if level == "" {
+			return "", false, nil, fmt.Errorf("reasoning_effort %q cannot be represented by Gemini", effort)
+		}
+		generationConfig["thinkingConfig"] = map[string]interface{}{"thinkingLevel": level, "includeThoughts": true}
+	}
+	if thinking, ok := raw["thinking"].(map[string]interface{}); ok {
+		typ := stringValue(thinking["type"])
+		if typ == "enabled" {
+			budget := intValue(thinking["budget_tokens"])
+			if budget < 1 {
+				return "", false, nil, fmt.Errorf("thinking.budget_tokens must be positive")
+			}
+			generationConfig["thinkingConfig"] = map[string]interface{}{"thinkingBudget": budget, "includeThoughts": true}
+		} else if typ != "disabled" {
+			return "", false, nil, fmt.Errorf("thinking type %q cannot be represented by Gemini", typ)
+		}
+	}
 	if responseFormat, ok := raw["response_format"].(map[string]interface{}); ok {
 		if formatType, _ := responseFormat["type"].(string); formatType == "json_object" {
 			generationConfig["responseMimeType"] = "application/json"
@@ -119,9 +167,15 @@ func convertOpenAIChatToGemini(body []byte) (string, bool, []byte, error) {
 			generationConfig["responseMimeType"] = "application/json"
 			if schema, ok := responseFormat["json_schema"].(map[string]interface{}); ok {
 				if value, ok := schema["schema"]; ok {
-					generationConfig["responseSchema"] = sanitizeGeminiSchema(value)
+					clean, err := geminiSchema(value)
+					if err != nil {
+						return "", false, nil, err
+					}
+					generationConfig["responseSchema"] = clean
 				}
 			}
+		} else {
+			return "", false, nil, fmt.Errorf("response_format type %q cannot be represented by Gemini", formatType)
 		}
 	}
 	if len(generationConfig) > 0 {
@@ -144,16 +198,17 @@ func convertChatMessagesToGemini(messagesValue interface{}) ([]interface{}, []in
 			continue
 		}
 		role, _ := message["role"].(string)
-		if role == "system" {
+		if role == "system" || role == "developer" {
 			systemInstruction = append(systemInstruction, geminiTextParts(message["content"])...)
 			continue
 		}
 
 		geminiRole := "user"
+		parts := geminiContentParts(message["content"])
 		if role == "assistant" {
+			parts = append(geminiReasoningParts(message), parts...)
 			geminiRole = "model"
 		}
-		parts := geminiContentParts(message["content"])
 
 		if role == "assistant" {
 			if calls, ok := message["tool_calls"].([]interface{}); ok {
@@ -200,6 +255,9 @@ func convertChatMessagesToGemini(messagesValue interface{}) ([]interface{}, []in
 				name = callID
 			}
 			response := decodeGeminiFunctionResponse(message["content"])
+			if isError, _ := message["is_error"].(bool); isError {
+				response = map[string]interface{}{"error": response}
+			}
 			functionResponse := map[string]interface{}{
 				"name":     name,
 				"response": response,
@@ -266,6 +324,34 @@ func geminiTextParts(content interface{}) []interface{} {
 		}
 	}
 	return textParts
+}
+
+func geminiReasoningParts(message map[string]interface{}) []interface{} {
+	parts := make([]interface{}, 0)
+	if details, ok := message["reasoning_details"].([]interface{}); ok {
+		for _, item := range details {
+			detail, ok := item.(map[string]interface{})
+			if !ok || stringValue(detail["type"]) != "thinking" {
+				continue
+			}
+			part := map[string]interface{}{"text": detail["thinking"], "thought": true}
+			if signature := stringValue(detail["signature"]); signature != "" {
+				part["thoughtSignature"] = signature
+			}
+			parts = append(parts, part)
+		}
+		if len(parts) > 0 {
+			return parts
+		}
+	}
+	if reasoning := stringValue(message["reasoning_content"]); reasoning != "" {
+		part := map[string]interface{}{"text": reasoning, "thought": true}
+		if signature := stringValue(message["reasoning_signature"]); signature != "" {
+			part["thoughtSignature"] = signature
+		}
+		parts = append(parts, part)
+	}
+	return parts
 }
 
 func geminiInlineImage(part map[string]interface{}) map[string]interface{} {
@@ -355,7 +441,7 @@ func sanitizeGeminiSchema(value interface{}) interface{} {
 		result := make(map[string]interface{})
 		for key, item := range schema {
 			switch key {
-			case "type", "format", "title", "description", "nullable", "enum", "maxItems", "minItems", "required", "propertyOrdering":
+			case "type", "format", "title", "description", "nullable", "enum", "maxItems", "minItems", "maxLength", "minLength", "maximum", "minimum", "required", "propertyOrdering":
 				result[key] = item
 			case "properties":
 				properties, ok := item.(map[string]interface{})
@@ -396,6 +482,11 @@ func convertChatToolChoiceToGemini(value interface{}) map[string]interface{} {
 	case map[string]interface{}:
 		if function, ok := choice["function"].(map[string]interface{}); ok {
 			if name, ok := function["name"].(string); ok && name != "" {
+				mode = "ANY"
+				allowed = []interface{}{name}
+			}
+		} else if stringValue(choice["type"]) == "function" {
+			if name := stringValue(choice["name"]); name != "" {
 				mode = "ANY"
 				allowed = []interface{}{name}
 			}
@@ -473,65 +564,92 @@ func convertGeminiResponseToChat(body []byte, modelID string) ([]byte, error) {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
-
-	message := map[string]interface{}{"role": "assistant", "content": ""}
-	var text strings.Builder
-	toolCalls := make([]interface{}, 0)
-	finishReason := "stop"
-	if candidates, ok := raw["candidates"].([]interface{}); ok && len(candidates) > 0 {
-		if candidate, ok := candidates[0].(map[string]interface{}); ok {
-			finishReason = geminiFinishReason(candidate["finishReason"])
-			if content, ok := candidate["content"].(map[string]interface{}); ok {
-				if parts, ok := content["parts"].([]interface{}); ok {
-					for _, item := range parts {
-						part, ok := item.(map[string]interface{})
-						if !ok {
-							continue
+	candidates, ok := raw["candidates"].([]interface{})
+	if !ok || len(candidates) == 0 {
+		if reason := geminiPromptBlockReason(raw); reason != "" {
+			return json.Marshal(map[string]interface{}{
+				"id": fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()), "object": "chat.completion",
+				"created": time.Now().Unix(), "model": modelID,
+				"choices": []interface{}{map[string]interface{}{
+					"index": 0, "message": map[string]interface{}{
+						"role": "assistant", "content": "", "refusal": reason,
+					}, "finish_reason": "content_filter",
+				}},
+			})
+		}
+		return nil, fmt.Errorf("gemini response has no candidates")
+	}
+	choices := make([]interface{}, 0, len(candidates))
+	for candidateIndex, item := range candidates {
+		candidate, ok := item.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("gemini candidate %d is not an object", candidateIndex)
+		}
+		message := map[string]interface{}{"role": "assistant", "content": ""}
+		var text strings.Builder
+		reasoning := strings.Builder{}
+		reasoningSignature := ""
+		toolCalls := make([]interface{}, 0)
+		if content, ok := candidate["content"].(map[string]interface{}); ok {
+			if parts, ok := content["parts"].([]interface{}); ok {
+				for partIndex, item := range parts {
+					part, ok := item.(map[string]interface{})
+					if !ok {
+						return nil, fmt.Errorf("gemini candidate %d part %d is not an object", candidateIndex, partIndex)
+					}
+					if value, ok := part["text"].(string); ok {
+						if thought, _ := part["thought"].(bool); thought {
+							reasoning.WriteString(value)
+							if signature := geminiThoughtSignature(part); signature != "" {
+								reasoningSignature = signature
+							}
+						} else {
+							text.WriteString(value)
 						}
-						if value, ok := part["text"].(string); ok {
-							if thought, _ := part["thought"].(bool); thought {
-								if existing, _ := message["reasoning_content"].(string); existing != "" {
-									message["reasoning_content"] = existing + value
-								} else {
-									message["reasoning_content"] = value
-								}
-							} else {
-								text.WriteString(value)
-							}
+					}
+					if call, ok := part["functionCall"].(map[string]interface{}); ok {
+						name, _ := call["name"].(string)
+						if name == "" {
+							return nil, fmt.Errorf("gemini candidate %d function call has no name", candidateIndex)
 						}
-						if call, ok := part["functionCall"].(map[string]interface{}); ok {
-							name, _ := call["name"].(string)
-							arguments, _ := json.Marshal(call["args"])
-							id, _ := call["id"].(string)
-							if id == "" {
-								id = fmt.Sprintf("call_%d", len(toolCalls))
-							}
-							toolCall := map[string]interface{}{
-								"id":   id,
-								"type": "function",
-								"function": map[string]interface{}{
-									"name":      name,
-									"arguments": string(arguments),
-								},
-							}
-							if thoughtSignature := geminiThoughtSignature(part); thoughtSignature != "" {
-								toolCall["extra_content"] = map[string]interface{}{
-									"google": map[string]interface{}{
-										"thought_signature": thoughtSignature,
-									},
-								}
-							}
-							toolCalls = append(toolCalls, toolCall)
+						arguments, err := json.Marshal(call["args"])
+						if err != nil {
+							return nil, err
 						}
+						id, _ := call["id"].(string)
+						if id == "" {
+							id = fmt.Sprintf("call_%d_%d", candidateIndex, len(toolCalls))
+						}
+						toolCall := map[string]interface{}{
+							"id": id, "type": "function",
+							"function": map[string]interface{}{"name": name, "arguments": string(arguments)},
+						}
+						if signature := geminiThoughtSignature(part); signature != "" {
+							toolCall["extra_content"] = map[string]interface{}{"google": map[string]interface{}{"thought_signature": signature}}
+						}
+						toolCalls = append(toolCalls, toolCall)
 					}
 				}
 			}
 		}
-	}
-	message["content"] = text.String()
-	if len(toolCalls) > 0 {
-		message["tool_calls"] = toolCalls
-		finishReason = "tool_calls"
+		message["content"] = text.String()
+		if reasoning.Len() > 0 {
+			message["reasoning_content"] = reasoning.String()
+			if reasoningSignature != "" {
+				message["reasoning_signature"] = reasoningSignature
+			}
+		}
+		if len(toolCalls) > 0 {
+			message["tool_calls"] = toolCalls
+		}
+		if refusal := stringValue(candidate["finishMessage"]); refusal != "" && text.Len() == 0 && len(toolCalls) == 0 {
+			message["refusal"] = refusal
+		}
+		finishReason := geminiFinishReason(candidate["finishReason"])
+		if len(toolCalls) > 0 {
+			finishReason = "tool_calls"
+		}
+		choices = append(choices, map[string]interface{}{"index": candidateIndex, "message": message, "finish_reason": finishReason})
 	}
 
 	usage := map[string]interface{}{}
@@ -539,17 +657,19 @@ func convertGeminiResponseToChat(body []byte, modelID string) ([]byte, error) {
 		usage["prompt_tokens"] = metadata["promptTokenCount"]
 		usage["completion_tokens"] = metadata["candidatesTokenCount"]
 		usage["total_tokens"] = metadata["totalTokenCount"]
+		if cached := metadata["cachedContentTokenCount"]; cached != nil {
+			usage["prompt_tokens_details"] = map[string]interface{}{"cached_tokens": cached}
+		}
+		if reasoning := metadata["thoughtsTokenCount"]; reasoning != nil {
+			usage["completion_tokens_details"] = map[string]interface{}{"reasoning_tokens": reasoning}
+		}
 	}
 	response := map[string]interface{}{
 		"id":      firstNonEmptyString(raw["responseId"], fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())),
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   modelID,
-		"choices": []interface{}{map[string]interface{}{
-			"index":         0,
-			"message":       message,
-			"finish_reason": finishReason,
-		}},
+		"choices": choices,
 	}
 	if len(usage) > 0 {
 		response["usage"] = usage
@@ -557,7 +677,16 @@ func convertGeminiResponseToChat(body []byte, modelID string) ([]byte, error) {
 	return json.Marshal(response)
 }
 
+func geminiPromptBlockReason(raw map[string]interface{}) string {
+	feedback, _ := raw["promptFeedback"].(map[string]interface{})
+	return stringValue(feedback["blockReason"])
+}
+
 func streamGeminiAsChat(w http.ResponseWriter, resp *http.Response, modelID string) error {
+	if resp.StatusCode >= http.StatusBadRequest {
+		body, _ := readUpstreamErrorBody(resp.Body)
+		return &UpstreamError{StatusCode: resp.StatusCode, Body: body}
+	}
 	copyGeminiResponseHeaders(w, resp.Header)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -571,83 +700,194 @@ func streamGeminiAsChat(w http.ResponseWriter, resp *http.Response, modelID stri
 
 	operationID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
-	started := false
+	started := make(map[int]bool)
+	seenCandidates := make(map[int]bool)
+	finishedCandidates := make(map[int]bool)
+	type toolState struct {
+		id, name, arguments string
+		candidate, index    int
+		started             bool
+		flushed             bool
+	}
+	tools := make(map[string]*toolState)
+	toolOrder := make([]string, 0)
+	nextToolIndex := make(map[int]int)
+	flushTools := func(candidate int, deltas []interface{}) []interface{} {
+		for _, key := range toolOrder {
+			state := tools[key]
+			if state.candidate != candidate || state.flushed {
+				continue
+			}
+			arguments := state.arguments
+			if arguments == "" {
+				arguments = "{}"
+			}
+			merged := false
+			for _, item := range deltas {
+				delta, _ := item.(map[string]interface{})
+				if intValue(delta["index"]) != state.index {
+					continue
+				}
+				function, _ := delta["function"].(map[string]interface{})
+				function["arguments"] = arguments
+				merged = true
+				break
+			}
+			if !merged {
+				deltas = append(deltas, map[string]interface{}{
+					"index": state.index,
+					"function": map[string]interface{}{
+						"arguments": arguments,
+					},
+				})
+			}
+			state.flushed = true
+		}
+		return deltas
+	}
+	writeError := func(err error) error {
+		payload, _ := json.Marshal(map[string]interface{}{"error": map[string]interface{}{"message": err.Error(), "type": "upstream_protocol_error"}})
+		if _, writeErr := fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload); writeErr != nil {
+			return writeErr
+		}
+		flusher.Flush()
+		return nil
+	}
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 4096), 4*1024*1024)
+	scanner.Buffer(make([]byte, 4096), maxSSELineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" || data == "[DONE]" {
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
 			continue
 		}
 		var raw map[string]interface{}
-		if json.Unmarshal([]byte(data), &raw) != nil {
-			continue
+		if err := json.Unmarshal([]byte(data), &raw); err != nil {
+			return writeError(fmt.Errorf("invalid upstream gemini SSE event: %w", err))
 		}
 		choices := make([]interface{}, 0)
-		if candidates, ok := raw["candidates"].([]interface{}); ok && len(candidates) > 0 {
-			if candidate, ok := candidates[0].(map[string]interface{}); ok {
-				delta := map[string]interface{}{}
-				if content, ok := candidate["content"].(map[string]interface{}); ok {
-					if parts, ok := content["parts"].([]interface{}); ok {
-						for _, item := range parts {
-							part, ok := item.(map[string]interface{})
-							if !ok {
-								continue
-							}
-							if text, ok := part["text"].(string); ok {
-								if thought, _ := part["thought"].(bool); thought {
-									delta["reasoning_content"] = text
-								} else {
-									delta["content"] = text
-								}
-							}
-							if call, ok := part["functionCall"].(map[string]interface{}); ok {
-								name, _ := call["name"].(string)
-								arguments, _ := json.Marshal(call["args"])
-								id, _ := call["id"].(string)
-								if id == "" {
-									id = fmt.Sprintf("call_%d", time.Now().UnixNano())
-								}
-								toolCall := map[string]interface{}{
-									"index": 0,
-									"id":    id,
-									"type":  "function",
-									"function": map[string]interface{}{
-										"name":      name,
-										"arguments": string(arguments),
-									},
-								}
-								if thoughtSignature := geminiThoughtSignature(part); thoughtSignature != "" {
-									toolCall["extra_content"] = map[string]interface{}{
-										"google": map[string]interface{}{
-											"thought_signature": thoughtSignature,
-										},
-									}
-								}
-								delta["tool_calls"] = []interface{}{toolCall}
-							}
-						}
+		candidates, _ := raw["candidates"].([]interface{})
+		if len(candidates) == 0 {
+			if reason := geminiPromptBlockReason(raw); reason != "" {
+				choices = append(choices, map[string]interface{}{
+					"index":         0,
+					"delta":         map[string]interface{}{"role": "assistant", "content": "", "refusal": reason},
+					"finish_reason": "content_filter",
+				})
+				seenCandidates[0] = true
+				finishedCandidates[0] = true
+			}
+		}
+		for fallbackIndex, item := range candidates {
+			candidate, ok := item.(map[string]interface{})
+			if !ok {
+				return writeError(fmt.Errorf("gemini candidate %d is not an object", fallbackIndex))
+			}
+			candidateIndex := fallbackIndex
+			if candidate["index"] != nil {
+				candidateIndex = intValue(candidate["index"])
+			}
+			seenCandidates[candidateIndex] = true
+			delta := map[string]interface{}{}
+			var contentText, reasoningText strings.Builder
+			reasoningSignature := ""
+			toolDeltas := make([]interface{}, 0)
+			content, _ := candidate["content"].(map[string]interface{})
+			parts, _ := content["parts"].([]interface{})
+			callOrdinal := 0
+			for partIndex, item := range parts {
+				part, ok := item.(map[string]interface{})
+				if !ok {
+					return writeError(fmt.Errorf("gemini candidate %d part %d is not an object", candidateIndex, partIndex))
+				}
+				if text, ok := part["text"].(string); ok {
+					if thought, _ := part["thought"].(bool); thought {
+						reasoningText.WriteString(text)
+					} else {
+						contentText.WriteString(text)
 					}
 				}
-				finishReason := interface{}(nil)
-				if value, ok := candidate["finishReason"]; ok {
-					finishReason = geminiFinishReason(value)
-				}
-				if len(delta) > 0 || finishReason != nil {
-					if len(delta) > 0 && !started {
-						delta["role"] = "assistant"
-						started = true
+				if thought, _ := part["thought"].(bool); thought {
+					if signature := geminiThoughtSignature(part); signature != "" {
+						reasoningSignature = signature
 					}
-					choices = append(choices, map[string]interface{}{
-						"index":         0,
-						"delta":         delta,
-						"finish_reason": finishReason,
-					})
 				}
+				call, ok := part["functionCall"].(map[string]interface{})
+				if !ok {
+					continue
+				}
+				name := stringValue(call["name"])
+				if name == "" {
+					return writeError(fmt.Errorf("gemini candidate %d function call has no name", candidateIndex))
+				}
+				id := stringValue(call["id"])
+				key := fmt.Sprintf("%d:%s:%d", candidateIndex, name, callOrdinal)
+				if id != "" {
+					key = fmt.Sprintf("%d:id:%s", candidateIndex, id)
+				}
+				state := tools[key]
+				if state == nil {
+					if id == "" {
+						id = fmt.Sprintf("call_%d_%d", candidateIndex, nextToolIndex[candidateIndex])
+					}
+					state = &toolState{id: id, name: name, candidate: candidateIndex, index: nextToolIndex[candidateIndex]}
+					nextToolIndex[candidateIndex]++
+					tools[key] = state
+					toolOrder = append(toolOrder, key)
+				}
+				if args := call["args"]; args != nil {
+					arguments, err := json.Marshal(args)
+					if err != nil {
+						return writeError(err)
+					}
+					state.arguments = string(arguments)
+				}
+				if !state.started {
+					toolCall := map[string]interface{}{"index": state.index, "function": map[string]interface{}{"arguments": ""}}
+					toolCall["id"] = state.id
+					toolCall["type"] = "function"
+					toolCall["function"].(map[string]interface{})["name"] = state.name
+					if signature := geminiThoughtSignature(part); signature != "" {
+						toolCall["extra_content"] = map[string]interface{}{"google": map[string]interface{}{"thought_signature": signature}}
+					}
+					state.started = true
+					toolDeltas = append(toolDeltas, toolCall)
+				}
+				callOrdinal++
+			}
+			if contentText.Len() > 0 {
+				delta["content"] = contentText.String()
+			}
+			if reasoningText.Len() > 0 {
+				delta["reasoning_content"] = reasoningText.String()
+			}
+			if reasoningSignature != "" {
+				delta["reasoning_signature"] = reasoningSignature
+			}
+			if len(toolDeltas) > 0 {
+				delta["tool_calls"] = toolDeltas
+			}
+			finishReason := interface{}(nil)
+			if value := candidate["finishReason"]; stringValue(value) != "" {
+				finishReason = geminiFinishReason(value)
+				finishedCandidates[candidateIndex] = true
+				toolDeltas = flushTools(candidateIndex, toolDeltas)
+				if len(toolDeltas) > 0 {
+					delta["tool_calls"] = toolDeltas
+				}
+			}
+			if len(delta) > 0 || finishReason != nil {
+				if !started[candidateIndex] {
+					delta["role"] = "assistant"
+					started[candidateIndex] = true
+				}
+				choices = append(choices, map[string]interface{}{"index": candidateIndex, "delta": delta, "finish_reason": finishReason})
 			}
 		}
 		chunk := map[string]interface{}{
@@ -658,11 +898,18 @@ func streamGeminiAsChat(w http.ResponseWriter, resp *http.Response, modelID stri
 			"choices": choices,
 		}
 		if metadata, ok := raw["usageMetadata"].(map[string]interface{}); ok {
-			chunk["usage"] = map[string]interface{}{
+			usage := map[string]interface{}{
 				"prompt_tokens":     metadata["promptTokenCount"],
 				"completion_tokens": metadata["candidatesTokenCount"],
 				"total_tokens":      metadata["totalTokenCount"],
 			}
+			if cached := metadata["cachedContentTokenCount"]; cached != nil {
+				usage["prompt_tokens_details"] = map[string]interface{}{"cached_tokens": cached}
+			}
+			if reasoning := metadata["thoughtsTokenCount"]; reasoning != nil {
+				usage["completion_tokens_details"] = map[string]interface{}{"reasoning_tokens": reasoning}
+			}
+			chunk["usage"] = usage
 		}
 		if len(choices) > 0 || chunk["usage"] != nil {
 			encoded, err := json.Marshal(chunk)
@@ -676,7 +923,43 @@ func streamGeminiAsChat(w http.ResponseWriter, resp *http.Response, modelID stri
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return writeError(err)
+	}
+	if len(seenCandidates) == 0 {
+		return writeError(fmt.Errorf("upstream Gemini stream ended without a terminal event"))
+	}
+	for candidate := range seenCandidates {
+		if !finishedCandidates[candidate] {
+			return writeError(fmt.Errorf("upstream Gemini candidate %d ended without a terminal event", candidate))
+		}
+	}
+	flushedCandidates := make(map[int]bool)
+	flushChoices := make([]interface{}, 0)
+	for _, key := range toolOrder {
+		state := tools[key]
+		if state.flushed || flushedCandidates[state.candidate] {
+			continue
+		}
+		flushedCandidates[state.candidate] = true
+		deltas := flushTools(state.candidate, nil)
+		if len(deltas) > 0 {
+			flushChoices = append(flushChoices, map[string]interface{}{
+				"index": state.candidate, "delta": map[string]interface{}{"tool_calls": deltas}, "finish_reason": nil,
+			})
+		}
+	}
+	if len(flushChoices) > 0 {
+		encoded, err := json.Marshal(map[string]interface{}{
+			"id": operationID, "object": "chat.completion.chunk", "created": created,
+			"model": modelID, "choices": flushChoices,
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", encoded); err != nil {
+			return err
+		}
+		flusher.Flush()
 	}
 	_, err := io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -686,16 +969,16 @@ func streamGeminiAsChat(w http.ResponseWriter, resp *http.Response, modelID stri
 func geminiFinishReason(value interface{}) string {
 	reason, _ := value.(string)
 	switch reason {
-	case "STOP", "":
+	case "STOP", "FINISH_REASON_UNSPECIFIED", "OTHER", "":
 		return "stop"
 	case "MAX_TOKENS":
 		return "length"
-	case "SAFETY":
+	case "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "RECITATION",
+		"MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT",
+		"IMAGE_RECITATION", "IMAGE_OTHER", "NO_IMAGE":
 		return "content_filter"
-	case "MALFORMED_FUNCTION_CALL", "OTHER":
-		return "tool_calls"
 	default:
-		return strings.ToLower(reason)
+		return "stop"
 	}
 }
 
@@ -707,12 +990,5 @@ func firstNonEmptyString(value interface{}, fallback string) string {
 }
 
 func copyGeminiResponseHeaders(w http.ResponseWriter, headers http.Header) {
-	for key, values := range headers {
-		if strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Content-Encoding") {
-			continue
-		}
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	copyResponseHeaders(w.Header(), headers, true)
 }

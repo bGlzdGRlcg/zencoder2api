@@ -1,7 +1,11 @@
-.git
-.github
-.env
-*.db
-zencoder-2api
-dist
-vscode
+# Only files required by the explicit Dockerfile COPY instructions enter the
+# build context. This excludes local credentials and reverse-engineering data.
+*
+!Dockerfile
+!go.mod
+!go.sum
+!main.go
+!internal/
+!internal/**
+!web/
+!web/**
