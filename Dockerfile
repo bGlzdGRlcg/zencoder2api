@@ -49,14 +49,10 @@ USER 10001:10001
 
 ENV PORT=8080 \
     DB_PATH=/data/data.db \
-    TZ=UTC \
     ZONEINFO=/usr/share/zoneinfo.zip
 
 VOLUME ["/data"]
 EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD ["wget", "-q", "--spider", "http://127.0.0.1:8080/livez"]
 
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["./zencoder2api"]

@@ -3,9 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"zencoder-2api/internal/database"
@@ -19,29 +16,21 @@ import (
 const (
 	creditResetJobName = "daily-credit-reset"
 	jobLeaseDuration   = 2 * time.Minute
+	creditResetHour    = 9
+	creditResetMinute  = 9
 )
 
-// StartCreditResetScheduler starts the daily reset loop and returns a cancel
-// function for graceful shutdown. CREDIT_RESET_TIMEZONE defaults to UTC and
-// CREDIT_RESET_AT defaults to 09:09.
+// StartCreditResetScheduler starts the daily UTC 09:09 reset loop and returns
+// a cancel function for graceful shutdown.
 func StartCreditResetScheduler() context.CancelFunc {
 	ctx, cancel := context.WithCancel(context.Background())
-	location, err := creditResetLocation()
-	if err != nil {
-		logging.Errorf("Credit reset scheduler disabled: %v", err)
-		return cancel
-	}
-	hour, minute, err := creditResetClock()
-	if err != nil {
-		logging.Errorf("Credit reset scheduler disabled: %v", err)
-		return cancel
-	}
+	location := time.UTC
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
 			now := time.Now().In(location)
-			next := nextDailyTime(now, hour, minute, location)
+			next := nextDailyTime(now, creditResetHour, creditResetMinute, location)
 			timer := time.NewTimer(time.Until(next))
 			select {
 			case <-timer.C:
@@ -59,50 +48,11 @@ func StartCreditResetScheduler() context.CancelFunc {
 			}
 		}
 	}()
-	logging.Infof("Credit reset scheduler started: timezone=%s at=%02d:%02d", location, hour, minute)
+	logging.Infof("Credit reset scheduler started: timezone=UTC at=%02d:%02d", creditResetHour, creditResetMinute)
 	return func() {
 		cancel()
 		<-done
 	}
-}
-
-func creditResetLocation() (*time.Location, error) {
-	name := strings.TrimSpace(os.Getenv("CREDIT_RESET_TIMEZONE"))
-	if name == "" {
-		name = "UTC"
-	}
-	location, err := time.LoadLocation(name)
-	if err != nil {
-		return nil, fmt.Errorf("invalid CREDIT_RESET_TIMEZONE %q: %w", name, err)
-	}
-	return location, nil
-}
-
-func creditResetClock() (int, int, error) {
-	raw := strings.TrimSpace(os.Getenv("CREDIT_RESET_AT"))
-	if raw == "" {
-		raw = "09:09"
-	}
-	parts := strings.Split(raw, ":")
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("CREDIT_RESET_AT must use HH:MM")
-	}
-	hour, hourErr := strconv.Atoi(parts[0])
-	minute, minuteErr := strconv.Atoi(parts[1])
-	if hourErr != nil || minuteErr != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
-		return 0, 0, fmt.Errorf("CREDIT_RESET_AT must use a valid 24-hour HH:MM value")
-	}
-	return hour, minute, nil
-}
-
-// ValidateCreditResetConfig lets startup fail closed instead of silently
-// running without maintenance when scheduler environment values are invalid.
-func ValidateCreditResetConfig() error {
-	if _, err := creditResetLocation(); err != nil {
-		return err
-	}
-	_, _, err := creditResetClock()
-	return err
 }
 
 func nextDailyTime(now time.Time, hour, minute int, location *time.Location) time.Time {
@@ -111,14 +61,6 @@ func nextDailyTime(now time.Time, hour, minute int, location *time.Location) tim
 		next = time.Date(now.Year(), now.Month(), now.Day()+1, hour, minute, 0, 0, location)
 	}
 	return next
-}
-
-func ResetAllCredits() error {
-	location, err := creditResetLocation()
-	if err != nil {
-		return err
-	}
-	return resetAllCreditsAt(context.Background(), time.Now().In(location))
 }
 
 func resetAllCreditsAt(ctx context.Context, now time.Time) error {

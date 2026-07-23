@@ -24,9 +24,8 @@ type Account struct {
 	OAuthAnonymousID string `json:"-"`
 	AccessToken      string `json:"-" gorm:"type:text"`
 	RefreshToken     string `json:"-" gorm:"type:text"`
-	// APIKey is encrypted at rest by internal/secret. It is never serialized
-	// through the management API and is only decrypted at the final request
-	// authentication boundary.
+	// APIKey is stored as plaintext but is never serialized through the
+	// management API.
 	APIKey              string     `json:"-" gorm:"type:text"`
 	CredentialRevision  uint64     `json:"-" gorm:"default:1"`
 	TokenExpiresAt      time.Time  `json:"-"`
@@ -74,7 +73,7 @@ type Account struct {
 }
 
 // OAuthSession persists a short-lived PKCE login so callbacks survive process
-// restarts. CodeVerifier is encrypted before persistence. ClaimID is the
+// restarts. CodeVerifier is stored as plaintext. ClaimID is the
 // ownership token; ClaimedAt is a renewable lease timestamp, and ConsumedAt
 // makes successful callbacks permanently one-time.
 type OAuthSession struct {
@@ -92,8 +91,8 @@ type OAuthSession struct {
 }
 
 // AdminSession stores only a hash of the random session nonce. Keeping this
-// server-side record makes logout and expiry effective across instances while
-// the encrypted browser cookie remains opaque and HttpOnly.
+// server-side record makes logout and expiry effective across instances. The
+// browser cookie is signed, readable, and HttpOnly.
 type AdminSession struct {
 	NonceHash string    `json:"-" gorm:"primaryKey;size:64"`
 	ExpiresAt time.Time `json:"-" gorm:"index;not null"`

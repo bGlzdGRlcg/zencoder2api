@@ -5,27 +5,16 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"os"
-	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 )
 
-const defaultMaxRequestBodyBytes int64 = 4 << 20
-
-func maxRequestBodyBytes() int64 {
-	value, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("MAX_REQUEST_BODY_BYTES")), 10, 64)
-	if err != nil || value <= 0 || value > 128<<20 {
-		return defaultMaxRequestBodyBytes
-	}
-	return value
-}
+const maxRequestBodyBytes int64 = 4 << 20
 
 // readRequestBody applies a second boundary at the handler level. The global
 // middleware catches Content-Length early, while this also covers chunked input.
 func readRequestBody(c *gin.Context) ([]byte, error) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes())
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		var maxErr *http.MaxBytesError

@@ -209,18 +209,13 @@ func (h *AccountHandler) CreateAPIKey(c *gin.Context) {
 	if strings.TrimSpace(req.Name) == "" {
 		req.Name = "API key"
 	}
-	encrypted, err := secret.Encrypt(key)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt API key"})
-		return
-	}
 	db := database.GetDB()
 	if db == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
 		return
 	}
 	values := map[string]interface{}{
-		"client_id": clientID, "credential_type": model.CredentialAPIKey, "api_key": encrypted,
+		"client_id": clientID, "credential_type": model.CredentialAPIKey, "api_key": key,
 		"o_auth_provider": "", "o_auth_email": req.Name, "o_auth_user_id": "",
 		"o_auth_tenant_id": "", "o_auth_anonymous_id": "", "access_token": "",
 		"refresh_token": "", "token_expires_at": time.Time{},
@@ -236,7 +231,7 @@ func (h *AccountHandler) CreateAPIKey(c *gin.Context) {
 		if errors.Is(findErr, gorm.ErrRecordNotFound) {
 			created := &model.Account{
 				ClientID: clientID, CredentialType: model.CredentialAPIKey,
-				APIKey: encrypted, CredentialRevision: 1,
+				APIKey: key, CredentialRevision: 1,
 				OAuthEmail: req.Name, HealthState: model.AccountHealthHealthy,
 			}
 			if err := tx.Create(created).Error; err != nil {
@@ -282,7 +277,7 @@ func (h *AccountHandler) CreateAPIKey(c *gin.Context) {
 	c.JSON(http.StatusCreated, account)
 }
 
-// RotateAPIKey replaces only the encrypted API-key field and preserves usage
+// RotateAPIKey replaces only the API-key field and preserves usage
 // counters and identity. OAuth accounts cannot be silently converted.
 func (h *AccountHandler) RotateAPIKey(c *gin.Context) {
 	id, err := strconv.ParseUint(strings.TrimSpace(c.Param("id")), 10, 64)
@@ -301,18 +296,13 @@ func (h *AccountHandler) RotateAPIKey(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to index API key"})
 		return
 	}
-	encrypted, err := secret.Encrypt(key)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt API key"})
-		return
-	}
 	db := database.GetDB()
 	if db == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
 		return
 	}
 	updates := map[string]interface{}{
-		"client_id": clientID, "api_key": encrypted, "health_state": model.AccountHealthHealthy,
+		"client_id": clientID, "api_key": key, "health_state": model.AccountHealthHealthy,
 		"cooldown_until": gorm.Expr("NULL"), "last_error_class": "", "last_error_at": gorm.Expr("NULL"),
 		"failure_count": 0, "reauth_required": false, "credential_revision": gorm.Expr("credential_revision + 1"), "updated_at": time.Now(),
 		"usage_credits_operation_credits": 0, "usage_credits_turns": 0,

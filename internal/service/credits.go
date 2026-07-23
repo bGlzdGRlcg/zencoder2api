@@ -160,27 +160,6 @@ func StartUsageCreditsWorker() context.CancelFunc {
 	return func() { stopUsageCreditsWorker(cancel, done) }
 }
 
-// StopUsageCreditsWorker stops the worker and waits for an in-flight query to
-// finish. It is safe to call more than once.
-func StopUsageCreditsWorker() {
-	creditRefreshWorkerMu.Lock()
-	cancel := creditRefreshWorkerCancel
-	done := creditRefreshWorkerDone
-	creditRefreshWorkerCancel = nil
-	creditRefreshWorkerDone = nil
-	creditRefreshQueue = nil
-	creditRefreshPending = nil
-	creditRefreshRunning = nil
-	creditRefreshFollowup = nil
-	creditRefreshWorkerMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	if done != nil {
-		<-done
-	}
-}
-
 func stopUsageCreditsWorker(cancel context.CancelFunc, done chan struct{}) {
 	creditRefreshWorkerMu.Lock()
 	if creditRefreshWorkerDone == done {

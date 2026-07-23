@@ -208,9 +208,9 @@ func applyZencoderAuth(ctx context.Context, req *http.Request, account *model.Ac
 		if strings.TrimSpace(account.AccessToken) != "" || strings.TrimSpace(account.RefreshToken) != "" {
 			return errors.New("API-key account contains OAuth tokens")
 		}
-		apiKey, err := secret.Decrypt(account.APIKey)
+		apiKey, err := secret.Plaintext(account.APIKey)
 		if err != nil {
-			return fmt.Errorf("decrypt Zencoder API key: %w", err)
+			return fmt.Errorf("load Zencoder API key: %w", err)
 		}
 		if apiKey = strings.TrimSpace(apiKey); apiKey == "" {
 			return errors.New("account has no Zencoder API key")
@@ -220,12 +220,6 @@ func applyZencoderAuth(ctx context.Context, req *http.Request, account *model.Ac
 	default:
 		return errors.New("account has an unsupported credential type")
 	}
-}
-
-// GetAccessToken returns a valid OAuth access token, refreshing it when it is
-// expired or will expire within one minute.
-func GetAccessToken(ctx context.Context, account *model.Account) (string, error) {
-	return getAccessTokenWithHealthMode(ctx, account, true)
 }
 
 func getAccessTokenWithHealthMode(ctx context.Context, account *model.Account, refreshFailureAffectsHealth bool) (string, error) {
@@ -239,13 +233,13 @@ func getAccessTokenWithHealthMode(ctx context.Context, account *model.Account, r
 		return "", errors.New("account is not a Zencoder OAuth account")
 	}
 	var err error
-	account.AccessToken, err = secret.Decrypt(account.AccessToken)
+	account.AccessToken, err = secret.Plaintext(account.AccessToken)
 	if err != nil {
-		return "", fmt.Errorf("decrypt Zencoder OAuth access token: %w", err)
+		return "", fmt.Errorf("load Zencoder OAuth access token: %w", err)
 	}
-	account.RefreshToken, err = secret.Decrypt(account.RefreshToken)
+	account.RefreshToken, err = secret.Plaintext(account.RefreshToken)
 	if err != nil {
-		return "", fmt.Errorf("decrypt Zencoder OAuth refresh token: %w", err)
+		return "", fmt.Errorf("load Zencoder OAuth refresh token: %w", err)
 	}
 	if strings.TrimSpace(account.AccessToken) == "" {
 		return "", errors.New("account has no Zencoder OAuth access token")
@@ -433,7 +427,7 @@ func refreshStoredOAuthAccount(ctx context.Context, account *model.Account, refr
 		}
 		return "", err
 	}
-	// Refill the lease immediately before the local encryption/writeback stage,
+	// Refill the lease immediately before the local writeback stage,
 	// then stop the background renewer so it cannot race with the CAS that
 	// clears lease ownership on success.
 	if err := renewOAuthRefreshLease(leaseCtx, account.ID, holder); err != nil {
@@ -443,17 +437,9 @@ func refreshStoredOAuthAccount(ctx context.Context, account *model.Account, refr
 		return "", heartbeatErr
 	}
 
-	encryptedAccessToken, err := secret.Encrypt(tokens.AccessToken)
-	if err != nil {
-		return "", fmt.Errorf("encrypt refreshed access token: %w", err)
-	}
-	encryptedRefreshToken, err := secret.Encrypt(tokens.RefreshToken)
-	if err != nil {
-		return "", fmt.Errorf("encrypt refreshed refresh token: %w", err)
-	}
 	updates := map[string]interface{}{
-		"access_token":        encryptedAccessToken,
-		"refresh_token":       encryptedRefreshToken,
+		"access_token":        tokens.AccessToken,
+		"refresh_token":       tokens.RefreshToken,
 		"token_expires_at":    tokens.ExpiresAt,
 		"credential_revision": gorm.Expr("credential_revision + 1"),
 		"refresh_lease_id":    "",
@@ -510,13 +496,13 @@ func loadOAuthAccount(ctx context.Context, id uint) (*model.Account, error) {
 		return nil, fmt.Errorf("load OAuth account: %w", err)
 	}
 	var err error
-	latest.AccessToken, err = secret.Decrypt(latest.AccessToken)
+	latest.AccessToken, err = secret.Plaintext(latest.AccessToken)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt latest access token: %w", err)
+		return nil, fmt.Errorf("load latest access token: %w", err)
 	}
-	latest.RefreshToken, err = secret.Decrypt(latest.RefreshToken)
+	latest.RefreshToken, err = secret.Plaintext(latest.RefreshToken)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt latest refresh token: %w", err)
+		return nil, fmt.Errorf("load latest refresh token: %w", err)
 	}
 	return &latest, nil
 }

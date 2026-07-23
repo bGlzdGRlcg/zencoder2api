@@ -3,7 +3,6 @@ package middleware
 import (
 	"crypto/subtle"
 	"errors"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -23,13 +22,7 @@ func AuthMiddleware() gin.HandlerFunc {
 	token := os.Getenv("AUTH_TOKEN")
 
 	return func(c *gin.Context) {
-		// Empty credentials are only allowed for an explicitly enabled loopback
-		// development server. Production misconfiguration fails closed.
 		if token == "" {
-			if allowInsecureLocalRequest(c) {
-				c.Next()
-				return
-			}
 			unauthenticatedConfiguration(c)
 			return
 		}
@@ -83,13 +76,7 @@ func AdminAuthMiddleware() gin.HandlerFunc {
 	adminPassword := os.Getenv("ADMIN_PASSWORD")
 
 	return func(c *gin.Context) {
-		// Empty credentials are only allowed for an explicitly enabled loopback
-		// development server. Production misconfiguration fails closed.
 		if adminPassword == "" {
-			if allowInsecureLocalRequest(c) {
-				c.Next()
-				return
-			}
 			unauthenticatedConfiguration(c)
 			return
 		}
@@ -122,16 +109,4 @@ func unauthenticatedConfiguration(c *gin.Context) {
 			"type":    "configuration_error",
 		},
 	})
-}
-
-func allowInsecureLocalRequest(c *gin.Context) bool {
-	if !strings.EqualFold(strings.TrimSpace(os.Getenv("ALLOW_INSECURE_LOCALHOST")), "true") {
-		return false
-	}
-	host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
-	if err != nil {
-		host = c.Request.RemoteAddr
-	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	return ip != nil && ip.IsLoopback()
 }

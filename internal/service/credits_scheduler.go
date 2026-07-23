@@ -3,9 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os"
-	"strings"
 	"time"
 
 	"zencoder-2api/internal/database"
@@ -19,38 +16,17 @@ import (
 const (
 	usageCreditsRefreshJobName         = "usage-based-credits-refresh"
 	defaultUsageCreditsRefreshInterval = 15 * time.Minute
-	minimumUsageCreditsRefreshInterval = time.Minute
-	maximumUsageCreditsRefreshInterval = 24 * time.Hour
 )
 
-// ValidateUsageCreditsRefreshConfig makes an invalid refresh cadence a startup
-// error instead of silently disabling balance-based scheduling.
-func ValidateUsageCreditsRefreshConfig() error {
-	_, err := usageCreditsRefreshInterval()
-	return err
-}
-
-func usageCreditsRefreshInterval() (time.Duration, error) {
-	raw := strings.TrimSpace(os.Getenv("USAGE_CREDITS_REFRESH_INTERVAL"))
-	if raw == "" {
-		return defaultUsageCreditsRefreshInterval, nil
-	}
-	interval, err := time.ParseDuration(raw)
-	if err != nil || interval < minimumUsageCreditsRefreshInterval || interval > maximumUsageCreditsRefreshInterval {
-		return 0, fmt.Errorf("usage credits refresh interval (USAGE_CREDITS_REFRESH_INTERVAL) must be between %s and %s", minimumUsageCreditsRefreshInterval, maximumUsageCreditsRefreshInterval)
-	}
-	return interval, nil
+func usageCreditsRefreshInterval() time.Duration {
+	return defaultUsageCreditsRefreshInterval
 }
 
 // StartUsageCreditsRefreshScheduler refreshes stale account snapshots at a
-// configurable interval. A database lease makes the scan single-owner across
+// fixed interval. A database lease makes the scan single-owner across
 // multiple service instances; per-account leases protect the actual queries.
 func StartUsageCreditsRefreshScheduler() context.CancelFunc {
-	interval, err := usageCreditsRefreshInterval()
-	if err != nil {
-		logging.Errorf("Usage-based credit scheduler disabled: %v", err)
-		return func() {}
-	}
+	interval := usageCreditsRefreshInterval()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

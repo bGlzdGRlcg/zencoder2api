@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -20,7 +21,6 @@ import (
 	"zencoder-2api/internal/database"
 	"zencoder-2api/internal/logging"
 	"zencoder-2api/internal/model"
-	"zencoder-2api/internal/secret"
 )
 
 const (
@@ -47,10 +47,6 @@ func CreateAdminSession() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		password := os.Getenv("ADMIN_PASSWORD")
 		if password == "" {
-			if allowInsecureLocalRequest(c) {
-				c.JSON(http.StatusOK, gin.H{"csrfToken": "", "expiresAt": time.Now().Add(adminSessionLifetime).Unix()})
-				return
-			}
 			unauthenticatedConfiguration(c)
 			return
 		}
@@ -86,7 +82,7 @@ func CreateAdminSession() gin.HandlerFunc {
 			Nonce:               nonce,
 			PasswordFingerprint: adminPasswordFingerprint(password),
 		}
-		sessionToken, err := encryptAdminSession(payload)
+		sessionToken, err := signAdminSession(payload, password)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": gin.H{
 				"message": "unable to create admin session",
@@ -109,7 +105,7 @@ func CreateAdminSession() gin.HandlerFunc {
 			MaxAge:   int(adminSessionLifetime.Seconds()),
 			Expires:  now.Add(adminSessionLifetime),
 			HttpOnly: true,
-			Secure:   adminCookieSecure(),
+			Secure:   adminCookieSecure(c.Request),
 			SameSite: http.SameSiteStrictMode,
 		})
 		c.Header("Cache-Control", "no-store")
@@ -140,7 +136,7 @@ func DestroyAdminSession() gin.HandlerFunc {
 			MaxAge:   -1,
 			Expires:  time.Unix(1, 0),
 			HttpOnly: true,
-			Secure:   adminCookieSecure(),
+			Secure:   adminCookieSecure(c.Request),
 			SameSite: http.SameSiteStrictMode,
 		})
 		c.Status(http.StatusNoContent)
@@ -177,24 +173,31 @@ func authenticateAdminSession(c *gin.Context, password string) error {
 	return nil
 }
 
-func encryptAdminSession(payload adminSessionPayload) (string, error) {
+func signAdminSession(payload adminSessionPayload, password string) (string, error) {
 	encodedPayload, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
-	return secret.Encrypt(string(encodedPayload))
+	payloadPart := base64.RawURLEncoding.EncodeToString(encodedPayload)
+	signature := adminSessionSignature(payloadPart, password)
+	return "v1." + payloadPart + "." + base64.RawURLEncoding.EncodeToString(signature), nil
 }
 
 func verifyAdminSession(token, password string, now time.Time) (adminSessionPayload, error) {
-	if !secret.IsEncrypted(token) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] != "v1" {
 		return adminSessionPayload{}, errInvalidAdminSession
 	}
-	encodedPayload, err := secret.Decrypt(token)
+	providedSignature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || !hmac.Equal(providedSignature, adminSessionSignature(parts[1], password)) {
+		return adminSessionPayload{}, errInvalidAdminSession
+	}
+	encodedPayload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return adminSessionPayload{}, errInvalidAdminSession
 	}
 	var payload adminSessionPayload
-	if err := json.Unmarshal([]byte(encodedPayload), &payload); err != nil {
+	if err := json.Unmarshal(encodedPayload, &payload); err != nil {
 		return adminSessionPayload{}, errInvalidAdminSession
 	}
 	if payload.Nonce == "" || payload.CSRFHash == "" || payload.PasswordFingerprint == "" || payload.IssuedAt <= 0 || payload.ExpiresAt <= payload.IssuedAt {
@@ -207,6 +210,12 @@ func verifyAdminSession(token, password string, now time.Time) (adminSessionPayl
 		return adminSessionPayload{}, errInvalidAdminSession
 	}
 	return payload, nil
+}
+
+func adminSessionSignature(payloadPart, password string) []byte {
+	mac := hmac.New(sha256.New, []byte(password))
+	_, _ = mac.Write([]byte("zencoder2api/admin-session/signature/v1\x00" + payloadPart))
+	return mac.Sum(nil)
 }
 
 func adminPasswordFingerprint(password string) string {
@@ -274,12 +283,12 @@ func bearerCredential(header string) (string, bool) {
 	return returnValue, returnValue != ""
 }
 
-func adminCookieSecure() bool {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("ADMIN_COOKIE_SECURE")), "true") {
+func adminCookieSecure(req *http.Request) bool {
+	if req.TLS != nil {
 		return true
 	}
-	publicBaseURL, err := url.Parse(strings.TrimSpace(os.Getenv("PUBLIC_BASE_URL")))
-	return err == nil && strings.EqualFold(publicBaseURL.Scheme, "https")
+	requestOrigin, err := url.Parse(strings.TrimSpace(req.Header.Get("Origin")))
+	return err == nil && strings.EqualFold(requestOrigin.Scheme, "https") && strings.EqualFold(requestOrigin.Host, req.Host)
 }
 
 func isSafeMethod(method string) bool {

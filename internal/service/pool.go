@@ -177,21 +177,6 @@ func copyAccountHealthState(dst *model.Account, src model.Account) {
 	dst.ReauthRequired = src.ReauthRequired
 }
 
-// GetNextAccount selects OAuth accounts in round-robin order. Accounts are
-// deliberately not leased or marked busy: concurrent and long-running streams
-// may share an OAuth account. Returning a value copy prevents those requests
-// from racing on the pool's cached object.
-func GetNextAccount() (*model.Account, error) {
-	return GetNextAccountContext(context.Background(), nil)
-}
-
-// GetNextAccountExcluding returns a healthy account not present in tried.
-// Callers use it for bounded retries so a cooldown cannot cause a duplicate
-// attempt against the same credential in one request.
-func GetNextAccountExcluding(tried map[uint]struct{}) (*model.Account, error) {
-	return GetNextAccountContext(context.Background(), tried)
-}
-
 // GetNextAccountContext propagates request cancellation through the database
 // health recheck instead of allowing a locked SQLite connection to outlive the
 // client request.
@@ -273,37 +258,6 @@ func accountAttemptLimit() int {
 	return maxAccountAttempts
 }
 
-// AccountPoolReady reports whether at least one credential can serve traffic.
-// It intentionally excludes cooldown and re-authentication-required accounts.
-func AccountPoolReady() bool {
-	return AccountPoolReadyContext(context.Background())
-}
-
-// AccountPoolReadyContext is the cancellation-aware readiness variant used by
-// HTTP health handlers so a locked SQLite database cannot hang readiness.
-func AccountPoolReadyContext(ctx context.Context) bool {
-	if pool == nil {
-		return false
-	}
-	for attempt := 0; attempt < 2; attempt++ {
-		pool.mu.Lock()
-		accounts := append([]model.Account(nil), pool.accounts...)
-		pool.mu.Unlock()
-		now := time.Now()
-		for _, account := range accounts {
-			if accountSchedulingPriority(account, now) >= 0 && (account.ID == 0 || accountSchedulingCurrentContext(ctx, &account)) {
-				return true
-			}
-		}
-		if attempt == 0 {
-			if err := pool.refreshContext(ctx); err != nil {
-				return false
-			}
-		}
-	}
-	return false
-}
-
 func isAccountHealthy(account model.Account, now time.Time) bool {
 	if account.ReauthRequired || strings.EqualFold(account.HealthState, accountErrorReauth) {
 		return false
@@ -343,10 +297,7 @@ func usageCreditsSnapshotFresh(account model.Account, now time.Time) bool {
 	if account.UsageCreditsPeriodEnd != nil && !account.UsageCreditsPeriodEnd.After(now) {
 		return false
 	}
-	interval, err := usageCreditsRefreshInterval()
-	if err != nil {
-		interval = defaultUsageCreditsRefreshInterval
-	}
+	interval := usageCreditsRefreshInterval()
 	return account.UsageCreditsUpdatedAt.Add(2 * interval).After(now)
 }
 

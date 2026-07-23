@@ -69,10 +69,6 @@ func (s *OAuthService) StartZencoderLogin(origin string) (OAuthStartResult, erro
 	if err != nil {
 		return OAuthStartResult{}, err
 	}
-	encryptedVerifier, err := secret.Encrypt(verifier)
-	if err != nil {
-		return OAuthStartResult{}, fmt.Errorf("encrypt OAuth code verifier: %w", err)
-	}
 	callbackURL, err := loopbackCallbackURL(origin, state)
 	if err != nil {
 		return OAuthStartResult{}, err
@@ -97,7 +93,7 @@ func (s *OAuthService) StartZencoderLogin(origin string) (OAuthStartResult, erro
 	}
 	if err := db.Create(&model.OAuthSession{
 		State:        state,
-		CodeVerifier: encryptedVerifier,
+		CodeVerifier: verifier,
 		AnonymousID:  anonymousID,
 		Origin:       strings.TrimRight(origin, "/"),
 		RedirectURL:  callbackURL,
@@ -151,9 +147,9 @@ func (s *OAuthService) CompleteZencoderLogin(
 		}
 	}()
 
-	codeVerifier, err := secret.Decrypt(session.CodeVerifier)
+	codeVerifier, err := secret.Plaintext(session.CodeVerifier)
 	if err != nil {
-		return OAuthCompleteResult{Origin: session.Origin}, fmt.Errorf("decrypt OAuth code verifier: %w", err)
+		return OAuthCompleteResult{Origin: session.Origin}, fmt.Errorf("load OAuth code verifier: %w", err)
 	}
 	tokens, err := s.exchangeCode(claimCtx, provider, code, codeVerifier, session.AnonymousID)
 	if claimErr := heartbeat.Err(); claimErr != nil {
@@ -333,24 +329,6 @@ func deleteOAuthSession(ctx context.Context, id uint, claimID string) error {
 	return db.WithContext(ctx).Where("id = ? AND claim_id = ?", id, claimID).Delete(&model.OAuthSession{}).Error
 }
 
-func consumeOAuthSession(ctx context.Context, id uint, claimID string) error {
-	db := database.GetDB()
-	if db == nil {
-		return errors.New("database is not initialized")
-	}
-	now := time.Now()
-	result := db.WithContext(ctx).Model(&model.OAuthSession{}).
-		Where("id = ? AND claim_id = ? AND consumed_at IS NULL AND expires_at > ?", id, claimID, now).
-		Update("consumed_at", now)
-	if result.Error != nil {
-		return fmt.Errorf("consume OAuth session: %w", result.Error)
-	}
-	if result.RowsAffected != 1 {
-		return ErrOAuthSessionInvalidOrExpired
-	}
-	return nil
-}
-
 func loopbackCallbackURL(origin string, state string) (string, error) {
 	parsedOrigin, err := url.Parse(origin)
 	if err != nil || parsedOrigin.Host == "" {
@@ -487,31 +465,6 @@ func (s *OAuthService) fetchProfile(ctx context.Context, accessToken string) (ze
 	return zencoderOAuthProfile{UserID: raw.UserID, TenantID: raw.TenantID, Email: raw.Email}, nil
 }
 
-func upsertOAuthAccount(
-	ctx context.Context,
-	provider string,
-	anonymousID string,
-	tokens zencoderOAuthTokens,
-	profile zencoderOAuthProfile,
-) (*model.Account, error) {
-	db := database.GetDB()
-	if db == nil {
-		return nil, errors.New("database is not initialized")
-	}
-	var account model.Account
-	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var err error
-		account, err = upsertOAuthAccountTx(tx, provider, anonymousID, tokens, profile)
-		return err
-	}); err != nil {
-		return nil, err
-	}
-	if err := decryptOAuthAccountTokens(&account); err != nil {
-		return nil, err
-	}
-	return &account, nil
-}
-
 // upsertAndConsumeOAuthAccount commits the credential mutation and one-time
 // session transition together. No network operation belongs in this
 // transaction; callers must complete exchange/profile HTTP first.
@@ -550,7 +503,7 @@ func upsertAndConsumeOAuthAccount(
 	if err != nil {
 		return nil, err
 	}
-	if err := decryptOAuthAccountTokens(&account); err != nil {
+	if err := loadOAuthAccountTokens(&account); err != nil {
 		return nil, err
 	}
 	return &account, nil
@@ -565,14 +518,6 @@ func upsertOAuthAccountTx(
 ) (model.Account, error) {
 	digest := sha256.Sum256([]byte(provider + ":" + profile.TenantID + ":" + profile.UserID))
 	clientID := "oauth-" + hex.EncodeToString(digest[:])
-	encryptedAccessToken, err := secret.Encrypt(tokens.AccessToken)
-	if err != nil {
-		return model.Account{}, fmt.Errorf("encrypt OAuth access token: %w", err)
-	}
-	encryptedRefreshToken, err := secret.Encrypt(tokens.RefreshToken)
-	if err != nil {
-		return model.Account{}, fmt.Errorf("encrypt OAuth refresh token: %w", err)
-	}
 	account := model.Account{
 		ClientID:           clientID,
 		CredentialType:     model.CredentialOAuth,
@@ -581,8 +526,8 @@ func upsertOAuthAccountTx(
 		OAuthUserID:        profile.UserID,
 		OAuthTenantID:      profile.TenantID,
 		OAuthAnonymousID:   anonymousID,
-		AccessToken:        encryptedAccessToken,
-		RefreshToken:       encryptedRefreshToken,
+		AccessToken:        tokens.AccessToken,
+		RefreshToken:       tokens.RefreshToken,
 		CredentialRevision: 1,
 		TokenExpiresAt:     tokens.ExpiresAt,
 	}
@@ -593,7 +538,7 @@ func upsertOAuthAccountTx(
 		"o_auth_user_id":                    profile.UserID,
 		"o_auth_tenant_id":                  profile.TenantID,
 		"o_auth_anonymous_id":               anonymousID,
-		"access_token":                      encryptedAccessToken,
+		"access_token":                      tokens.AccessToken,
 		"api_key":                           "",
 		"token_expires_at":                  tokens.ExpiresAt,
 		"health_state":                      model.AccountHealthHealthy,
@@ -623,7 +568,7 @@ func upsertOAuthAccountTx(
 		"updated_at":                        time.Now(),
 	}
 	if tokens.RefreshToken != "" {
-		updates["refresh_token"] = encryptedRefreshToken
+		updates["refresh_token"] = tokens.RefreshToken
 	}
 	if err := db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "client_id"}},
@@ -637,18 +582,18 @@ func upsertOAuthAccountTx(
 	return account, nil
 }
 
-func decryptOAuthAccountTokens(account *model.Account) error {
+func loadOAuthAccountTokens(account *model.Account) error {
 	if account == nil {
 		return errors.New("OAuth account is nil")
 	}
 	var err error
-	account.AccessToken, err = secret.Decrypt(account.AccessToken)
+	account.AccessToken, err = secret.Plaintext(account.AccessToken)
 	if err != nil {
-		return fmt.Errorf("decrypt OAuth access token after upsert: %w", err)
+		return fmt.Errorf("load OAuth access token after upsert: %w", err)
 	}
-	account.RefreshToken, err = secret.Decrypt(account.RefreshToken)
+	account.RefreshToken, err = secret.Plaintext(account.RefreshToken)
 	if err != nil {
-		return fmt.Errorf("decrypt OAuth refresh token after upsert: %w", err)
+		return fmt.Errorf("load OAuth refresh token after upsert: %w", err)
 	}
 	return nil
 }

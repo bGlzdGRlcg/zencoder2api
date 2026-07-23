@@ -182,15 +182,15 @@ func migrateSchemaVersionOne(db *gorm.DB) error {
 		return fmt.Errorf("initialize credential revisions: %w", err)
 	}
 
-	// client_secret is a retired legacy field. APIKey is retained and migrated
-	// through the same encrypted credential store as OAuth tokens.
+	// client_secret is a retired legacy field. APIKey is retained in the
+	// account credential store.
 	if db.Migrator().HasColumn(&model.Account{}, "client_secret") {
 		if err := db.Migrator().DropColumn(&model.Account{}, "client_secret"); err != nil {
 			return fmt.Errorf("drop legacy account column client_secret: %w", err)
 		}
 	}
 	// Schema v1 did not persist the PKCE verifier. Keep its cleanup here so v2
-	// exclusively owns the encrypted verifier column added below.
+	// exclusively owns the verifier column added below.
 	if db.Migrator().HasColumn(&model.OAuthSession{}, "code_verifier") {
 		if err := db.Migrator().DropColumn(&model.OAuthSession{}, "code_verifier"); err != nil {
 			return fmt.Errorf("drop retired OAuth session verifier: %w", err)
@@ -260,23 +260,23 @@ func migrateAccountSecrets(db *gorm.DB) error {
 		return fmt.Errorf("load account secrets for migration: %w", err)
 	}
 	for _, account := range accounts {
-		accessToken, err := secret.Encrypt(account.AccessToken)
+		accessToken, err := secret.Plaintext(account.AccessToken)
 		if err != nil {
-			return fmt.Errorf("encrypt access token for account %d: %w", account.ID, err)
+			return fmt.Errorf("load access token for account %d: %w", account.ID, err)
 		}
-		refreshToken, err := secret.Encrypt(account.RefreshToken)
+		refreshToken, err := secret.Plaintext(account.RefreshToken)
 		if err != nil {
-			return fmt.Errorf("encrypt refresh token for account %d: %w", account.ID, err)
+			return fmt.Errorf("load refresh token for account %d: %w", account.ID, err)
 		}
-		apiKey, err := secret.Encrypt(account.APIKey)
+		apiKey, err := secret.Plaintext(account.APIKey)
 		if err != nil {
-			return fmt.Errorf("encrypt API key for account %d: %w", account.ID, err)
+			return fmt.Errorf("load API key for account %d: %w", account.ID, err)
 		}
 		clientID := account.ClientID
 		if account.APIKey != "" {
-			plaintextAPIKey, err := secret.Decrypt(account.APIKey)
+			plaintextAPIKey, err := secret.Plaintext(account.APIKey)
 			if err != nil {
-				return fmt.Errorf("decrypt API key for account %d: %w", account.ID, err)
+				return fmt.Errorf("load API key for account %d: %w", account.ID, err)
 			}
 			index, err := secret.BlindIndex("zencoder-api-key", strings.TrimSpace(plaintextAPIKey))
 			if err != nil {
@@ -293,7 +293,7 @@ func migrateAccountSecrets(db *gorm.DB) error {
 			"api_key":       apiKey,
 			"client_id":     clientID,
 		}).Error; err != nil {
-			return fmt.Errorf("persist encrypted tokens for account %d: %w", account.ID, err)
+			return fmt.Errorf("persist account credentials for account %d: %w", account.ID, err)
 		}
 	}
 	return nil

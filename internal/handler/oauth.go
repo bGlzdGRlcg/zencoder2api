@@ -7,10 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -182,36 +180,27 @@ func (h *OAuthHandler) renderCallback(c *gin.Context, origin string, success boo
 }
 
 func publicOrigin(req *http.Request) (string, error) {
-	if configured := strings.TrimSpace(os.Getenv("PUBLIC_BASE_URL")); configured != "" {
-		return validatePublicOrigin(configured)
+	if requestOrigin := strings.TrimSpace(req.Header.Get("Origin")); requestOrigin != "" {
+		parsed, err := url.Parse(requestOrigin)
+		if err != nil || !strings.EqualFold(parsed.Host, req.Host) {
+			return "", errors.New("request Origin does not match Host")
+		}
+		return validateRequestOrigin(requestOrigin)
 	}
 	scheme := "http"
 	if req.TLS != nil {
 		scheme = "https"
 	}
-	host := req.Host
-	parsed, err := url.Parse(scheme + "://" + host)
-	if err != nil || !isLoopbackOAuthHost(parsed.Hostname()) {
-		return "", errors.New("PUBLIC_BASE_URL is required for non-loopback OAuth origins")
-	}
-	return validatePublicOrigin(parsed.String())
+	return validateRequestOrigin(scheme + "://" + req.Host)
 }
 
-func validatePublicOrigin(raw string) (string, error) {
+func validateRequestOrigin(raw string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return "", fmt.Errorf("PUBLIC_BASE_URL 必须是有效的 HTTP(S) 地址")
+		return "", fmt.Errorf("请求来源必须是有效的 HTTP(S) 地址")
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("PUBLIC_BASE_URL 不能包含凭据、查询参数或片段")
+		return "", fmt.Errorf("请求来源不能包含凭据、查询参数或片段")
 	}
 	return parsed.Scheme + "://" + parsed.Host + strings.TrimRight(parsed.EscapedPath(), "/"), nil
-}
-
-func isLoopbackOAuthHost(host string) bool {
-	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }

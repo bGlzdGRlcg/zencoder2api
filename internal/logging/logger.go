@@ -1,16 +1,13 @@
 package logging
 
-// Package logging provides a minimal leveled logger for the proxy.
-// By default stdout/stderr are silent (LOG_LEVEL=silent). Set LOG_LEVEL to
-// "error", "warn", "info", or "debug" to progressively enable more output.
-// Startup errors (Fatal/Fatalf) always write to stderr regardless of level.
+// Package logging provides a minimal silent logger for the proxy. Startup
+// errors (Fatal/Fatalf) always write to stderr.
 
 import (
 	"context"
 	"io"
 	"log"
 	"os"
-	"strings"
 	"sync"
 )
 
@@ -45,31 +42,13 @@ var (
 	logger       = log.New(os.Stderr, "", log.LstdFlags)
 )
 
-// Init reads LOG_LEVEL from the environment and configures the standard log
-// package accordingly. It must be called once at startup, before any logging.
+// Init disables regular application logging. Fatal startup errors remain
+// visible through Fatalf.
 func Init() {
 	mu.Lock()
 	defer mu.Unlock()
-
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL")))
-	switch raw {
-	case "debug":
-		currentLevel = LevelDebug
-	case "info":
-		currentLevel = LevelInfo
-	case "warn":
-		currentLevel = LevelWarn
-	case "error":
-		currentLevel = LevelError
-	default:
-		currentLevel = LevelSilent
-	}
-
-	if currentLevel == LevelSilent {
-		log.SetOutput(io.Discard)
-	} else {
-		log.SetOutput(os.Stderr)
-	}
+	currentLevel = LevelSilent
+	log.SetOutput(io.Discard)
 }
 
 // Enabled reports whether messages at the given level would be emitted.

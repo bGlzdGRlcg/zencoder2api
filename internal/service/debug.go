@@ -3,23 +3,13 @@ package service
 import (
 	"context"
 	"net/url"
-	"os"
-	"sync"
 
 	"zencoder-2api/internal/logging"
 )
 
-var (
-	debugMode     bool
-	debugModeOnce sync.Once
-)
-
-// IsDebugMode 检查是否启用调试模式
+// IsDebugMode reports the fixed disabled debug state.
 func IsDebugMode() bool {
-	debugModeOnce.Do(func() {
-		debugMode = os.Getenv("DEBUG") == "true" || os.Getenv("DEBUG") == "1"
-	})
-	return debugMode
+	return false
 }
 
 func logToContext(ctx context.Context, format string, args ...interface{}) {
