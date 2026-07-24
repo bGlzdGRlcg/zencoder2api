@@ -35,13 +35,9 @@ GEMINI_MODELS = [
     "gemini-3.1-pro-preview-customtools",
     "gemini-3-flash-preview",
     "gemini-3.5-flash",
-    "gemini-3.1-flash-image",
 ]
 OPENAI_MODELS = [
     "gpt-5-nano",
-    "gpt-5.1-codex-mini",
-    "gpt-5.1-codex-max",
-    "gpt-5.3-codex",
     "gpt-5.4-mini",
     "gpt-5.4",
     "gpt-5.5",
@@ -50,7 +46,7 @@ OPENAI_MODELS = [
     "grok-code-fast",
     "grok-4.5",
 ]
-CODEX_MODELS = {"gpt-5.1-codex-mini", "gpt-5.1-codex-max", "gpt-5.3-codex"}
+CODEX_MODELS = set()
 
 SCHEMA = {
     "type": "object",
@@ -605,9 +601,6 @@ def capabilities_for(model):
             ("reasoning_low", lambda: gemini_reasoning(model, "low")),
             ("reasoning_high", lambda: gemini_reasoning(model, "high")),
         ]
-        if model == "gemini-3.1-flash-image":
-            cases.append(("image_generation", lambda: gemini_image_generation(model)))
-            cases.append(("image_edit", lambda: gemini_image_edit(model)))
         return cases
     return [
         ("chat", lambda: openai_text(model)),
