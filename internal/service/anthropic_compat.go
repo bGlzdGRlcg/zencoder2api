@@ -19,7 +19,7 @@ func isAnthropicCompatibleModel(modelID string) bool {
 	return providerID == "anthropic" || providerID == "glm" || providerID == "minimax"
 }
 
-func (s *OpenAIService) chatCompletionsViaAnthropic(ctx context.Context, body []byte) (*http.Response, error) {
+func (s *OpenAIService) chatCompletionsViaAnthropic(ctx context.Context, body []byte, forceIncludeUsage bool) (*http.Response, error) {
 	var request struct {
 		Model  string `json:"model"`
 		Stream bool   `json:"stream"`
@@ -27,7 +27,7 @@ func (s *OpenAIService) chatCompletionsViaAnthropic(ctx context.Context, body []
 	if err := json.Unmarshal(body, &request); err != nil {
 		return nil, err
 	}
-	converted, err := convertChatToAnthropicBody(body)
+	converted, includeUsage, err := convertChatToAnthropicBody(body)
 	if err != nil {
 		return nil, openAICompatibilityError(err)
 	}
@@ -41,7 +41,7 @@ func (s *OpenAIService) chatCompletionsViaAnthropic(ctx context.Context, body []
 		return resp, nil
 	}
 	if request.Stream {
-		return wrapAnthropicStreamAsChat(resp, request.Model), nil
+		return wrapAnthropicStreamAsChat(resp, request.Model, includeUsage || forceIncludeUsage), nil
 	}
 	return convertAnthropicResponseToChat(resp, request.Model)
 }
@@ -61,7 +61,7 @@ func (s *OpenAIService) responsesViaAnthropic(ctx context.Context, w http.Respon
 		return openAICompatibilityError(err)
 	}
 
-	resp, err := s.chatCompletionsViaAnthropic(ctx, chatBody)
+	resp, err := s.chatCompletionsViaAnthropic(ctx, chatBody, true)
 	if err != nil {
 		return err
 	}
@@ -91,19 +91,25 @@ func (s *OpenAIService) responsesViaAnthropic(ctx context.Context, w http.Respon
 	return err
 }
 
-func convertChatToAnthropicBody(body []byte) ([]byte, error) {
+func convertChatToAnthropicBody(body []byte) ([]byte, bool, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	removeUndefinedPlaceholders(raw)
+	includeUsage, err := consumeChatStreamOptions(raw, "Anthropic Chat")
+	if err != nil {
+		return nil, false, err
+	}
+	consumeAnthropicReasoningEffort(raw)
 	if err := validateChatForAnthropic(raw); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if messages, ok := raw["messages"].([]interface{}); ok {
 		converted, system, err := convertChatMessagesToAnthropic(messages)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		raw["messages"] = converted
 		if len(system) > 0 {
@@ -185,7 +191,38 @@ func convertChatToAnthropicBody(body []byte) ([]byte, error) {
 		delete(raw, "stop")
 	}
 
-	return json.Marshal(raw)
+	converted, err := json.Marshal(raw)
+	return converted, includeUsage, err
+}
+
+func consumeAnthropicReasoningEffort(raw map[string]interface{}) {
+	value, exists := raw["reasoning_effort"]
+	delete(raw, "reasoning_effort")
+	if !exists || raw["thinking"] != nil {
+		return
+	}
+
+	effort := strings.ToLower(strings.TrimSpace(stringValue(value)))
+	if effort == "none" {
+		raw["thinking"] = map[string]interface{}{"type": "disabled"}
+		return
+	}
+
+	budget := 4096
+	switch effort {
+	case "minimal":
+		budget = 1024
+	case "low":
+		budget = 2048
+	case "high":
+		budget = 8192
+	case "xhigh":
+		budget = 16384
+	}
+	raw["thinking"] = map[string]interface{}{
+		"type":          "enabled",
+		"budget_tokens": budget,
+	}
 }
 
 func convertChatMessagesToAnthropic(messages []interface{}) ([]interface{}, []string, error) {
@@ -302,8 +339,12 @@ func anthropicReasoningBlocks(message map[string]interface{}) ([]interface{}, er
 	if reasoning == "" {
 		return nil, nil
 	}
+	signature := stringValue(message["reasoning_signature"])
+	if signature == "" {
+		signature = geminiThoughtSignatureBypass
+	}
 	return []interface{}{map[string]interface{}{
-		"type": "thinking", "thinking": reasoning, "signature": stringValue(message["reasoning_signature"]),
+		"type": "thinking", "thinking": reasoning, "signature": signature,
 	}}, nil
 }
 
@@ -564,7 +605,7 @@ func numberAsInt(value interface{}) int {
 	return 0
 }
 
-func wrapAnthropicStreamAsChat(resp *http.Response, modelID string) *http.Response {
+func wrapAnthropicStreamAsChat(resp *http.Response, modelID string, includeUsage bool) *http.Response {
 	source := resp.Body
 	reader, writer := io.Pipe()
 	resp.Body = reader
@@ -574,7 +615,7 @@ func wrapAnthropicStreamAsChat(resp *http.Response, modelID string) *http.Respon
 
 	go func() {
 		defer source.Close()
-		err := convertAnthropicStream(source, writer, modelID)
+		err := convertAnthropicStream(source, writer, modelID, includeUsage)
 		if err != nil {
 			_ = writer.CloseWithError(err)
 			return
@@ -584,7 +625,7 @@ func wrapAnthropicStreamAsChat(resp *http.Response, modelID string) *http.Respon
 	return resp
 }
 
-func convertAnthropicStream(source io.Reader, destination *io.PipeWriter, modelID string) error {
+func convertAnthropicStream(source io.Reader, destination *io.PipeWriter, modelID string, includeUsage bool) error {
 	reader := bufio.NewReader(source)
 	eventName := ""
 	dataLines := make([]string, 0)
@@ -738,8 +779,10 @@ func convertAnthropicStream(source io.Reader, destination *io.PipeWriter, modelI
 			}
 		case "message_stop":
 			terminalSeen = true
-			if err := writeUsage(); err != nil {
-				return err
+			if includeUsage {
+				if err := writeUsage(); err != nil {
+					return err
+				}
 			}
 			_, err := io.WriteString(destination, "data: [DONE]\n\n")
 			return err

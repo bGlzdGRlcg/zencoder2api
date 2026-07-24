@@ -53,7 +53,7 @@ func (s *OpenAIService) ChatCompletions(ctx context.Context, body []byte) (*http
 	// and MiniMax through /v1/messages. Accept Chat Completions for them too,
 	// adapting both request and response formats at the proxy boundary.
 	if isAnthropicCompatibleModel(req.Model) {
-		return s.chatCompletionsViaAnthropic(ctx, body)
+		return s.chatCompletionsViaAnthropic(ctx, body, false)
 	}
 
 	// The gateway can reject function tools on Chat Completions when reasoning
@@ -163,7 +163,7 @@ func requiresResponsesForFunctionTools(modelID string, body []byte) bool {
 }
 
 func (s *OpenAIService) chatCompletionsViaResponses(ctx context.Context, modelID string, body []byte) (*http.Response, error) {
-	responsesBody, err := s.convertChatToResponsesBody(body)
+	responsesBody, includeUsage, err := s.convertChatToResponsesBody(body)
 	if err != nil {
 		return nil, openAICompatibilityError(err)
 	}
@@ -181,7 +181,7 @@ func (s *OpenAIService) chatCompletionsViaResponses(ctx context.Context, modelID
 		return nil, fmt.Errorf("invalid request body: %w", err)
 	}
 	if request.Stream {
-		return wrapResponsesStreamAsChat(resp, modelID), nil
+		return wrapResponsesStreamAsChat(resp, modelID, includeUsage), nil
 	}
 
 	converted, err := convertResponsesResponseToChat(resp, modelID)
@@ -349,7 +349,7 @@ func convertResponsesJSONToChat(body []byte, modelID string) ([]byte, error) {
 	})
 }
 
-func wrapResponsesStreamAsChat(resp *http.Response, modelID string) *http.Response {
+func wrapResponsesStreamAsChat(resp *http.Response, modelID string, includeUsage bool) *http.Response {
 	source := resp.Body
 	reader, writer := io.Pipe()
 	resp.Body = reader
@@ -357,13 +357,13 @@ func wrapResponsesStreamAsChat(resp *http.Response, modelID string) *http.Respon
 	resp.Header.Del("Content-Length")
 	go func() {
 		defer source.Close()
-		err := convertResponsesStreamToChat(source, writer, modelID)
+		err := convertResponsesStreamToChat(source, writer, modelID, includeUsage)
 		_ = writer.CloseWithError(err)
 	}()
 	return resp
 }
 
-func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, modelID string) error {
+func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, modelID string, includeUsage bool) error {
 	reader := bufio.NewReader(source)
 	operationID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
@@ -558,7 +558,7 @@ func convertResponsesStreamToChat(source io.Reader, destination *io.PipeWriter, 
 			if err := writeChunk(map[string]interface{}{}, finishReason); err != nil {
 				return err
 			}
-			if usage, ok := response["usage"].(map[string]interface{}); ok {
+			if usage, ok := response["usage"].(map[string]interface{}); includeUsage && ok {
 				if err := writeUsage(usage); err != nil {
 					return err
 				}
@@ -694,19 +694,26 @@ func (s *OpenAIService) Responses(ctx context.Context, body []byte) (*http.Respo
 }
 
 // convertChatToResponsesBody 将 Chat Completion 的请求体转换为 Responses API 的请求体
-func (s *OpenAIService) convertChatToResponsesBody(body []byte) ([]byte, error) {
+func (s *OpenAIService) convertChatToResponsesBody(body []byte) ([]byte, bool, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	for _, field := range []string{"frequency_penalty", "presence_penalty", "logit_bias", "logprobs", "top_logprobs", "modalities", "audio", "user", "stream_options"} {
+	removeUndefinedPlaceholders(raw)
+
+	includeUsage, err := consumeChatStreamOptions(raw, "Responses")
+	if err != nil {
+		return nil, false, err
+	}
+
+	for _, field := range []string{"frequency_penalty", "presence_penalty", "logit_bias", "logprobs", "top_logprobs", "modalities", "audio", "user"} {
 		if value, ok := raw[field]; ok && value != nil {
-			return nil, fmt.Errorf("Responses compatibility path cannot preserve field %q", field)
+			return nil, false, fmt.Errorf("Responses compatibility path cannot preserve field %q", field)
 		}
 	}
 	if value, ok := raw["n"]; ok {
 		if intValue(value) != 1 {
-			return nil, fmt.Errorf("Responses compatibility path cannot preserve n=%v", value)
+			return nil, false, fmt.Errorf("Responses compatibility path cannot preserve n=%v", value)
 		}
 		delete(raw, "n")
 	}
@@ -780,7 +787,7 @@ func (s *OpenAIService) convertChatToResponsesBody(body []byte) ([]byte, error) 
 	}
 	if format, ok := raw["response_format"].(map[string]interface{}); ok {
 		if formatType := stringValue(format["type"]); formatType != "json_object" && formatType != "json_schema" {
-			return nil, fmt.Errorf("Responses compatibility path cannot preserve response_format type %q", formatType)
+			return nil, false, fmt.Errorf("Responses compatibility path cannot preserve response_format type %q", formatType)
 		}
 		textConfig, _ := raw["text"].(map[string]interface{})
 		if textConfig == nil {
@@ -838,7 +845,8 @@ func (s *OpenAIService) convertChatToResponsesBody(body []byte) ([]byte, error) 
 		delete(raw, "messages")
 	}
 
-	return json.Marshal(raw)
+	converted, err := json.Marshal(raw)
+	return converted, includeUsage, err
 }
 
 func convertChatMessagesToResponsesInput(messages []interface{}) []interface{} {
@@ -1190,9 +1198,13 @@ func removeUndefinedPlaceholders(value interface{}) {
 	switch current := value.(type) {
 	case map[string]interface{}:
 		for key, child := range current {
-			if text, ok := child.(string); ok && text == "[undefined]" {
-				delete(current, key)
-				continue
+			if text, ok := child.(string); ok {
+				// Cherry Studio can emit these diagnostic placeholders for
+				// JavaScript values that were undefined or circular.
+				if text == "[undefined]" || (key == "extra_content" && text == "[Circular]") {
+					delete(current, key)
+					continue
+				}
 			}
 			removeUndefinedPlaceholders(child)
 		}

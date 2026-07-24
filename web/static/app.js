@@ -268,6 +268,30 @@ async function createAdminSession(password) {
 	}
 }
 
+async function restoreAdminSession() {
+	adminCSRFToken = null;
+	try {
+		const response = await fetchWithTimeout(`${API_BASE}/admin/session`, {
+			method: "GET",
+			credentials: "same-origin",
+			cache: "no-store",
+			referrerPolicy: "no-referrer",
+			headers: { Accept: "application/json" },
+		});
+		if (!response.ok) return false;
+		const result = await response.json();
+		if (!result || typeof result.csrfToken !== "string" || !result.csrfToken) {
+			return false;
+		}
+		adminCSRFToken = result.csrfToken;
+		return true;
+	} catch (error) {
+		console.warn("Admin session restore failed", error);
+		adminCSRFToken = null;
+		return false;
+	}
+}
+
 function showAdminLogin() {
 	const modal = document.getElementById("adminPasswordModal");
 	const mainApp = document.getElementById("mainApp");
@@ -366,8 +390,15 @@ async function logout() {
 }
 
 async function initAdminAuth() {
-	// A reload deliberately requires a fresh exchange; no credential is stored.
-	adminCSRFToken = null;
+	setAdminLoginLoading(true, "正在恢复会话...");
+	const restored = await restoreAdminSession();
+	setAdminLoginLoading(false);
+	if (restored) {
+		appSessionActive = true;
+		hideAdminLogin();
+		initializeApp();
+		return;
+	}
 	showAdminLogin();
 }
 

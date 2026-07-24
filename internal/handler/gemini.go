@@ -23,9 +23,6 @@ func NewGeminiHandler() *GeminiHandler {
 func (h *GeminiHandler) ListModels(c *gin.Context) {
 	items := make([]gin.H, 0)
 	for _, zenModel := range model.ListZenModels() {
-		if zenModel.ProviderID != "gemini" {
-			continue
-		}
 		items = append(items, gin.H{
 			"name":                       "models/" + zenModel.ID,
 			"baseModelId":                zenModel.ID,
@@ -42,7 +39,7 @@ func (h *GeminiHandler) ListModels(c *gin.Context) {
 func (h *GeminiHandler) GetModel(c *gin.Context) {
 	modelName := strings.TrimPrefix(strings.TrimSpace(c.Param("model")), "models/")
 	zenModel, ok := model.GetZenModel(modelName)
-	if !ok || zenModel.ProviderID != "gemini" {
+	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{
 			"message": "model not found",
 			"status":  "NOT_FOUND",
@@ -79,7 +76,7 @@ func (h *GeminiHandler) HandleRequest(c *gin.Context) {
 	// back in the request path, while others pass only the model ID.
 	modelName = strings.TrimPrefix(modelName, "models/")
 	zenModel, known := model.GetZenModel(modelName)
-	if !known || zenModel.ProviderID != "gemini" {
+	if !known {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "unknown Gemini model", "type": "invalid_request_error"}})
 		return
 	}
@@ -93,11 +90,23 @@ func (h *GeminiHandler) HandleRequest(c *gin.Context) {
 
 	switch action {
 	case "generateContent":
-		if err := h.svc.GenerateContentProxy(c.Request.Context(), c.Writer, modelName, body); err != nil && !c.Writer.Written() {
+		var err error
+		if zenModel.ProviderID == "gemini" {
+			err = h.svc.GenerateContentProxy(c.Request.Context(), c.Writer, modelName, body)
+		} else {
+			err = h.svc.CompatibleGenerateContentProxy(c.Request.Context(), c.Writer, modelName, body, false)
+		}
+		if err != nil && !c.Writer.Written() {
 			h.handleError(c, err)
 		}
 	case "streamGenerateContent":
-		if err := h.svc.StreamGenerateContentProxy(c.Request.Context(), c.Writer, modelName, body); err != nil && !c.Writer.Written() {
+		var err error
+		if zenModel.ProviderID == "gemini" {
+			err = h.svc.StreamGenerateContentProxy(c.Request.Context(), c.Writer, modelName, body)
+		} else {
+			err = h.svc.CompatibleGenerateContentProxy(c.Request.Context(), c.Writer, modelName, body, true)
+		}
+		if err != nil && !c.Writer.Written() {
 			h.handleError(c, err)
 		}
 	default:

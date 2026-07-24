@@ -82,7 +82,8 @@ func convertResponsesToGemini(body []byte) (string, bool, []byte, error) {
 	if err != nil {
 		return "", false, nil, err
 	}
-	return convertOpenAIChatToGemini(chatBody)
+	modelID, stream, _, nativeBody, err := convertOpenAIChatToGemini(chatBody)
+	return modelID, stream, nativeBody, err
 }
 
 type geminiResponsesTool struct {
@@ -91,7 +92,6 @@ type geminiResponsesTool struct {
 	outputIndex int
 	arguments   strings.Builder
 	lastArgs    string
-	pendingJSON bool
 }
 
 func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID string) error {
@@ -117,6 +117,14 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 	toolOrder := make([]int, 0)
 	messageID := fmt.Sprintf("msg_%s", responseID)
 	messageStarted := false
+	messageOutputIndex := -1
+	reasoningID := fmt.Sprintf("rs_%s", responseID)
+	reasoningStarted := false
+	reasoningSummaryStarted := false
+	reasoningOutputIndex := -1
+	reasoning := strings.Builder{}
+	reasoningSignature := strings.Builder{}
+	nextOutputIndex := 0
 	usage := map[string]interface{}{}
 	finishReason := "stop"
 	terminalSeen := false
@@ -147,15 +155,46 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 			},
 		})
 	}
+	startReasoning := func() error {
+		if reasoningStarted {
+			return nil
+		}
+		reasoningStarted = true
+		reasoningOutputIndex = nextOutputIndex
+		nextOutputIndex++
+		return writeEvent("response.output_item.added", map[string]interface{}{
+			"type": "response.output_item.added", "response_id": responseID,
+			"output_index": reasoningOutputIndex,
+			"item": map[string]interface{}{
+				"type": "reasoning", "id": reasoningID, "status": "in_progress", "summary": []interface{}{},
+			},
+		})
+	}
+	startReasoningSummary := func() error {
+		if err := startReasoning(); err != nil {
+			return err
+		}
+		if reasoningSummaryStarted {
+			return nil
+		}
+		reasoningSummaryStarted = true
+		return writeEvent("response.reasoning_summary_part.added", map[string]interface{}{
+			"type": "response.reasoning_summary_part.added", "response_id": responseID,
+			"item_id": reasoningID, "output_index": reasoningOutputIndex, "summary_index": 0,
+			"part": map[string]interface{}{"type": "summary_text", "text": ""},
+		})
+	}
 	startTextMessage := func() error {
 		if messageStarted {
 			return nil
 		}
 		messageStarted = true
+		messageOutputIndex = nextOutputIndex
+		nextOutputIndex++
 		if err := writeEvent("response.output_item.added", map[string]interface{}{
 			"type":         "response.output_item.added",
 			"response_id":  responseID,
-			"output_index": 0,
+			"output_index": messageOutputIndex,
 			"item": map[string]interface{}{
 				"type":    "message",
 				"id":      messageID,
@@ -169,7 +208,7 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 		return writeEvent("response.content_part.added", map[string]interface{}{
 			"type":          "response.content_part.added",
 			"response_id":   responseID,
-			"output_index":  0,
+			"output_index":  messageOutputIndex,
 			"content_index": 0,
 			"item_id":       messageID,
 			"part": map[string]interface{}{
@@ -249,25 +288,38 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 			part, _ := item.(map[string]interface{})
 			if value, ok := part["text"].(string); ok && value != "" {
 				if thought, _ := part["thought"].(bool); thought {
-					return writeFailure(fmt.Errorf("Responses compatibility path cannot preserve streamed Gemini thinking/signature"))
-				}
-				if err := startTextMessage(); err != nil {
-					return err
-				}
-				text.WriteString(value)
-				if err := writeEvent("response.output_text.delta", map[string]interface{}{
-					"type":          "response.output_text.delta",
-					"response_id":   responseID,
-					"output_index":  0,
-					"content_index": 0,
-					"item_id":       messageID,
-					"delta":         value,
-				}); err != nil {
-					return err
+					if err := startReasoningSummary(); err != nil {
+						return err
+					}
+					reasoning.WriteString(value)
+					if err := writeEvent("response.reasoning_summary_text.delta", map[string]interface{}{
+						"type": "response.reasoning_summary_text.delta", "response_id": responseID,
+						"item_id": reasoningID, "output_index": reasoningOutputIndex, "summary_index": 0, "delta": value,
+					}); err != nil {
+						return err
+					}
+				} else {
+					if err := startTextMessage(); err != nil {
+						return err
+					}
+					text.WriteString(value)
+					if err := writeEvent("response.output_text.delta", map[string]interface{}{
+						"type":          "response.output_text.delta",
+						"response_id":   responseID,
+						"output_index":  messageOutputIndex,
+						"content_index": 0,
+						"item_id":       messageID,
+						"delta":         value,
+					}); err != nil {
+						return err
+					}
 				}
 			}
-			if geminiThoughtSignature(part) != "" {
-				return writeFailure(fmt.Errorf("Responses compatibility path cannot preserve streamed Gemini thinking/signature"))
+			if signature := geminiThoughtSignature(part); signature != "" {
+				if err := startReasoning(); err != nil {
+					return err
+				}
+				reasoningSignature.WriteString(signature)
 			}
 
 			functionCall, ok := part["functionCall"].(map[string]interface{})
@@ -297,9 +349,10 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 			if state == nil {
 				state = &geminiResponsesTool{
 					id:          firstNonEmptyString(functionCall["id"], fmt.Sprintf("call_%d", index)),
-					outputIndex: len(toolOrder) + 1,
+					outputIndex: nextOutputIndex,
 					name:        stringValue(functionCall["name"]),
 				}
+				nextOutputIndex++
 				tools[index] = state
 				toolOrder = append(toolOrder, index)
 				if err := writeEvent("response.output_item.added", map[string]interface{}{
@@ -338,7 +391,39 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 		return writeFailure(fmt.Errorf("upstream Gemini stream ended without a terminal event"))
 	}
 
-	output := make([]interface{}, 0, 1+len(toolOrder))
+	output := make([]interface{}, nextOutputIndex)
+	if reasoningStarted {
+		summary := make([]interface{}, 0, 1)
+		if reasoningSummaryStarted {
+			part := map[string]interface{}{"type": "summary_text", "text": reasoning.String()}
+			summary = append(summary, part)
+			if err := writeEvent("response.reasoning_summary_text.done", map[string]interface{}{
+				"type": "response.reasoning_summary_text.done", "response_id": responseID,
+				"item_id": reasoningID, "output_index": reasoningOutputIndex, "summary_index": 0, "text": reasoning.String(),
+			}); err != nil {
+				return err
+			}
+			if err := writeEvent("response.reasoning_summary_part.done", map[string]interface{}{
+				"type": "response.reasoning_summary_part.done", "response_id": responseID,
+				"item_id": reasoningID, "output_index": reasoningOutputIndex, "summary_index": 0, "part": part,
+			}); err != nil {
+				return err
+			}
+		}
+		reasoningOutput := map[string]interface{}{
+			"type": "reasoning", "id": reasoningID, "status": "completed", "summary": summary,
+		}
+		if reasoningSignature.Len() > 0 {
+			reasoningOutput["encrypted_content"] = reasoningSignature.String()
+		}
+		output[reasoningOutputIndex] = reasoningOutput
+		if err := writeEvent("response.output_item.done", map[string]interface{}{
+			"type": "response.output_item.done", "response_id": responseID,
+			"output_index": reasoningOutputIndex, "item": reasoningOutput,
+		}); err != nil {
+			return err
+		}
+	}
 	if text.Len() > 0 {
 		if err := startTextMessage(); err != nil {
 			return err
@@ -346,14 +431,14 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 		if err := writeEvent("response.output_text.done", map[string]interface{}{
 			"type":          "response.output_text.done",
 			"response_id":   responseID,
-			"output_index":  0,
+			"output_index":  messageOutputIndex,
 			"content_index": 0,
 			"item_id":       messageID,
 			"text":          text.String(),
 		}); err != nil {
 			return err
 		}
-		output = append(output, map[string]interface{}{
+		messageOutput := map[string]interface{}{
 			"type":   "message",
 			"id":     messageID,
 			"role":   "assistant",
@@ -363,7 +448,8 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 				"text":        text.String(),
 				"annotations": []interface{}{},
 			}},
-		})
+		}
+		output[messageOutputIndex] = messageOutput
 	}
 	for _, index := range toolOrder {
 		state := tools[index]
@@ -388,7 +474,16 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 			"name":      state.name,
 			"arguments": state.arguments.String(),
 		}
-		output = append(output, toolOutput)
+		output[state.outputIndex] = toolOutput
+		if err := writeEvent("response.function_call_arguments.done", map[string]interface{}{
+			"type":         "response.function_call_arguments.done",
+			"response_id":  responseID,
+			"item_id":      state.id,
+			"output_index": state.outputIndex,
+			"arguments":    state.arguments.String(),
+		}); err != nil {
+			return err
+		}
 
 		// Cherry Studio turns a streamed function call into an executable tool
 		// invocation only after this terminal item event. Without it the UI keeps
@@ -406,7 +501,7 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 		if err := writeEvent("response.content_part.done", map[string]interface{}{
 			"type":          "response.content_part.done",
 			"response_id":   responseID,
-			"output_index":  0,
+			"output_index":  messageOutputIndex,
 			"content_index": 0,
 			"item_id":       messageID,
 			"part": map[string]interface{}{
@@ -420,8 +515,8 @@ func streamGeminiAsResponses(w http.ResponseWriter, resp *http.Response, modelID
 		if err := writeEvent("response.output_item.done", map[string]interface{}{
 			"type":         "response.output_item.done",
 			"response_id":  responseID,
-			"output_index": 0,
-			"item":         output[0],
+			"output_index": messageOutputIndex,
+			"item":         output[messageOutputIndex],
 		}); err != nil {
 			return err
 		}
@@ -495,6 +590,12 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 	responseModel := modelID
 	messageID := fmt.Sprintf("msg_%s", responseID)
 	messageStarted := false
+	messageOutputIndex := -1
+	reasoningID := fmt.Sprintf("rs_%s", responseID)
+	reasoningStarted := false
+	reasoningSummaryStarted := false
+	reasoningOutputIndex := -1
+	nextOutputIndex := 0
 	type messagePartState struct {
 		typ   string
 		index int
@@ -504,6 +605,8 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 	refusalContentIndex := -1
 	text := strings.Builder{}
 	refusal := strings.Builder{}
+	reasoning := strings.Builder{}
+	reasoningSignature := strings.Builder{}
 	tools := make(map[int]*geminiResponsesTool)
 	toolOrder := make([]int, 0)
 	usage := map[string]interface{}{}
@@ -537,6 +640,38 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 			},
 		})
 	}
+	startReasoning := func() error {
+		if reasoningStarted {
+			return nil
+		}
+		reasoningStarted = true
+		reasoningOutputIndex = nextOutputIndex
+		nextOutputIndex++
+		if err := writeEvent("response.output_item.added", map[string]interface{}{
+			"type": "response.output_item.added", "response_id": responseID,
+			"output_index": reasoningOutputIndex,
+			"item": map[string]interface{}{
+				"type": "reasoning", "id": reasoningID, "status": "in_progress", "summary": []interface{}{},
+			},
+		}); err != nil {
+			return err
+		}
+		return nil
+	}
+	startReasoningSummary := func() error {
+		if err := startReasoning(); err != nil {
+			return err
+		}
+		if reasoningSummaryStarted {
+			return nil
+		}
+		reasoningSummaryStarted = true
+		return writeEvent("response.reasoning_summary_part.added", map[string]interface{}{
+			"type": "response.reasoning_summary_part.added", "response_id": responseID,
+			"item_id": reasoningID, "output_index": reasoningOutputIndex, "summary_index": 0,
+			"part": map[string]interface{}{"type": "summary_text", "text": ""},
+		})
+	}
 	startMessagePart := func(partType string) (int, error) {
 		if partType == "output_text" && textContentIndex >= 0 {
 			return textContentIndex, nil
@@ -546,10 +681,12 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 		}
 		if !messageStarted {
 			messageStarted = true
+			messageOutputIndex = nextOutputIndex
+			nextOutputIndex++
 			if err := writeEvent("response.output_item.added", map[string]interface{}{
 				"type":         "response.output_item.added",
 				"response_id":  responseID,
-				"output_index": 0,
+				"output_index": messageOutputIndex,
 				"item": map[string]interface{}{
 					"type":    "message",
 					"id":      messageID,
@@ -578,7 +715,7 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 		if err := writeEvent("response.content_part.added", map[string]interface{}{
 			"type":          "response.content_part.added",
 			"response_id":   responseID,
-			"output_index":  0,
+			"output_index":  messageOutputIndex,
 			"content_index": contentIndex,
 			"item_id":       messageID,
 			"part":          part,
@@ -653,8 +790,23 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 			terminalSeen = true
 		}
 		delta, _ := choice["delta"].(map[string]interface{})
-		if stringValue(delta["reasoning_content"]) != "" || stringValue(delta["reasoning_signature"]) != "" {
-			return writeFailure(fmt.Errorf("Responses compatibility path cannot preserve streamed reasoning/signature"))
+		if value := stringValue(delta["reasoning_content"]); value != "" {
+			if err := startReasoningSummary(); err != nil {
+				return err
+			}
+			reasoning.WriteString(value)
+			if err := writeEvent("response.reasoning_summary_text.delta", map[string]interface{}{
+				"type": "response.reasoning_summary_text.delta", "response_id": responseID,
+				"item_id": reasoningID, "output_index": reasoningOutputIndex, "summary_index": 0, "delta": value,
+			}); err != nil {
+				return err
+			}
+		}
+		if value := stringValue(delta["reasoning_signature"]); value != "" {
+			if err := startReasoning(); err != nil {
+				return err
+			}
+			reasoningSignature.WriteString(value)
 		}
 		if value := stringValue(delta["content"]); value != "" {
 			contentIndex, err := startMessagePart("output_text")
@@ -665,7 +817,7 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 			if err := writeEvent("response.output_text.delta", map[string]interface{}{
 				"type":          "response.output_text.delta",
 				"response_id":   responseID,
-				"output_index":  0,
+				"output_index":  messageOutputIndex,
 				"content_index": contentIndex,
 				"item_id":       messageID,
 				"delta":         value,
@@ -682,7 +834,7 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 			if err := writeEvent("response.refusal.delta", map[string]interface{}{
 				"type":          "response.refusal.delta",
 				"response_id":   responseID,
-				"output_index":  0,
+				"output_index":  messageOutputIndex,
 				"content_index": contentIndex,
 				"item_id":       messageID,
 				"delta":         value,
@@ -700,8 +852,9 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 			if state == nil {
 				state = &geminiResponsesTool{
 					id:          firstNonEmptyString(call["id"], fmt.Sprintf("call_%d", index)),
-					outputIndex: len(toolOrder) + 1,
+					outputIndex: nextOutputIndex,
 				}
+				nextOutputIndex++
 				tools[index] = state
 				toolOrder = append(toolOrder, index)
 				newTool = true
@@ -732,42 +885,8 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 			if arguments == "" {
 				continue
 			}
-			if state.lastArgs != "" && strings.HasPrefix(arguments, state.lastArgs) {
-				deltaArguments, err := cumulativeJSONDelta(state.lastArgs, arguments)
-				if err != nil {
-					return writeFailure(err)
-				}
-				state.lastArgs = arguments
-				if state.arguments.Len() == 0 && json.Valid([]byte(arguments)) {
-					state.pendingJSON = true
-					continue
-				}
-				state.pendingJSON = false
-				state.arguments.WriteString(deltaArguments)
-				if deltaArguments == "" {
-					continue
-				}
-				if err := writeEvent("response.function_call_arguments.delta", map[string]interface{}{
-					"type":         "response.function_call_arguments.delta",
-					"response_id":  responseID,
-					"item_id":      state.id,
-					"output_index": state.outputIndex,
-					"delta":        deltaArguments,
-				}); err != nil {
-					return err
-				}
-				continue
-			}
-			if json.Valid([]byte(arguments)) {
-				state.lastArgs = arguments
-				state.pendingJSON = true
-				continue
-			}
-			if state.pendingJSON {
-				return writeFailure(fmt.Errorf("upstream appended a fragment after complete tool arguments"))
-			}
 			currentArguments := arguments
-			if !strings.HasPrefix(arguments, state.lastArgs) {
+			if state.lastArgs != "" && !strings.HasPrefix(arguments, state.lastArgs) {
 				currentArguments = state.lastArgs + arguments
 			}
 			deltaArguments, err := cumulativeJSONDelta(state.lastArgs, currentArguments)
@@ -796,26 +915,40 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 	if !terminalSeen || !transportDone {
 		return writeFailure(fmt.Errorf("upstream OpenAI stream ended without a terminal event"))
 	}
-	for _, index := range toolOrder {
-		state := tools[index]
-		if !state.pendingJSON {
-			continue
+	output := make([]interface{}, nextOutputIndex)
+	if reasoningStarted {
+		summary := make([]interface{}, 0, 1)
+		if reasoningSummaryStarted {
+			part := map[string]interface{}{"type": "summary_text", "text": reasoning.String()}
+			summary = append(summary, part)
+			if err := writeEvent("response.reasoning_summary_text.done", map[string]interface{}{
+				"type": "response.reasoning_summary_text.done", "response_id": responseID,
+				"item_id": reasoningID, "output_index": reasoningOutputIndex, "summary_index": 0, "text": reasoning.String(),
+			}); err != nil {
+				return err
+			}
+			if err := writeEvent("response.reasoning_summary_part.done", map[string]interface{}{
+				"type": "response.reasoning_summary_part.done", "response_id": responseID,
+				"item_id": reasoningID, "output_index": reasoningOutputIndex, "summary_index": 0, "part": part,
+			}); err != nil {
+				return err
+			}
 		}
-		state.arguments.Reset()
-		state.arguments.WriteString(state.lastArgs)
-		if err := writeEvent("response.function_call_arguments.delta", map[string]interface{}{
-			"type":         "response.function_call_arguments.delta",
-			"response_id":  responseID,
-			"item_id":      state.id,
-			"output_index": state.outputIndex,
-			"delta":        state.lastArgs,
+		reasoningOutput := map[string]interface{}{
+			"type": "reasoning", "id": reasoningID, "status": "completed", "summary": summary,
+		}
+		if reasoningSignature.Len() > 0 {
+			reasoningOutput["encrypted_content"] = reasoningSignature.String()
+		}
+		output[reasoningOutputIndex] = reasoningOutput
+		if err := writeEvent("response.output_item.done", map[string]interface{}{
+			"type": "response.output_item.done", "response_id": responseID,
+			"output_index": reasoningOutputIndex, "item": reasoningOutput,
 		}); err != nil {
 			return err
 		}
-		state.pendingJSON = false
 	}
 
-	output := make([]interface{}, 0, 1+len(toolOrder))
 	if messageStarted {
 		contentParts := make([]interface{}, 0, len(messageParts))
 		for _, state := range messageParts {
@@ -835,13 +968,13 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 			"status":  "completed",
 			"content": contentParts,
 		}
-		output = append(output, messageOutput)
+		output[messageOutputIndex] = messageOutput
 		for _, state := range messageParts {
 			contentPart := contentParts[state.index].(map[string]interface{})
 			if state.typ == "refusal" {
 				if err := writeEvent("response.refusal.done", map[string]interface{}{
 					"type": "response.refusal.done", "response_id": responseID,
-					"output_index": 0, "content_index": state.index, "item_id": messageID,
+					"output_index": messageOutputIndex, "content_index": state.index, "item_id": messageID,
 					"refusal": refusal.String(),
 				}); err != nil {
 					return err
@@ -850,7 +983,7 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 				if err := writeEvent("response.output_text.done", map[string]interface{}{
 					"type":          "response.output_text.done",
 					"response_id":   responseID,
-					"output_index":  0,
+					"output_index":  messageOutputIndex,
 					"content_index": state.index,
 					"item_id":       messageID,
 					"text":          text.String(),
@@ -861,7 +994,7 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 			if err := writeEvent("response.content_part.done", map[string]interface{}{
 				"type":          "response.content_part.done",
 				"response_id":   responseID,
-				"output_index":  0,
+				"output_index":  messageOutputIndex,
 				"content_index": state.index,
 				"item_id":       messageID,
 				"part":          contentPart,
@@ -872,7 +1005,7 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 		if err := writeEvent("response.output_item.done", map[string]interface{}{
 			"type":         "response.output_item.done",
 			"response_id":  responseID,
-			"output_index": 0,
+			"output_index": messageOutputIndex,
 			"item":         messageOutput,
 		}); err != nil {
 			return err
@@ -889,7 +1022,16 @@ func streamChatAsResponses(w http.ResponseWriter, resp *http.Response, modelID s
 			"name":      state.name,
 			"arguments": state.arguments.String(),
 		}
-		output = append(output, toolOutput)
+		output[state.outputIndex] = toolOutput
+		if err := writeEvent("response.function_call_arguments.done", map[string]interface{}{
+			"type":         "response.function_call_arguments.done",
+			"response_id":  responseID,
+			"item_id":      state.id,
+			"output_index": state.outputIndex,
+			"arguments":    state.arguments.String(),
+		}); err != nil {
+			return err
+		}
 		if err := writeEvent("response.output_item.done", map[string]interface{}{
 			"type":         "response.output_item.done",
 			"response_id":  responseID,
@@ -1045,7 +1187,22 @@ func responsesInputToChatMessages(value interface{}) []interface{} {
 				"content":      stringValue(entry["output"]),
 			})
 		case "reasoning":
-			continue
+			reasoning := strings.Builder{}
+			if summary, ok := entry["summary"].([]interface{}); ok {
+				for _, item := range summary {
+					part, _ := item.(map[string]interface{})
+					reasoning.WriteString(stringValue(part["text"]))
+				}
+			}
+			message := map[string]interface{}{
+				"role":              "assistant",
+				"content":           "",
+				"reasoning_content": reasoning.String(),
+			}
+			if encrypted := stringValue(entry["encrypted_content"]); encrypted != "" {
+				message["reasoning_signature"] = encrypted
+			}
+			messages = append(messages, message)
 		default:
 			role, _ := entry["role"].(string)
 			if role == "" {
@@ -1183,14 +1340,31 @@ func convertChatJSONToResponses(body []byte, modelID string) ([]byte, error) {
 			"status":  "completed",
 			"content": content,
 		}
-		if signature := stringValue(message["reasoning_signature"]); signature != "" {
-			return nil, fmt.Errorf("Responses compatibility path cannot preserve non-streamed reasoning signature")
+		reasoning := stringValue(message["reasoning_content"])
+		encryptedReasoning := stringValue(message["reasoning_signature"])
+		if details, ok := message["reasoning_details"].([]interface{}); ok {
+			for _, item := range details {
+				detail, _ := item.(map[string]interface{})
+				if reasoning == "" && stringValue(detail["type"]) == "thinking" {
+					reasoning = stringValue(detail["thinking"])
+				}
+				if encryptedReasoning == "" {
+					encryptedReasoning = firstNonEmptyString(stringValue(detail["signature"]), stringValue(detail["data"]))
+				}
+			}
 		}
-		if details, ok := message["reasoning_details"].([]interface{}); ok && len(details) > 0 {
-			return nil, fmt.Errorf("Responses compatibility path cannot preserve non-streamed reasoning details")
-		}
-		if reasoning := stringValue(message["reasoning_content"]); reasoning != "" {
-			output = append(output, map[string]interface{}{"type": "reasoning", "id": fmt.Sprintf("rs_%s", responseID), "status": "completed", "summary": []interface{}{map[string]interface{}{"type": "summary_text", "text": reasoning}}})
+		if reasoning != "" || encryptedReasoning != "" {
+			reasoningOutput := map[string]interface{}{
+				"type": "reasoning", "id": fmt.Sprintf("rs_%s", responseID), "status": "completed",
+				"summary": []interface{}{},
+			}
+			if reasoning != "" {
+				reasoningOutput["summary"] = []interface{}{map[string]interface{}{"type": "summary_text", "text": reasoning}}
+			}
+			if encryptedReasoning != "" {
+				reasoningOutput["encrypted_content"] = encryptedReasoning
+			}
+			output = append(output, reasoningOutput)
 		}
 		if refusal := stringValue(message["refusal"]); refusal != "" {
 			messageOutput["content"] = []interface{}{map[string]interface{}{"type": "refusal", "refusal": refusal}}
@@ -1206,9 +1380,6 @@ func convertChatJSONToResponses(body []byte, modelID string) ([]byte, error) {
 			for _, item := range toolCalls {
 				call, _ := item.(map[string]interface{})
 				function, _ := call["function"].(map[string]interface{})
-				if signature := openAIThoughtSignature(call); signature != "" {
-					return nil, fmt.Errorf("Responses compatibility path cannot preserve non-streamed tool thought signature")
-				}
 				callID := stringValue(call["id"])
 				output = append(output, map[string]interface{}{
 					"type":      "function_call",

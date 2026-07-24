@@ -116,6 +116,72 @@ func CreateAdminSession() gin.HandlerFunc {
 	}
 }
 
+// ResumeAdminSession restores a still-active browser session after a page
+// reload. The HttpOnly cookie proves possession of the session; a fresh CSRF
+// token is issued because the previous token intentionally lived only in
+// JavaScript memory.
+func ResumeAdminSession() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		password := os.Getenv("ADMIN_PASSWORD")
+		if password == "" {
+			unauthenticatedConfiguration(c)
+			return
+		}
+
+		cookie, err := c.Request.Cookie(adminSessionCookieName)
+		if err != nil {
+			writeAdminUnauthorized(c)
+			return
+		}
+		now := time.Now()
+		payload, err := verifyAdminSession(cookie.Value, password, now)
+		if err != nil || requireActiveAdminSession(c.Request.Context(), payload.Nonce, now) != nil {
+			writeAdminUnauthorized(c)
+			return
+		}
+
+		csrfToken, err := randomAdminToken(32)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": gin.H{
+				"message": "unable to resume admin session",
+				"type":    "internal_error",
+			}})
+			return
+		}
+		payload.CSRFHash = hashCSRFToken(csrfToken)
+		sessionToken, err := signAdminSession(payload, password)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": gin.H{
+				"message": "unable to resume admin session",
+				"type":    "internal_error",
+			}})
+			return
+		}
+
+		expiresAt := time.Unix(payload.ExpiresAt, 0)
+		maxAge := int(time.Until(expiresAt).Seconds())
+		if maxAge < 1 {
+			writeAdminUnauthorized(c)
+			return
+		}
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name:     adminSessionCookieName,
+			Value:    sessionToken,
+			Path:     "/api",
+			MaxAge:   maxAge,
+			Expires:  expiresAt,
+			HttpOnly: true,
+			Secure:   adminCookieSecure(c.Request),
+			SameSite: http.SameSiteStrictMode,
+		})
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, gin.H{
+			"csrfToken": csrfToken,
+			"expiresAt": payload.ExpiresAt,
+		})
+	}
+}
+
 // DestroyAdminSession always clears the browser cookie. Session tokens are
 // short-lived and password rotation invalidates every outstanding token.
 func DestroyAdminSession() gin.HandlerFunc {

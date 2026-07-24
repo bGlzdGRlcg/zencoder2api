@@ -34,13 +34,42 @@ func rejectUnsupportedFields(raw map[string]interface{}, protocol string, allowe
 	return fmt.Errorf("%s compatibility path cannot preserve field(s): %s", protocol, strings.Join(unsupported, ", "))
 }
 
-func rejectPresent(raw map[string]interface{}, protocol string, fields ...string) error {
-	for _, field := range fields {
-		if value, ok := raw[field]; ok && value != nil {
-			return fmt.Errorf("%s compatibility path cannot preserve field %q", protocol, field)
-		}
+func consumeChatStreamOptions(raw map[string]interface{}, protocol string) (bool, error) {
+	value, ok := raw["stream_options"]
+	if !ok || value == nil {
+		delete(raw, "stream_options")
+		return false, nil
 	}
-	return nil
+	options, ok := value.(map[string]interface{})
+	if !ok {
+		return false, fmt.Errorf("%s compatibility path requires stream_options to be an object", protocol)
+	}
+
+	includeUsage := false
+	for field, option := range options {
+		if option == nil {
+			continue
+		}
+		if field != "include_usage" {
+			return false, fmt.Errorf("%s compatibility path cannot preserve field %q", protocol, "stream_options."+field)
+		}
+		boolValue, ok := option.(bool)
+		if !ok {
+			return false, fmt.Errorf("%s compatibility path requires stream_options.include_usage to be a boolean", protocol)
+		}
+		includeUsage = boolValue
+	}
+	delete(raw, "stream_options")
+	return includeUsage, nil
+}
+
+func consumeResponsesCompatibilityHints(raw map[string]interface{}) {
+	// These options control OpenAI-side persistence and optional response
+	// decorations. Compatibility providers are stateless, so accepting and
+	// dropping them gives clients such as Cherry Studio the most useful result
+	// without changing the generated model input.
+	delete(raw, "store")
+	delete(raw, "include")
 }
 
 func requireString(raw map[string]interface{}, field string) (string, error) {
@@ -82,28 +111,48 @@ func validateGeminiSchema(value interface{}, path string) error {
 	switch schema := value.(type) {
 	case map[string]interface{}:
 		allowed := map[string]struct{}{
+			"$schema": {}, "$id": {}, "$defs": {}, "$ref": {}, "$anchor": {}, "$comment": {},
 			"type": {}, "format": {}, "title": {}, "description": {},
+			"default": {}, "examples": {}, "example": {}, "deprecated": {}, "readOnly": {}, "writeOnly": {},
 			"nullable": {}, "enum": {}, "maxItems": {}, "minItems": {},
 			"maxLength": {}, "minLength": {}, "maximum": {}, "minimum": {},
 			"required": {}, "propertyOrdering": {}, "properties": {}, "items": {},
+			"prefixItems": {}, "anyOf": {}, "oneOf": {}, "additionalProperties": {},
 		}
 		for key, item := range schema {
 			if _, ok := allowed[key]; !ok {
 				return fmt.Errorf("%s contains unsupported JSON Schema keyword %q", path, key)
 			}
 			switch key {
-			case "properties":
+			case "properties", "$defs":
 				properties, ok := item.(map[string]interface{})
 				if !ok {
-					return fmt.Errorf("%s.properties must be an object", path)
+					return fmt.Errorf("%s.%s must be an object", path, key)
 				}
 				for name, property := range properties {
-					if err := validateGeminiSchema(property, path+".properties."+name); err != nil {
+					if err := validateGeminiSchema(property, path+"."+key+"."+name); err != nil {
 						return err
 					}
 				}
 			case "items":
 				if err := validateGeminiSchema(item, path+".items"); err != nil {
+					return err
+				}
+			case "prefixItems", "anyOf", "oneOf":
+				items, ok := item.([]interface{})
+				if !ok {
+					return fmt.Errorf("%s.%s must be an array", path, key)
+				}
+				for index, child := range items {
+					if err := validateGeminiSchema(child, fmt.Sprintf("%s.%s[%d]", path, key, index)); err != nil {
+						return err
+					}
+				}
+			case "additionalProperties":
+				if _, ok := item.(bool); ok {
+					continue
+				}
+				if err := validateGeminiSchema(item, path+".additionalProperties"); err != nil {
 					return err
 				}
 			}
@@ -171,11 +220,6 @@ func validateGeminiChatMessages(value interface{}) error {
 		}
 		if err := validateGeminiContent(message["content"], fmt.Sprintf("messages[%d].content", messageIndex)); err != nil {
 			return err
-		}
-		if reasoning := stringValue(message["reasoning_content"]); reasoning != "" {
-			if signature := stringValue(message["reasoning_signature"]); signature == "" {
-				return fmt.Errorf("messages[%d].reasoning_content requires reasoning_signature for Gemini", messageIndex)
-			}
 		}
 		if details, ok := message["reasoning_details"].([]interface{}); ok {
 			for detailIndex, item := range details {
@@ -306,7 +350,7 @@ func validateGeminiToolChoice(value interface{}) error {
 }
 
 func validateChatForAnthropic(raw map[string]interface{}) error {
-	if err := rejectUnsupportedFields(raw, "Anthropic Chat", "model", "messages", "stream", "max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "tools", "tool_choice", "parallel_tool_calls"); err != nil {
+	if err := rejectUnsupportedFields(raw, "Anthropic Chat", "model", "messages", "stream", "max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "tools", "tool_choice", "parallel_tool_calls", "thinking"); err != nil {
 		return err
 	}
 	if _, err := requireString(raw, "model"); err != nil {
@@ -336,15 +380,26 @@ func validateChatForAnthropic(raw map[string]interface{}) error {
 		if (role == "tool" || role == "function") && stringValue(message["tool_call_id"]) == "" && stringValue(message["call_id"]) == "" && stringValue(message["name"]) == "" {
 			return fmt.Errorf("messages[%d] tool_call_id is required", messageIndex)
 		}
-		if reasoning := stringValue(message["reasoning_content"]); reasoning != "" && stringValue(message["reasoning_signature"]) == "" {
-			if _, ok := message["reasoning_details"].([]interface{}); !ok {
-				return fmt.Errorf("messages[%d] reasoning_content requires reasoning_signature or reasoning_details", messageIndex)
-			}
-		}
 	}
 	if stop, ok := raw["stop"]; ok {
 		if err := validateStringList(stop, "stop"); err != nil {
 			return err
+		}
+	}
+	if value, ok := raw["thinking"]; ok {
+		thinking, ok := value.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("thinking must be an object")
+		}
+		if err := rejectUnsupportedFields(thinking, "Anthropic Chat thinking", "type", "budget_tokens", "enabled"); err != nil {
+			return err
+		}
+		typ := stringValue(thinking["type"])
+		if typ != "" && typ != "enabled" && typ != "adaptive" && typ != "disabled" {
+			return fmt.Errorf("thinking.type %q cannot be represented by Anthropic", typ)
+		}
+		if budget, exists := thinking["budget_tokens"]; exists && intValue(budget) < 1 {
+			return fmt.Errorf("thinking.budget_tokens must be a positive integer")
 		}
 	}
 	if tools, ok := raw["tools"].([]interface{}); ok {
@@ -488,33 +543,17 @@ func validateAnthropicBlocks(value interface{}, path string) error {
 }
 
 func validateAnthropicForOpenAI(raw map[string]interface{}) error {
-	if err := rejectPresent(raw, "OpenAI Anthropic", "top_k", "thinking"); err != nil {
-		return err
-	}
 	if err := validateAnthropicToolChoice(raw["tool_choice"]); err != nil {
 		return err
-	}
-	messages, _ := raw["messages"].([]interface{})
-	for messageIndex, item := range messages {
-		message, _ := item.(map[string]interface{})
-		for blockIndex, block := range anthropicMessageBlocks(message["content"]) {
-			switch stringValue(block["type"]) {
-			case "thinking", "redacted_thinking":
-				return fmt.Errorf("OpenAI Anthropic compatibility path cannot preserve messages[%d].content[%d] %s block", messageIndex, blockIndex, stringValue(block["type"]))
-			case "tool_result":
-				if isError, _ := block["is_error"].(bool); isError {
-					return fmt.Errorf("OpenAI Anthropic compatibility path cannot preserve messages[%d].content[%d].is_error", messageIndex, blockIndex)
-				}
-			}
-		}
 	}
 	return nil
 }
 
 func validateResponsesForGemini(raw map[string]interface{}) error {
-	if err := rejectUnsupportedFields(raw, "Gemini Responses", "model", "input", "instructions", "max_output_tokens", "tools", "tool_choice", "temperature", "top_p", "stream", "text", "reasoning"); err != nil {
+	if err := rejectUnsupportedFields(raw, "Gemini Responses", "model", "input", "instructions", "max_output_tokens", "tools", "tool_choice", "temperature", "top_p", "stream", "text", "reasoning", "include", "store"); err != nil {
 		return err
 	}
+	consumeResponsesCompatibilityHints(raw)
 	if _, err := requireString(raw, "model"); err != nil {
 		return err
 	}
@@ -601,7 +640,10 @@ func validateResponsesInputForGemini(value interface{}) error {
 		}
 		typ := stringValue(entry["type"])
 		switch typ {
-		case "message":
+		case "", "message":
+			if typ == "" && stringValue(entry["role"]) == "" {
+				return fmt.Errorf("input[%d] message role is required", index)
+			}
 			if err := validateResponsesContentForGemini(entry["content"], fmt.Sprintf("input[%d].content", index)); err != nil {
 				return err
 			}
@@ -614,7 +656,8 @@ func validateResponsesInputForGemini(value interface{}) error {
 				return fmt.Errorf("input[%d].call_id is required", index)
 			}
 		case "reasoning":
-			return fmt.Errorf("input[%d] reasoning item cannot be represented by Gemini", index)
+			// Responses reasoning items are restored to Chat reasoning fields by
+			// the shared converter before the Gemini adapter runs.
 		default:
 			return fmt.Errorf("input[%d] type %q cannot be represented by Gemini", index, typ)
 		}
@@ -656,9 +699,10 @@ func validateResponsesContentForGemini(value interface{}, path string) error {
 }
 
 func validateResponsesForAnthropic(raw map[string]interface{}) error {
-	if err := rejectUnsupportedFields(raw, "Anthropic Responses", "model", "input", "instructions", "max_output_tokens", "tools", "tool_choice", "temperature", "top_p", "stream"); err != nil {
+	if err := rejectUnsupportedFields(raw, "Anthropic Responses", "model", "input", "instructions", "max_output_tokens", "tools", "tool_choice", "temperature", "top_p", "stream", "include", "store", "reasoning", "parallel_tool_calls"); err != nil {
 		return err
 	}
+	consumeResponsesCompatibilityHints(raw)
 	if _, err := requireString(raw, "model"); err != nil {
 		return err
 	}
@@ -679,16 +723,14 @@ func validateResponsesForAnthropic(raw map[string]interface{}) error {
 			}
 		}
 	}
-	if value := raw["reasoning"]; value != nil {
-		return fmt.Errorf("responses reasoning cannot be represented by Anthropic without losing thinking budget/signature semantics")
-	}
 	return nil
 }
 
 func validateResponsesForChat(raw map[string]interface{}) error {
-	if err := rejectUnsupportedFields(raw, "Chat Responses", "model", "input", "instructions", "max_output_tokens", "tools", "tool_choice", "temperature", "top_p", "stream", "text", "reasoning", "parallel_tool_calls"); err != nil {
+	if err := rejectUnsupportedFields(raw, "Chat Responses", "model", "input", "instructions", "max_output_tokens", "tools", "tool_choice", "temperature", "top_p", "stream", "text", "reasoning", "parallel_tool_calls", "include", "store"); err != nil {
 		return err
 	}
+	consumeResponsesCompatibilityHints(raw)
 	if _, err := requireString(raw, "model"); err != nil {
 		return err
 	}
@@ -705,9 +747,6 @@ func validateResponsesForChat(raw map[string]interface{}) error {
 				return fmt.Errorf("chat Responses tools[%d] built-in or malformed tool cannot be represented", index)
 			}
 		}
-	}
-	if reasoning, ok := raw["reasoning"].(map[string]interface{}); ok && reasoning["summary"] != nil {
-		return fmt.Errorf("chat Responses reasoning.summary cannot be represented")
 	}
 	if textValue, exists := raw["text"]; exists && textValue != nil {
 		text, ok := textValue.(map[string]interface{})
@@ -740,7 +779,10 @@ func validateResponsesInputForChat(value interface{}) error {
 			return fmt.Errorf("input[%d] must be an object", index)
 		}
 		switch typ := stringValue(entry["type"]); typ {
-		case "message":
+		case "", "message":
+			if typ == "" && stringValue(entry["role"]) == "" {
+				return fmt.Errorf("input[%d] message role is required", index)
+			}
 			if err := validateResponsesChatContent(entry["content"], fmt.Sprintf("input[%d].content", index)); err != nil {
 				return err
 			}
@@ -753,7 +795,7 @@ func validateResponsesInputForChat(value interface{}) error {
 				return fmt.Errorf("input[%d].call_id is required", index)
 			}
 		case "reasoning":
-			return fmt.Errorf("input[%d] reasoning item cannot be represented by Chat Completions", index)
+			// Preserve this through the shared Responses-to-Chat converter.
 		default:
 			return fmt.Errorf("input[%d] type %q cannot be represented by Chat Completions", index, typ)
 		}
@@ -805,11 +847,14 @@ func validateResponsesInputForAnthropic(value interface{}) error {
 			return fmt.Errorf("input[%d] must be an object", index)
 		}
 		switch typ := stringValue(entry["type"]); typ {
-		case "message":
+		case "", "message":
+			if typ == "" && stringValue(entry["role"]) == "" {
+				return fmt.Errorf("input[%d] message role is required", index)
+			}
 			if err := validateAnthropicBlocks(entry["content"], fmt.Sprintf("input[%d].content", index)); err != nil {
 				return err
 			}
-		case "function_call", "function_call_output":
+		case "function_call", "function_call_output", "reasoning":
 		default:
 			return fmt.Errorf("input[%d] type %q cannot be represented by Anthropic", index, typ)
 		}

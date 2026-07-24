@@ -19,6 +19,7 @@ func (s *OpenAIService) MessagesProxy(ctx context.Context, w http.ResponseWriter
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return anthropicCompatibilityError(err)
 	}
+	removeUndefinedPlaceholders(raw)
 	if err := validateAnthropicForOpenAI(raw); err != nil {
 		return anthropicCompatibilityError(err)
 	}
@@ -27,7 +28,16 @@ func (s *OpenAIService) MessagesProxy(ctx context.Context, w http.ResponseWriter
 		return anthropicCompatibilityError(err)
 	}
 
-	resp, err := s.ChatCompletions(ctx, chatBody)
+	var resp *http.Response
+	if anthropicThinkingEnabled(raw["thinking"]) {
+		chatBody, err = addOpenAIReasoningSummary(chatBody)
+		if err != nil {
+			return anthropicCompatibilityError(err)
+		}
+		resp, err = s.chatCompletionsViaResponses(ctx, stringValue(raw["model"]), chatBody)
+	} else {
+		resp, err = s.ChatCompletions(ctx, chatBody)
+	}
 	if err != nil {
 		return err
 	}
@@ -190,11 +200,10 @@ func convertAnthropicMessagesToChat(body []byte) ([]byte, string, bool, error) {
 	if value, ok := raw["stop_sequences"]; ok {
 		chat["stop"] = value
 	}
-	if value, ok := raw["top_k"]; ok {
-		chat["top_k"] = value
-	}
-	if thinking, ok := raw["thinking"]; ok {
-		chat["thinking"] = thinking
+	if thinking, ok := raw["thinking"].(map[string]interface{}); ok {
+		if effort := anthropicThinkingEffort(thinking); effort != "" {
+			chat["reasoning_effort"] = effort
+		}
 	}
 	if tools, ok := raw["tools"].([]interface{}); ok {
 		converted := make([]interface{}, 0, len(tools))
@@ -235,6 +244,56 @@ func convertAnthropicMessagesToChat(body []byte) ([]byte, string, bool, error) {
 
 	encoded, err := json.Marshal(chat)
 	return encoded, modelID, boolValue(raw["stream"]), err
+}
+
+func anthropicThinkingEffort(thinking map[string]interface{}) string {
+	if stringValue(thinking["type"]) == "disabled" {
+		return "none"
+	}
+	budget := intValue(thinking["budget_tokens"])
+	switch {
+	case budget <= 0:
+		return "medium"
+	case budget <= 1024:
+		return "minimal"
+	case budget <= 2048:
+		return "low"
+	case budget <= 4096:
+		return "medium"
+	case budget <= 8192:
+		return "high"
+	default:
+		return "xhigh"
+	}
+}
+
+func anthropicThinkingEnabled(value interface{}) bool {
+	thinking, ok := value.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if enabled, ok := thinking["enabled"].(bool); ok {
+		return enabled
+	}
+	typ := stringValue(thinking["type"])
+	return typ == "enabled" || typ == "adaptive"
+}
+
+func addOpenAIReasoningSummary(body []byte) ([]byte, error) {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	reasoning, _ := raw["reasoning"].(map[string]interface{})
+	if reasoning == nil {
+		reasoning = map[string]interface{}{}
+	}
+	if effort := stringValue(raw["reasoning_effort"]); effort != "" {
+		reasoning["effort"] = effort
+	}
+	reasoning["summary"] = "auto"
+	raw["reasoning"] = reasoning
+	return json.Marshal(raw)
 }
 
 func anthropicImageToChatPart(block map[string]interface{}) (map[string]interface{}, bool) {

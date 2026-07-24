@@ -19,7 +19,7 @@ func (s *GeminiService) MessagesProxy(ctx context.Context, w http.ResponseWriter
 		return &UpstreamError{StatusCode: http.StatusBadRequest, Body: []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error"}}`, err.Error()))}
 	}
 
-	geminiModelID, _, nativeBody, err := convertOpenAIChatToGemini(chatBody)
+	geminiModelID, _, _, nativeBody, err := convertOpenAIChatToGemini(chatBody)
 	if err != nil {
 		return &UpstreamError{StatusCode: http.StatusBadRequest, Body: []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"invalid_request_error"}}`, err.Error()))}
 	}

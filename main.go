@@ -244,6 +244,7 @@ func setupRoutes(r *gin.Engine) error {
 	oauthHandler := handler.NewOAuthHandler()
 	r.GET("/oauth/zencoder/callback/:state", oauthHandler.ZencoderCallback)
 	r.POST("/api/admin/session", middleware.CreateAdminSession())
+	r.GET("/api/admin/session", middleware.ResumeAdminSession())
 	r.DELETE("/api/admin/session", middleware.DestroyAdminSession())
 	apiAuth := middleware.AuthMiddleware()
 
