@@ -145,7 +145,7 @@ func (s *OpenAIService) ChatCompletions(ctx context.Context, body []byte) (*http
 
 func requiresResponsesForFunctionTools(modelID string, body []byte) bool {
 	zenModel := model.ResolveOpenAIModel(modelID)
-	if zenModel.ProviderID != "openai" {
+	if zenModel.ProviderID != "openai" && zenModel.ProviderID != "xai" {
 		return false
 	}
 	// Any catalog model with reasoning parameters can hit the gateway rule
@@ -1146,7 +1146,9 @@ func prepareGatewayRequestBody(body []byte, modelID, path string, zenModel model
 			}
 		}
 
-		// Preserve caller reasoning; fill a missing effort from the catalog only.
+		// Preserve caller reasoning when the catalog permits it. Some internal
+		// aliases expose only one effort even though clients such as Cherry Studio
+		// send a global preference such as "high" for every model.
 		if effort, ok := raw["reasoning_effort"]; ok {
 			reasoning, _ := raw["reasoning"].(map[string]interface{})
 			if reasoning == nil {
@@ -1159,9 +1161,15 @@ func prepareGatewayRequestBody(body []byte, modelID, path string, zenModel model
 			delete(raw, "reasoning_effort")
 		}
 		if zenModel.Parameters != nil && zenModel.Parameters.Reasoning != nil {
-			if _, exists := raw["reasoning"]; !exists {
-				raw["reasoning"] = map[string]interface{}{"effort": zenModel.Parameters.Reasoning.Effort}
+			config := zenModel.Parameters.Reasoning
+			reasoning, _ := raw["reasoning"].(map[string]interface{})
+			if reasoning == nil {
+				reasoning = map[string]interface{}{}
 			}
+			if effort := stringValue(reasoning["effort"]); effort == "" || !reasoningEffortAllowed(effort, config.AllowedEfforts) {
+				reasoning["effort"] = config.Effort
+			}
+			raw["reasoning"] = reasoning
 		} else if isKnownModel && raw["reasoning"] != nil {
 			return nil, fmt.Errorf("model %q does not support Responses reasoning", modelID)
 		}
@@ -1192,6 +1200,18 @@ func prepareGatewayRequestBody(body []byte, modelID, path string, zenModel model
 
 	_ = modelID // retained for call-site clarity and future model-specific rules
 	return json.Marshal(raw)
+}
+
+func reasoningEffortAllowed(effort string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, candidate := range allowed {
+		if effort == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func removeUndefinedPlaceholders(value interface{}) {
@@ -1284,9 +1304,6 @@ func (s *OpenAIService) ResponsesProxy(ctx context.Context, w http.ResponseWrite
 	if isAnthropicCompatibleModel(req.Model) {
 		return s.responsesViaAnthropic(ctx, w, body)
 	}
-	if zenModel := model.ResolveOpenAIModel(req.Model); zenModel.ProviderID == "xai" {
-		return s.responsesViaChat(ctx, w, body)
-	}
 
 	resp, err := s.Responses(ctx, body)
 	if err != nil {
@@ -1298,36 +1315,4 @@ func (s *OpenAIService) ResponsesProxy(ctx context.Context, w http.ResponseWrite
 		return StreamResponse(w, resp)
 	}
 	return CopyResponse(w, resp)
-}
-
-func (s *OpenAIService) responsesViaChat(ctx context.Context, w http.ResponseWriter, body []byte) error {
-	chatBody, modelID, stream, err := convertResponsesToChat(body)
-	if err != nil {
-		return openAICompatibilityError(err)
-	}
-	resp, err := s.ChatCompletions(ctx, chatBody)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusMultipleChoices {
-		errBody, _ := readUpstreamErrorBody(resp.Body)
-		return &UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
-	}
-	if stream {
-		return streamChatAsResponses(w, resp, modelID)
-	}
-	chatResponse, err := readCompatibilityResponseBody(resp.Body)
-	if err != nil {
-		return err
-	}
-	converted, err := convertChatJSONToResponses(chatResponse, modelID)
-	if err != nil {
-		return openAICompatibilityError(err)
-	}
-	copyResponseHeaders(w.Header(), resp.Header, true)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, err = w.Write(converted)
-	return err
 }

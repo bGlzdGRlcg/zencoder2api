@@ -37,6 +37,13 @@ func (s *GrokService) ChatCompletions(ctx context.Context, body []byte) (*http.R
 	if !known || zenModel.ProviderID != "xai" {
 		return nil, unknownModelError(req.Model)
 	}
+	// The XAI Chat endpoint currently fails its internal Responses adapter for
+	// reasoning requests with function tools. Its native Responses endpoint
+	// supports the same request, so adapt at our boundary and restore the Chat
+	// response shape for callers.
+	if requiresResponsesForFunctionTools(req.Model, body) {
+		return NewOpenAIService().chatCompletionsViaResponses(ctx, req.Model, body)
+	}
 
 	DebugLogRequest(ctx, "Grok", "/v1/chat/completions", req.Model)
 

@@ -63,3 +63,4 @@ zencoder-2api
 *.pem
 *.key
 dist/
+log/

@@ -13,8 +13,9 @@ type ThinkingConfig struct {
 
 // ReasoningConfig OpenAI reasoning配置
 type ReasoningConfig struct {
-	Effort  string `json:"effort"`
-	Summary string `json:"summary,omitempty"`
+	Effort         string   `json:"effort"`
+	Summary        string   `json:"summary,omitempty"`
+	AllowedEfforts []string `json:"-"`
 }
 
 // TextConfig OpenAI text配置
@@ -58,6 +59,10 @@ var (
 		Reasoning: &ReasoningConfig{Effort: "medium"},
 		Text:      &TextConfig{Verbosity: "medium"},
 	}
+	openaiNanoParams = &ModelParameters{
+		Reasoning:     &ReasoningConfig{Effort: "minimal", AllowedEfforts: []string{"minimal"}},
+		MaxInputChars: 4000,
+	}
 
 	anthropicEnabledParams = &ModelParameters{
 		Temperature: &temp1,
@@ -95,13 +100,14 @@ var ZenModels = map[string]ZenModel{
 	"gemini-3.1-pro-preview-customtools": {ID: "gemini-3.1-pro-preview-customtools", GatewayID: "gemini-3-1-pro-preview-customtools", DisplayName: "Gemini Pro 3.1", Model: "gemini-3.1-pro-preview-customtools", Multiplier: 2, ProviderID: "gemini"},
 	"gemini-3-flash-preview":             {ID: "gemini-3-flash-preview", DisplayName: "Gemini Flash 3.0", Model: "gemini-3-flash-preview", Multiplier: 1, ProviderID: "gemini"},
 	"gemini-3.5-flash":                   {ID: "gemini-3.5-flash", GatewayID: "gemini-3-5-flash", DisplayName: "Gemini Flash 3.5", Model: "gemini-3.5-flash", Multiplier: 2.5, ProviderID: "gemini"},
-	"gemini-3.1-flash-image-preview":     {ID: "gemini-3.1-flash-image-preview", GatewayID: "gemini-3-1-flash-image-preview", DisplayName: "Gemini 3.1 Flash Image Preview", Model: "gemini-3.1-flash-image-preview", Multiplier: 8, ProviderID: "gemini"},
+	"gemini-3.1-flash-image":             {ID: "gemini-3.1-flash-image", GatewayID: "gemini-3-1-flash-image", DisplayName: "Gemini 3.1 Flash Image", Model: "gemini-3.1-flash-image", Multiplier: 8, ProviderID: "gemini"},
 
 	// Other gateway providers exposed through the OpenAI-compatible route
 	"minimax-m3": {ID: "minimax-m3", DisplayName: "MiniMax M3", Model: "accounts/fireworks/models/minimax-m3", Multiplier: 1, ProviderID: "minimax", Parameters: minimaxParams},
 	"glm-5.2":    {ID: "glm-5.2", GatewayID: "glm-5-2", DisplayName: "GLM 5.2", Model: "accounts/fireworks/models/glm-5p2", Multiplier: 2, ProviderID: "glm", Parameters: glmParams},
 
 	// OpenAI
+	"gpt-5-nano":         {ID: "gpt-5-nano", GatewayID: "generate-name-v2", DisplayName: "GPT-5 nano", Model: "gpt-5-nano-2025-08-07", Multiplier: 0, ProviderID: "openai", Parameters: openaiNanoParams},
 	"gpt-5.1-codex-mini": {ID: "gpt-5.1-codex-mini", GatewayID: "gpt-5-1-codex-mini", DisplayName: "GPT-5.1 Codex mini", Model: "gpt-5.1-codex-mini", Multiplier: 0.5, ProviderID: "openai", Parameters: openaiParams},
 	"gpt-5.1-codex-max":  {ID: "gpt-5.1-codex-max", GatewayID: "gpt-5-1-codex-max", DisplayName: "GPT-5.1 Codex Max", Model: "gpt-5.1-codex-max", Multiplier: 1.5, ProviderID: "openai", Parameters: openaiParams},
 	"gpt-5.3-codex":      {ID: "gpt-5.3-codex", GatewayID: "gpt-5-3-codex", DisplayName: "GPT-5.3 Codex", Model: "gpt-5.3-codex", Multiplier: 2, ProviderID: "openai", Parameters: openaiParams},

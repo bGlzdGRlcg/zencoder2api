@@ -35,9 +35,10 @@ GEMINI_MODELS = [
     "gemini-3.1-pro-preview-customtools",
     "gemini-3-flash-preview",
     "gemini-3.5-flash",
-    "gemini-3.1-flash-image-preview",
+    "gemini-3.1-flash-image",
 ]
 OPENAI_MODELS = [
+    "gpt-5-nano",
     "gpt-5.1-codex-mini",
     "gpt-5.1-codex-max",
     "gpt-5.3-codex",
@@ -604,7 +605,7 @@ def capabilities_for(model):
             ("reasoning_low", lambda: gemini_reasoning(model, "low")),
             ("reasoning_high", lambda: gemini_reasoning(model, "high")),
         ]
-        if model == "gemini-3.1-flash-image-preview":
+        if model == "gemini-3.1-flash-image":
             cases.append(("image_generation", lambda: gemini_image_generation(model)))
             cases.append(("image_edit", lambda: gemini_image_edit(model)))
         return cases
